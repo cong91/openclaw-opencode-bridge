@@ -1,4 +1,4 @@
-# openclaw-opencode-bridge
+# @mrc2204/opencode-bridge
 
 OpenClaw ↔ OpenCode bridge plugin for multi-agent orchestration, callback routing, SSE probing, run observability, and runtime serve management.
 

@@ -1,4 +1,4 @@
-# openclaw-opencode-bridge
+# @mrc2204/opencode-bridge
 
 > English README: [README.en.md](./README.en.md)
 

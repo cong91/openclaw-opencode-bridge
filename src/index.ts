@@ -92,6 +92,18 @@ type ServeRegistryFile = {
   entries: ServeRegistryEntry[];
 };
 
+type BridgeConfigFile = {
+  opencodeServerUrl?: string;
+  projectRegistry?: {
+    projectId: string;
+    repoRoot: string;
+    serverUrl: string;
+    idleTimeoutMs?: number;
+  }[];
+  hookBaseUrl?: string;
+  hookToken?: string;
+};
+
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_SOFT_STALL_MS = 60 * 1000;
 const DEFAULT_HARD_STALL_MS = 180 * 1000;
@@ -114,6 +126,47 @@ function buildSessionKey(agentId: string, taskId: string): string {
   return `${HOOK_PREFIX}${agentId}:${taskId}`;
 }
 
+function getBridgeStateDir(): string {
+  const stateDir = process.env.OPENCLAW_STATE_DIR || `${process.env.HOME}/.openclaw`;
+  return join(stateDir, 'opencode-bridge');
+}
+
+function getBridgeConfigPath(): string {
+  return join(getBridgeStateDir(), 'config.json');
+}
+
+function ensureBridgeConfigFile(): BridgeConfigFile {
+  const dir = getBridgeStateDir();
+  mkdirSync(dir, { recursive: true });
+  const path = getBridgeConfigPath();
+  if (!existsSync(path)) {
+    const initial: BridgeConfigFile = {
+      opencodeServerUrl: 'http://127.0.0.1:4096',
+      projectRegistry: [],
+    };
+    writeFileSync(path, JSON.stringify(initial, null, 2), 'utf8');
+    return initial;
+  }
+  return JSON.parse(readFileSync(path, 'utf8')) as BridgeConfigFile;
+}
+
+function writeBridgeConfigFile(data: BridgeConfigFile) {
+  const path = getBridgeConfigPath();
+  mkdirSync(getBridgeStateDir(), { recursive: true });
+  writeFileSync(path, JSON.stringify(data, null, 2), 'utf8');
+  return path;
+}
+
+function getRuntimeConfig(cfg: any): BridgeConfigFile {
+  const fileCfg = ensureBridgeConfigFile();
+  return {
+    opencodeServerUrl: fileCfg.opencodeServerUrl || cfg?.opencodeServerUrl,
+    projectRegistry: fileCfg.projectRegistry || cfg?.projectRegistry || [],
+    hookBaseUrl: fileCfg.hookBaseUrl || cfg?.hookBaseUrl,
+    hookToken: fileCfg.hookToken || cfg?.hookToken,
+  };
+}
+
 function normalizeRegistry(raw: unknown): ProjectRegistryEntry[] {
   return asArray(raw)
     .map((item) => {
@@ -134,7 +187,14 @@ function normalizeRegistry(raw: unknown): ProjectRegistryEntry[] {
 }
 
 function findRegistryEntry(cfg: any, projectId?: string, repoRoot?: string): ProjectRegistryEntry | undefined {
-  const registry = normalizeRegistry(cfg?.projectRegistry);
+  const runtimeCfg = getRuntimeConfig(cfg);
+  const dynamicRegistry = normalizeServeRegistry(readServeRegistry()).entries.map((x) => ({
+    projectId: x.project_id,
+    repoRoot: x.repo_root,
+    serverUrl: x.opencode_server_url,
+    idleTimeoutMs: x.idle_timeout_ms,
+  }));
+  const registry = [...dynamicRegistry, ...normalizeRegistry(runtimeCfg.projectRegistry)].filter(Boolean) as ProjectRegistryEntry[];
   if (projectId) {
     const byProject = registry.find((x) => x.projectId === projectId);
     if (byProject) return byProject;
@@ -273,8 +333,7 @@ function evaluateLifecycle(input: {
 }
 
 function getRunStateDir(): string {
-  const stateDir = process.env.OPENCLAW_STATE_DIR || `${process.env.HOME}/.openclaw`;
-  return join(stateDir, "opencode-bridge-runs");
+  return join(getBridgeStateDir(), 'runs');
 }
 
 function writeRunStatus(status: Phase3RunStatus) {
@@ -292,8 +351,7 @@ function readRunStatus(runId: string): Phase3RunStatus | null {
 }
 
 function getAuditDir(): string {
-  const stateDir = process.env.OPENCLAW_STATE_DIR || `${process.env.HOME}/.openclaw`;
-  return join(stateDir, "opencode-bridge-audit");
+  return join(getBridgeStateDir(), 'audit');
 }
 
 function appendAudit(record: CallbackAuditRecord) {
@@ -305,8 +363,7 @@ function appendAudit(record: CallbackAuditRecord) {
 }
 
 function getServeRegistryPath(): string {
-  const stateDir = process.env.OPENCLAW_STATE_DIR || `${process.env.HOME}/.openclaw`;
-  return join(stateDir, "opencode-bridge-registry.json");
+  return join(getBridgeStateDir(), 'registry.json');
 }
 
 function readServeRegistry(): ServeRegistryFile {
@@ -543,9 +600,10 @@ const plugin = {
       description: "Hiển thị contract hiện tại của OpenCode bridge: sessionKey convention, routing envelope schema, registry, lifecycle state skeleton và assumption 1 project = 1 serve.",
       parameters: { type: "object", properties: {} },
       async execute() {
-        const registry = normalizeRegistry(cfg?.projectRegistry);
+        const runtimeCfg = getRuntimeConfig(cfg);
+        const registry = normalizeRegistry(runtimeCfg.projectRegistry);
         return {
-          content: [{ type: "text", text: JSON.stringify({ ok: true, pluginId: "opencode-bridge", version: "0.1.0", assumption: "1 project = 1 opencode serve instance", sessionKeyConvention: "hook:opencode:<agentId>:<taskId>", lifecycleStates: ["queued", "server_ready", "session_created", "prompt_sent", "running", "awaiting_permission", "stalled", "failed", "completed"], requiredEnvelopeFields: ["task_id", "run_id", "agent_id", "session_key", "origin_session_key", "project_id", "repo_root", "opencode_server_url"], callbackPrimary: "/hooks/agent", callbackNotPrimary: ["/hooks/wake", "cron", "group:sessions"], config: { opencodeServerUrl: cfg?.opencodeServerUrl || null, hookBaseUrl: cfg?.hookBaseUrl || null, hookTokenPresent: Boolean(cfg?.hookToken), projectRegistry: registry }, note: "Runtime-ops scaffold in progress. Probe, callback execution, run artifacts, registry persistence, and lifecycle helpers are available for PoC use." }, null, 2) }]
+          content: [{ type: "text", text: JSON.stringify({ ok: true, pluginId: "opencode-bridge", version: "0.1.0", assumption: "1 project = 1 opencode serve instance", sessionKeyConvention: "hook:opencode:<agentId>:<taskId>", lifecycleStates: ["queued", "server_ready", "session_created", "prompt_sent", "running", "awaiting_permission", "stalled", "failed", "completed"], requiredEnvelopeFields: ["task_id", "run_id", "agent_id", "session_key", "origin_session_key", "project_id", "repo_root", "opencode_server_url"], callbackPrimary: "/hooks/agent", callbackNotPrimary: ["/hooks/wake", "cron", "group:sessions"], config: { bridgeConfigPath: getBridgeConfigPath(), opencodeServerUrl: runtimeCfg.opencodeServerUrl || null, hookBaseUrl: runtimeCfg.hookBaseUrl || null, hookTokenPresent: Boolean(runtimeCfg.hookToken), projectRegistry: registry, stateDir: getBridgeStateDir(), runStateDir: getRunStateDir(), auditDir: getAuditDir() }, note: "Runtime-ops scaffold in progress. Plugin-owned config/state is stored under ~/.openclaw/opencode-bridge. New projects are auto-registered only when using opencode_serve_spawn (not by passive envelope build alone)." }, null, 2) }]
         };
       }
     }, { optional: true });
@@ -568,268 +626,29 @@ const plugin = {
       parameters: { type: "object", properties: { taskId: { type: "string" }, runId: { type: "string" }, agentId: { type: "string" }, originSessionKey: { type: "string" }, projectId: { type: "string" }, repoRoot: { type: "string" }, channel: { type: "string" }, to: { type: "string" }, deliver: { type: "boolean" }, priority: { type: "string" } }, required: ["taskId", "runId", "agentId", "originSessionKey", "projectId", "repoRoot"] },
       async execute(_id: string, params: any) {
         const entry = findRegistryEntry(cfg, params?.projectId, params?.repoRoot);
-        const serverUrl = entry?.serverUrl || cfg?.opencodeServerUrl;
+        const serverUrl = entry?.serverUrl;
         if (!serverUrl) {
-          return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Missing opencode server mapping. Configure opencodeServerUrl or matching projectRegistry entry first." }, null, 2) }] };
-        }
-        const envelope = buildEnvelope({ taskId: params.taskId, runId: params.runId, agentId: params.agentId, originSessionKey: params.originSessionKey, projectId: params.projectId, repoRoot: params.repoRoot, serverUrl, channel: params.channel, to: params.to, deliver: params.deliver, priority: params.priority });
-        return { content: [{ type: "text", text: JSON.stringify({ ok: true, envelope, registryMatch: entry || null }, null, 2) }] };
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_build_callback",
-      label: "OpenCode Build Callback",
-      description: "Map OpenCode event + routing envelope sang callback payload chuẩn cho OpenClaw `/hooks/agent`.",
-      parameters: { type: "object", properties: { event: { type: "string", enum: ["task.started", "task.progress", "permission.requested", "task.stalled", "task.failed", "task.completed"] }, envelope: { type: "object" }, summary: { type: "string" } }, required: ["event", "envelope"] },
-      async execute(_id: string, params: any) {
-        const callback = buildHooksAgentCallback({ event: params.event, envelope: params.envelope as RoutingEnvelope, summary: params.summary });
-        return { content: [{ type: "text", text: JSON.stringify({ ok: true, state: mapEventToState(params.event), callback }, null, 2) }] };
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_probe_sse",
-      label: "OpenCode Probe SSE",
-      description: "PoC nhỏ: thử đọc event đầu tiên từ SSE stream của OpenCode serve để chuẩn bị cho listener thật.",
-      parameters: { type: "object", properties: { serverUrl: { type: "string" } } },
-      async execute(_id: string, params: any) {
-        const serverUrl = params?.serverUrl || cfg?.opencodeServerUrl;
-        if (!serverUrl) {
-          return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Missing serverUrl" }, null, 2) }] };
-        }
-        try {
-          const preview = await fetchSseEvents(serverUrl, { maxEvents: 1, timeoutMs: 3000 });
-          const normalized = preview.map((line) => normalizeOpenCodeEvent(line));
-          return { content: [{ type: "text", text: JSON.stringify({ ok: true, serverUrl, preview, normalized }, null, 2) }] };
-        } catch (error: any) {
-          return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }, null, 2) }] };
-        }
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_execute_callback",
-      label: "OpenCode Execute Callback",
-      description: "PoC phase 2: thực thi callback thật về OpenClaw `/hooks/agent` từ callback payload đã build.",
-      parameters: { type: "object", properties: { callback: { type: "object" }, hookBaseUrl: { type: "string" }, hookToken: { type: "string" } }, required: ["callback"] },
-      async execute(_id: string, params: any) {
-        const hookBaseUrl = params?.hookBaseUrl || cfg?.hookBaseUrl;
-        const hookToken = params?.hookToken || cfg?.hookToken;
-        if (!hookBaseUrl || !hookToken) {
-          return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Missing hookBaseUrl or hookToken" }, null, 2) }] };
-        }
-        const result = await executeHooksAgentCallback(hookBaseUrl, hookToken, params.callback as HooksAgentCallbackPayload);
-        const auditPath = appendAudit({ callbackStatus: result.status, callbackOk: result.ok, callbackBody: result.body, createdAt: new Date().toISOString() });
-        return { content: [{ type: "text", text: JSON.stringify({ ok: result.ok, status: result.status, body: result.body, auditPath }, null, 2) }], ...(result.ok ? {} : { isError: true }) };
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_run_status",
-      label: "OpenCode Run Status",
-      description: "Đọc status artifact của một run phase-3 trong opencode-bridge.",
-      parameters: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] },
-      async execute(_id: string, params: any) {
-        const status = readRunStatus(params.runId);
-        return { content: [{ type: "text", text: JSON.stringify({ ok: true, status }, null, 2) }] };
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_callback_from_event",
-      label: "OpenCode Callback From Event",
-      description: "PoC phase 3: nhận một raw event, normalize -> state -> callback payload -> thực thi callback thật -> ghi status artifact.",
-      parameters: { type: "object", properties: { event: { type: "object" }, envelope: { type: "object" }, hookBaseUrl: { type: "string" }, hookToken: { type: "string" }, summary: { type: "string" } }, required: ["event", "envelope"] },
-      async execute(_id: string, params: any) {
-        const hookBaseUrl = params?.hookBaseUrl || cfg?.hookBaseUrl;
-        const hookToken = params?.hookToken || cfg?.hookToken;
-        if (!hookBaseUrl || !hookToken) {
-          return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Missing hookBaseUrl or hookToken" }, null, 2) }] };
-        }
-        const normalized = normalizeOpenCodeEvent(params.event);
-        if (!normalized.kind) {
-          return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Could not normalize event", raw: params.event }, null, 2) }] };
-        }
-        const envelope = params.envelope as RoutingEnvelope;
-        const callback = buildHooksAgentCallback({ event: normalized.kind, envelope, summary: params.summary || normalized.summary });
-        const state = mapEventToState(normalized.kind);
-        const result = await executeHooksAgentCallback(hookBaseUrl, hookToken, callback);
-        const statusObj: Phase3RunStatus = { taskId: envelope.task_id, runId: envelope.run_id, state, lastEvent: normalized.kind, lastSummary: params.summary || normalized.summary, updatedAt: new Date().toISOString(), envelope };
-        const statusPath = writeRunStatus(statusObj);
-        const auditPath = appendAudit({ taskId: envelope.task_id, runId: envelope.run_id, agentId: envelope.agent_id, sessionKey: envelope.session_key, event: normalized.kind, callbackStatus: result.status, callbackOk: result.ok, callbackBody: result.body, createdAt: new Date().toISOString() });
-        return { content: [{ type: "text", text: JSON.stringify({ ok: result.ok, normalized, state, callback, callbackResult: result, statusPath, auditPath }, null, 2) }], ...(result.ok ? {} : { isError: true }) };
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_listen_once",
-      label: "OpenCode Listen Once",
-      description: "Phase 3 mini listener runner: đọc một vài event thật từ OpenCode SSE, normalize, callback về `/hooks/agent`, rồi ghi status artifact.",
-      parameters: { type: "object", properties: { envelope: { type: "object" }, hookBaseUrl: { type: "string" }, hookToken: { type: "string" }, maxEvents: { type: "number" }, timeoutMs: { type: "number" } }, required: ["envelope"] },
-      async execute(_id: string, params: any) {
-        const hookBaseUrl = params?.hookBaseUrl || cfg?.hookBaseUrl;
-        const hookToken = params?.hookToken || cfg?.hookToken;
-        if (!hookBaseUrl || !hookToken) {
-          return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Missing hookBaseUrl or hookToken" }, null, 2) }] };
-        }
-        const envelope = params.envelope as RoutingEnvelope;
-        const lines = await fetchSseEvents(envelope.opencode_server_url, { maxEvents: Number(params?.maxEvents || 3), timeoutMs: Number(params?.timeoutMs || 5000) });
-        const normalized = lines.map((line) => normalizeOpenCodeEvent(line));
-        const useful = normalized.find((x) => x.kind);
-        if (!useful || !useful.kind) {
-          return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: "No useful SSE event observed", lines, normalized }, null, 2) }] };
-        }
-        const callback = buildHooksAgentCallback({ event: useful.kind, envelope, summary: useful.summary });
-        const state = mapEventToState(useful.kind);
-        const result = await executeHooksAgentCallback(hookBaseUrl, hookToken, callback);
-        const statusObj: Phase3RunStatus = { taskId: envelope.task_id, runId: envelope.run_id, state, lastEvent: useful.kind, lastSummary: useful.summary, updatedAt: new Date().toISOString(), envelope };
-        const statusPath = writeRunStatus(statusObj);
-        const auditPath = appendAudit({ taskId: envelope.task_id, runId: envelope.run_id, agentId: envelope.agent_id, sessionKey: envelope.session_key, event: useful.kind, callbackStatus: result.status, callbackOk: result.ok, callbackBody: result.body, createdAt: new Date().toISOString() });
-        return { content: [{ type: "text", text: JSON.stringify({ ok: result.ok, lines, normalized, selected: useful, callback, callbackResult: result, statusPath, auditPath }, null, 2) }], ...(result.ok ? {} : { isError: true }) };
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_debug_normalize_event",
-      label: "OpenCode Debug Normalize Event",
-      description: "Debug helper: normalize raw SSE/event payload và chọn useful event đầu tiên.",
-      parameters: { type: "object", properties: { lines: { type: "array", items: { type: "string" } } } },
-      async execute(_id: string, params: any) {
-        const lines = asArray(params?.lines).map((x) => String(x));
-        const normalized = lines.map((line) => normalizeOpenCodeEvent(line));
-        const useful = normalized.find((x) => x.kind) || null;
-        return { content: [{ type: "text", text: JSON.stringify({ ok: true, lines, normalized, useful }, null, 2) }] };
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_debug_execute_callback",
-      label: "OpenCode Debug Execute Callback",
-      description: "Debug helper: thực thi callback thật tới /hooks/agent với payload đã truyền vào và trả kết quả chi tiết.",
-      parameters: { type: "object", properties: { callback: { type: "object" }, hookBaseUrl: { type: "string" }, hookToken: { type: "string" } }, required: ["callback", "hookBaseUrl", "hookToken"] },
-      async execute(_id: string, params: any) {
-        const result = await executeHooksAgentCallback(params.hookBaseUrl, params.hookToken, params.callback as HooksAgentCallbackPayload);
-        const auditPath = appendAudit({ callbackStatus: result.status, callbackOk: result.ok, callbackBody: result.body, createdAt: new Date().toISOString() });
-        return { content: [{ type: "text", text: JSON.stringify({ ok: result.ok, result, auditPath }, null, 2) }], ...(result.ok ? {} : { isError: true }) };
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_debug_write_status",
-      label: "OpenCode Debug Write Status",
-      description: "Debug helper: ghi status artifact trực tiếp từ input để cô lập path write status / audit.",
-      parameters: { type: "object", properties: { taskId: { type: "string" }, runId: { type: "string" }, state: { type: "string" }, lastEvent: { type: "string" }, lastSummary: { type: "string" }, envelope: { type: "object" } }, required: ["taskId", "runId", "state", "envelope"] },
-      async execute(_id: string, params: any) {
-        const statusObj: Phase3RunStatus = { taskId: params.taskId, runId: params.runId, state: params.state as BridgeLifecycleState, lastEvent: (params.lastEvent as OpenCodeEventKind) || null, lastSummary: params.lastSummary, updatedAt: new Date().toISOString(), envelope: params.envelope as RoutingEnvelope };
-        const statusPath = writeRunStatus(statusObj);
-        const auditPath = appendAudit({ taskId: params.taskId, runId: params.runId, agentId: (params.envelope || {}).agent_id, sessionKey: (params.envelope || {}).session_key, event: params.lastEvent, callbackStatus: 0, callbackOk: true, callbackBody: 'debug-write-status', createdAt: new Date().toISOString() });
-        return { content: [{ type: "text", text: JSON.stringify({ ok: true, statusPath, auditPath, statusObj }, null, 2) }] };
-      }
-    }, { optional: true });
-
-    api.registerTool({
-      name: "opencode_listen_loop",
-      label: "OpenCode Listen Loop",
-      description: "Runtime-ops listener runner: đọc nhiều event SSE, evaluate lifecycle, callback permission/stall/completed/failed, và ghi status/audit artifact liên tục cho một run ngắn.",
-      parameters: {
-        type: "object",
-        properties: {
-          envelope: { type: "object" },
-          hookBaseUrl: { type: "string" },
-          hookToken: { type: "string" },
-          maxEvents: { type: "number" },
-          timeoutMs: { type: "number" },
-          softStallMs: { type: "number" },
-          hardStallMs: { type: "number" },
-          debug: { type: "boolean" }
-        },
-        required: ["envelope"]
-      },
-      async execute(_id: string, params: any) {
-        const debug = Boolean(params?.debug);
-        const checkpoints: any[] = [];
-        try {
-          const hookBaseUrl = params?.hookBaseUrl || cfg?.hookBaseUrl;
-          const hookToken = params?.hookToken || cfg?.hookToken;
-          checkpoints.push({ step: 'inputs', hookBaseUrl: Boolean(hookBaseUrl), hookToken: Boolean(hookToken) });
-          if (!hookBaseUrl || !hookToken) {
-            return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Missing hookBaseUrl or hookToken", checkpoints }, null, 2) }] };
-          }
-          const envelope = params.envelope as RoutingEnvelope;
-          checkpoints.push({ step: 'envelope', envelope });
-          const lines = await fetchSseEvents(envelope.opencode_server_url, {
-            maxEvents: Number(params?.maxEvents || 5),
-            timeoutMs: Number(params?.timeoutMs || 6000),
-          });
-          checkpoints.push({ step: 'fetchSseEvents', lines });
-          const normalized = lines.map((line) => normalizeOpenCodeEvent(line));
-          checkpoints.push({ step: 'normalized', normalized });
-          const useful = normalized.filter((x) => x.kind);
-          checkpoints.push({ step: 'useful', useful });
-          let lastKind: OpenCodeEventKind | null = null;
-          let lastSummary: string | undefined = undefined;
-          let callbackResults: any[] = [];
-          let lastEventAtMs = Date.now();
-          for (const item of useful) {
-            if (!item.kind) continue;
-            lastKind = item.kind;
-            lastSummary = item.summary;
-            lastEventAtMs = Date.now();
-            const evaluation = evaluateLifecycle({
-              lastEventKind: item.kind,
-              lastEventAtMs,
-              nowMs: Date.now(),
-              softStallMs: asNumber(params?.softStallMs),
-              hardStallMs: asNumber(params?.hardStallMs),
-            });
-            checkpoints.push({ step: 'evaluation', event: item.kind, evaluation });
-            if (evaluation.needsPermissionHandling || evaluation.state === 'failed' || evaluation.state === 'completed') {
-              const callback = buildHooksAgentCallback({ event: item.kind, envelope, summary: item.summary });
-              const result = await executeHooksAgentCallback(hookBaseUrl, hookToken, callback);
-              callbackResults.push({ event: item.kind, callback, result });
-              appendAudit({ taskId: envelope.task_id, runId: envelope.run_id, agentId: envelope.agent_id, sessionKey: envelope.session_key, event: item.kind, callbackStatus: result.status, callbackOk: result.ok, callbackBody: result.body, createdAt: new Date().toISOString() });
-            }
-          }
-          const noUsefulEvents = useful.length === 0;
-          checkpoints.push({ step: 'noUsefulEvents', noUsefulEvents });
-          if (noUsefulEvents) {
-            const evaluation = evaluateLifecycle({
-              lastEventAtMs: Date.now() - Number(params?.hardStallMs || DEFAULT_HARD_STALL_MS),
-              nowMs: Date.now(),
-              softStallMs: asNumber(params?.softStallMs),
-              hardStallMs: asNumber(params?.hardStallMs),
-            });
-            checkpoints.push({ step: 'stalled-evaluation', evaluation });
-            if (evaluation.state === 'stalled') {
-              const callback = buildHooksAgentCallback({ event: 'task.stalled', envelope, summary: 'OpenCode listener detected stalled/no useful event window' });
-              const result = await executeHooksAgentCallback(hookBaseUrl, hookToken, callback);
-              callbackResults.push({ event: 'task.stalled', callback, result });
-              appendAudit({ taskId: envelope.task_id, runId: envelope.run_id, agentId: envelope.agent_id, sessionKey: envelope.session_key, event: 'task.stalled', callbackStatus: result.status, callbackOk: result.ok, callbackBody: result.body, createdAt: new Date().toISOString() });
-              lastKind = 'task.stalled';
-              lastSummary = 'OpenCode listener detected stalled/no useful event window';
-            }
-          }
-          const finalState = lastKind ? mapEventToState(lastKind) : 'stalled';
-          const statusObj: Phase3RunStatus = {
-            taskId: envelope.task_id,
-            runId: envelope.run_id,
-            state: finalState,
-            lastEvent: lastKind,
-            lastSummary,
-            updatedAt: new Date().toISOString(),
-            envelope,
-          };
-          const statusPath = writeRunStatus(statusObj);
-          return {
-            content: [{ type: "text", text: JSON.stringify({ ok: true, lines, normalized, useful, callbackResults, statusPath, finalState, ...(debug ? { checkpoints } : {}) }, null, 2) }]
-          };
-        } catch (error: any) {
           return {
             isError: true,
-            content: [{ type: "text", text: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error), ...(debug ? { checkpoints } : {}) }, null, 2) }]
+            content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Missing project registry mapping. Use opencode_serve_spawn for the project or add a matching projectRegistry entry in ~/.openclaw/opencode-bridge/config.json first." }, null, 2) }]
           };
         }
+        const envelope = buildEnvelope({
+          taskId: params.taskId,
+          runId: params.runId,
+          agentId: params.agentId,
+          originSessionKey: params.originSessionKey,
+          projectId: params.projectId,
+          repoRoot: params.repoRoot,
+          serverUrl,
+          channel: params.channel,
+          to: params.to,
+          deliver: params.deliver,
+          priority: params.priority,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ ok: true, envelope, registryMatch: entry || null }, null, 2) }]
+        };
       }
     }, { optional: true });
 

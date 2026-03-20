@@ -2,7 +2,7 @@
   "id": "opencode-bridge",
   "name": "OpenCode Bridge",
   "description": "Bridge plugin scaffold for OpenClaw ↔ OpenCode orchestration.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -18,12 +18,24 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "projectId": { "type": "string" },
-            "repoRoot": { "type": "string" },
-            "serverUrl": { "type": "string" },
-            "idleTimeoutMs": { "type": "number" }
+            "projectId": {
+              "type": "string"
+            },
+            "repoRoot": {
+              "type": "string"
+            },
+            "serverUrl": {
+              "type": "string"
+            },
+            "idleTimeoutMs": {
+              "type": "number"
+            }
           },
-          "required": ["projectId", "repoRoot", "serverUrl"]
+          "required": [
+            "projectId",
+            "repoRoot",
+            "serverUrl"
+          ]
         }
       }
     }

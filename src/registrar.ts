@@ -16,6 +16,7 @@ import {
   normalizeRegistry,
   findRegistryEntry,
   buildEnvelope,
+  resolveExecutionAgent,
   buildHookPolicyChecklist,
   evaluateLifecycle,
   resolveServerUrl,
@@ -51,7 +52,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
       const runtimeCfg = getRuntimeConfig(cfg);
       const registry = normalizeRegistry(runtimeCfg.projectRegistry);
       return {
-        content: [{ type: "text", text: JSON.stringify({ ok: true, pluginId: "opencode-bridge", version: "0.1.0", assumption: "1 project = 1 opencode serve instance", sessionKeyConvention: "hook:opencode:<agentId>:<taskId>", lifecycleStates: ["queued", "server_ready", "session_created", "prompt_sent", "running", "awaiting_permission", "stalled", "failed", "completed"], requiredEnvelopeFields: ["task_id", "run_id", "agent_id", "session_key", "origin_session_key", "project_id", "repo_root", "opencode_server_url"], callbackPrimary: "/hooks/agent", callbackNotPrimary: ["/hooks/wake", "cron", "group:sessions"], config: { bridgeConfigPath: getBridgeConfigPath(), opencodeServerUrl: runtimeCfg.opencodeServerUrl || null, hookBaseUrl: runtimeCfg.hookBaseUrl || null, hookTokenPresent: Boolean(runtimeCfg.hookToken), projectRegistry: registry, stateDir: getBridgeStateDir(), runStateDir: getRunStateDir(), auditDir: getAuditDir() }, note: "Runtime-ops scaffold in progress. Plugin-owned config/state is stored under ~/.openclaw/opencode-bridge. New projects are auto-registered only when using opencode_serve_spawn (not by passive envelope build alone)." }, null, 2) }]
+        content: [{ type: "text", text: JSON.stringify({ ok: true, pluginId: "opencode-bridge", version: "0.1.0", assumption: "1 project = 1 opencode serve instance", sessionKeyConvention: "hook:opencode:<agentId>:<taskId>", lifecycleStates: ["queued", "server_ready", "session_created", "prompt_sent", "running", "awaiting_permission", "stalled", "failed", "completed"], requiredEnvelopeFields: ["task_id", "run_id", "agent_id", "requested_agent_id", "resolved_agent_id", "session_key", "origin_session_key", "callback_target_session_key", "project_id", "repo_root", "opencode_server_url"], callbackPrimary: "/hooks/agent", callbackNotPrimary: ["/hooks/wake", "cron", "group:sessions"], config: { bridgeConfigPath: getBridgeConfigPath(), opencodeServerUrl: runtimeCfg.opencodeServerUrl || null, hookBaseUrl: runtimeCfg.hookBaseUrl || null, hookTokenPresent: Boolean(runtimeCfg.hookToken), projectRegistry: registry, executionAgentMappings: runtimeCfg.executionAgentMappings || [], stateDir: getBridgeStateDir(), runStateDir: getRunStateDir(), auditDir: getAuditDir() }, note: "Runtime-ops scaffold in progress. Plugin-owned config/state is stored under ~/.openclaw/opencode-bridge. New projects are auto-registered only when using opencode_serve_spawn (not by passive envelope build alone)." }, null, 2) }]
       };
     }
   }, { optional: true });
@@ -71,7 +72,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
     name: "opencode_build_envelope",
     label: "OpenCode Build Envelope",
     description: "Dựng routing envelope chuẩn cho task delegate sang OpenCode với sessionKey convention hook:opencode:<agentId>:<taskId>.",
-    parameters: { type: "object", properties: { taskId: { type: "string" }, runId: { type: "string" }, agentId: { type: "string" }, originSessionKey: { type: "string" }, projectId: { type: "string" }, repoRoot: { type: "string" }, channel: { type: "string" }, to: { type: "string" }, deliver: { type: "boolean" }, priority: { type: "string" } }, required: ["taskId", "runId", "agentId", "originSessionKey", "projectId", "repoRoot"] },
+    parameters: { type: "object", properties: { taskId: { type: "string" }, runId: { type: "string" }, agentId: { type: "string", description: "Requester/origin agent id" }, executionAgentId: { type: "string", description: "Optional explicit OpenCode execution agent id" }, originSessionKey: { type: "string" }, originSessionId: { type: "string" }, projectId: { type: "string" }, repoRoot: { type: "string" }, channel: { type: "string" }, to: { type: "string" }, deliver: { type: "boolean" }, priority: { type: "string" } }, required: ["taskId", "runId", "agentId", "originSessionKey", "projectId", "repoRoot"] },
     async execute(_id: string, params: any) {
       const entry = findRegistryEntry(cfg, params?.projectId, params?.repoRoot);
       const serverUrl = entry?.serverUrl;
@@ -81,11 +82,26 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
           content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Missing project registry mapping. Use opencode_serve_spawn for the project or add a matching projectRegistry entry in ~/.openclaw/opencode-bridge/config.json first." }, null, 2) }]
         };
       }
+      const requestedAgentId = asString(params?.agentId);
+      const resolved = resolveExecutionAgent({
+        cfg,
+        requestedAgentId: requestedAgentId || "",
+        explicitExecutionAgentId: asString(params?.executionAgentId),
+      });
+      if (!resolved.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: JSON.stringify({ ok: false, error: resolved.error, requestedAgentId: resolved.requestedAgentId, mappingConfigured: resolved.mappingConfigured }, null, 2) }],
+        };
+      }
+
       const envelope = buildEnvelope({
         taskId: params.taskId,
         runId: params.runId,
-        agentId: params.agentId,
+        requestedAgentId: resolved.requestedAgentId,
+        resolvedAgentId: resolved.resolvedAgentId,
         originSessionKey: params.originSessionKey,
+        originSessionId: asString(params.originSessionId),
         projectId: params.projectId,
         repoRoot: params.repoRoot,
         serverUrl,
@@ -95,7 +111,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
         priority: params.priority,
       });
       return {
-        content: [{ type: "text", text: JSON.stringify({ ok: true, envelope, registryMatch: entry || null }, null, 2) }]
+        content: [{ type: "text", text: JSON.stringify({ ok: true, envelope, agentResolution: resolved, registryMatch: entry || null }, null, 2) }]
       };
     }
   }, { optional: true });

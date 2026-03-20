@@ -10,9 +10,17 @@ export type ProjectRegistryEntry = {
 export type RoutingEnvelope = {
   task_id: string;
   run_id: string;
+  // OpenCode execution agent (resolved)
   agent_id: string;
+  // OpenClaw requester agent before resolution/mapping
+  requested_agent_id: string;
+  // Explicit resolved execution agent id (same value as agent_id for audit clarity)
+  resolved_agent_id: string;
   session_key: string;
   origin_session_key: string;
+  origin_session_id?: string;
+  callback_target_session_key: string;
+  callback_target_session_id?: string;
   project_id: string;
   repo_root: string;
   opencode_server_url: string;
@@ -38,6 +46,7 @@ export type HooksAgentCallbackPayload = {
   name: string;
   agentId: string;
   sessionKey: string;
+  sessionId?: string;
   wakeMode: "now" | "next-heartbeat";
   deliver: boolean;
   channel?: string;
@@ -161,7 +170,11 @@ export type CallbackAuditRecord = {
   taskId?: string;
   runId?: string;
   agentId?: string;
+  requestedAgentId?: string;
+  resolvedAgentId?: string;
   sessionKey?: string;
+  callbackTargetSessionKey?: string;
+  callbackTargetSessionId?: string;
   event?: string;
   callbackStatus: number;
   callbackOk: boolean;
@@ -191,6 +204,12 @@ export type BridgeConfigFile = {
     repoRoot: string;
     serverUrl: string;
     idleTimeoutMs?: number;
+  }[];
+  // Optional explicit mapping from requester agent -> OpenCode execution agent.
+  // If present and no mapping matched, envelope build should fail (no silent fallback).
+  executionAgentMappings?: {
+    requestedAgentId: string;
+    executionAgentId: string;
   }[];
   hookBaseUrl?: string;
   hookToken?: string;

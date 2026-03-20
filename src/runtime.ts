@@ -83,6 +83,7 @@ export function getRuntimeConfig(cfg: any): BridgeConfigFile {
   return {
     opencodeServerUrl: fileCfg.opencodeServerUrl || cfg?.opencodeServerUrl,
     projectRegistry: fileCfg.projectRegistry || cfg?.projectRegistry || [],
+    executionAgentMappings: fileCfg.executionAgentMappings || cfg?.executionAgentMappings || [],
     hookBaseUrl: fileCfg.hookBaseUrl || cfg?.hookBaseUrl,
     hookToken: fileCfg.hookToken || cfg?.hookToken,
   };
@@ -127,11 +128,75 @@ export function findRegistryEntry(cfg: any, projectId?: string, repoRoot?: strin
   return undefined;
 }
 
+export function resolveExecutionAgent(input: {
+  cfg: any;
+  requestedAgentId: string;
+  explicitExecutionAgentId?: string;
+}):
+  | { ok: true; requestedAgentId: string; resolvedAgentId: string; strategy: "explicit_param" | "config_mapping" | "identity" }
+  | { ok: false; requestedAgentId: string; error: string; mappingConfigured: boolean } {
+  const requestedAgentId = asString(input.requestedAgentId);
+  if (!requestedAgentId) {
+    return {
+      ok: false,
+      requestedAgentId: "",
+      mappingConfigured: false,
+      error: "requestedAgentId is required",
+    };
+  }
+
+  const explicitExecutionAgentId = asString(input.explicitExecutionAgentId);
+  if (explicitExecutionAgentId) {
+    return {
+      ok: true,
+      requestedAgentId,
+      resolvedAgentId: explicitExecutionAgentId,
+      strategy: "explicit_param",
+    };
+  }
+
+  const runtimeCfg = getRuntimeConfig(input.cfg);
+  const mappings = asArray(runtimeCfg.executionAgentMappings)
+    .map((x) => (x && typeof x === "object" ? (x as Record<string, unknown>) : {}))
+    .map((x) => ({
+      requestedAgentId: asString(x.requestedAgentId),
+      executionAgentId: asString(x.executionAgentId),
+    }))
+    .filter((x) => x.requestedAgentId && x.executionAgentId) as { requestedAgentId: string; executionAgentId: string }[];
+
+  if (mappings.length > 0) {
+    const matched = mappings.find((x) => x.requestedAgentId === requestedAgentId);
+    if (!matched) {
+      return {
+        ok: false,
+        requestedAgentId,
+        mappingConfigured: true,
+        error: `Execution agent mapping is configured but no mapping matched requestedAgentId=${requestedAgentId}`,
+      };
+    }
+    return {
+      ok: true,
+      requestedAgentId,
+      resolvedAgentId: matched.executionAgentId,
+      strategy: "config_mapping",
+    };
+  }
+
+  return {
+    ok: true,
+    requestedAgentId,
+    resolvedAgentId: requestedAgentId,
+    strategy: "identity",
+  };
+}
+
 export function buildEnvelope(input: {
   taskId: string;
   runId: string;
-  agentId: string;
+  requestedAgentId: string;
+  resolvedAgentId: string;
   originSessionKey: string;
+  originSessionId?: string;
   projectId: string;
   repoRoot: string;
   serverUrl: string;
@@ -143,9 +208,14 @@ export function buildEnvelope(input: {
   return {
     task_id: input.taskId,
     run_id: input.runId,
-    agent_id: input.agentId,
-    session_key: buildSessionKey(input.agentId, input.taskId),
+    agent_id: input.resolvedAgentId,
+    requested_agent_id: input.requestedAgentId,
+    resolved_agent_id: input.resolvedAgentId,
+    session_key: buildSessionKey(input.resolvedAgentId, input.taskId),
     origin_session_key: input.originSessionKey,
+    ...(input.originSessionId ? { origin_session_id: input.originSessionId } : {}),
+    callback_target_session_key: input.originSessionKey,
+    ...(input.originSessionId ? { callback_target_session_id: input.originSessionId } : {}),
     project_id: input.projectId,
     repo_root: input.repoRoot,
     opencode_server_url: input.serverUrl,
@@ -182,13 +252,15 @@ export function buildHooksAgentCallback(input: {
   const state = mapEventToState(input.event);
   const message =
     input.summary ||
-    `OpenCode event=${input.event} state=${state} task=${input.envelope.task_id} run=${input.envelope.run_id} project=${input.envelope.project_id}`;
+    `OpenCode event=${input.event} state=${state} task=${input.envelope.task_id} run=${input.envelope.run_id} project=${input.envelope.project_id} requestedAgent=${input.envelope.requested_agent_id} resolvedAgent=${input.envelope.resolved_agent_id}`;
 
   return {
     message,
     name: "OpenCode",
-    agentId: input.envelope.agent_id,
-    sessionKey: input.envelope.session_key,
+    // callback should wake requester/origin lane, not execution lane
+    agentId: input.envelope.requested_agent_id,
+    sessionKey: input.envelope.callback_target_session_key,
+    ...(input.envelope.callback_target_session_id ? { sessionId: input.envelope.callback_target_session_id } : {}),
     wakeMode: "now",
     deliver: false,
     ...(input.envelope.channel ? { channel: input.envelope.channel } : {}),

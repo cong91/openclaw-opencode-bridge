@@ -2,6 +2,13 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
+import {
+  type EventScope,
+  type OpenCodeEventKind,
+  parseSseFramesFromBuffer,
+  normalizeTypedEventV1,
+  resolveSessionId,
+} from "./observability";
 
 type ProjectRegistryEntry = {
   projectId: string;
@@ -36,13 +43,6 @@ type BridgeLifecycleState =
   | "failed"
   | "completed";
 
-type OpenCodeEventKind =
-  | "task.started"
-  | "task.progress"
-  | "permission.requested"
-  | "task.stalled"
-  | "task.failed"
-  | "task.completed";
 
 type HooksAgentCallbackPayload = {
   message: string;
@@ -63,6 +63,109 @@ type Phase3RunStatus = {
   lastSummary?: string;
   updatedAt: string;
   envelope: RoutingEnvelope;
+};
+
+type OpenCodeApiSnapshot = {
+  health?: any;
+  sessionList?: any[];
+  sessionStatus?: any;
+  fetchedAt: string;
+};
+
+type RunStatusResponse = {
+  ok: boolean;
+  source: {
+    runStatusArtifact: boolean;
+    opencodeApi: boolean;
+  };
+  runId?: string;
+  taskId?: string;
+  projectId?: string;
+  sessionId?: string;
+  correlation?: {
+    sessionResolution: {
+      strategy: string;
+      score?: number;
+    };
+  };
+  state: BridgeLifecycleState;
+  lastEvent?: OpenCodeEventKind | null;
+  lastSummary?: string;
+  updatedAt: string;
+  timestamps: {
+    artifactUpdatedAt?: string;
+    apiFetchedAt?: string;
+  };
+  health?: {
+    ok: boolean;
+    version?: string;
+  };
+  apiSnapshot?: OpenCodeApiSnapshot;
+  note?: string;
+};
+
+type RunEventRecord = {
+  index: number;
+  scope: EventScope;
+  rawLine: string;
+  data?: any;
+  normalizedKind?: OpenCodeEventKind | null;
+  summary?: string;
+  runId?: string;
+  taskId?: string;
+  sessionId?: string;
+  typedEvent?: any;
+  timestamp: string;
+};
+
+type RunEventsResponse = {
+  ok: boolean;
+  runId?: string;
+  taskId?: string;
+  sessionId?: string;
+  correlation?: {
+    sessionResolution?: {
+      strategy: string;
+      score?: number;
+    };
+  };
+  scope: EventScope;
+  schemaVersion: "opencode.event.v1";
+  eventPath: string;
+  eventCount: number;
+  events: RunEventRecord[];
+  truncated: boolean;
+  timeoutMs: number;
+};
+
+type SessionTailMessage = {
+  index: number;
+  role?: string;
+  text?: string;
+  createdAt?: number | string;
+  id?: string;
+  agent?: string;
+  model?: string;
+  raw?: any;
+};
+
+type SessionTailResponse = {
+  ok: boolean;
+  sessionId: string;
+  runId?: string;
+  taskId?: string;
+  correlation?: {
+    sessionResolution: {
+      strategy: string;
+      score?: number;
+    };
+  };
+  limit: number;
+  totalMessages: number;
+  messages: SessionTailMessage[];
+  diff?: any;
+  latestSummary?: any;
+  fetchedAt: string;
 };
 
 type CallbackAuditRecord = {
@@ -107,6 +210,9 @@ type BridgeConfigFile = {
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_SOFT_STALL_MS = 60 * 1000;
 const DEFAULT_HARD_STALL_MS = 180 * 1000;
+const DEFAULT_OBS_TIMEOUT_MS = 3000;
+const DEFAULT_TAIL_LIMIT = 20;
+const DEFAULT_EVENT_LIMIT = 10;
 const HOOK_PREFIX = "hook:opencode:";
 
 function asArray(value: unknown): any[] {
@@ -273,26 +379,6 @@ function buildHooksAgentCallback(input: {
     ...(input.envelope.channel ? { channel: input.envelope.channel } : {}),
     ...(input.envelope.to ? { to: input.envelope.to } : {}),
   };
-}
-
-function normalizeOpenCodeEvent(raw: any): { kind: OpenCodeEventKind | null; summary?: string; raw: any } {
-  const text = JSON.stringify(raw || {}).toLowerCase();
-  if (text.includes("permission") || text.includes("question.asked")) {
-    return { kind: "permission.requested", summary: "OpenCode đang chờ permission/user input", raw };
-  }
-  if (text.includes("error") || text.includes("failed")) {
-    return { kind: "task.failed", summary: "OpenCode task failed", raw };
-  }
-  if (text.includes("complete") || text.includes("completed") || text.includes("done")) {
-    return { kind: "task.completed", summary: "OpenCode task completed", raw };
-  }
-  if (text.includes("progress") || text.includes("delta") || text.includes("assistant")) {
-    return { kind: "task.progress", summary: "OpenCode task made progress", raw };
-  }
-  if (text.includes("start") || text.includes("created") || text.includes("connected")) {
-    return { kind: "task.started", summary: "OpenCode task/server started", raw };
-  }
-  return { kind: null, raw };
 }
 
 function evaluateLifecycle(input: {
@@ -545,6 +631,123 @@ async function fetchSseEvents(serverUrl: string, options?: { maxEvents?: number;
   }
 }
 
+function resolveServerUrl(cfg: any, params?: any): string {
+  return asString(params?.opencodeServerUrl)
+    || asString(params?.serverUrl)
+    || getRuntimeConfig(cfg).opencodeServerUrl
+    || "http://127.0.0.1:4096";
+}
+
+async function fetchJsonSafe(url: string): Promise<{ ok: boolean; status?: number; data?: any; error?: string }> {
+  try {
+    const response = await fetch(url);
+    const text = await response.text();
+    let data: any = undefined;
+    try { data = text ? JSON.parse(text) : undefined; } catch { data = text; }
+    return { ok: response.ok, status: response.status, data };
+  } catch (error: any) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+}
+
+function resolveSessionForRun(input: {
+  sessionId?: string;
+  runStatus?: Phase3RunStatus | null;
+  sessionList?: any[];
+  runId?: string;
+}): { sessionId?: string; strategy: string; score?: number } {
+  const artifactEnvelope = input.runStatus?.envelope as any;
+  const resolved = resolveSessionId({
+    explicitSessionId: input.sessionId,
+    runId: input.runId || input.runStatus?.runId,
+    taskId: input.runStatus?.taskId,
+    sessionKey: artifactEnvelope?.session_key,
+    artifactSessionId:
+      (typeof artifactEnvelope?.session_id === 'string' ? artifactEnvelope.session_id : undefined)
+      || (typeof artifactEnvelope?.sessionId === 'string' ? artifactEnvelope.sessionId : undefined),
+    sessionList: input.sessionList,
+  });
+  return { sessionId: resolved.sessionId, strategy: resolved.strategy, ...(resolved.score !== undefined ? { score: resolved.score } : {}) };
+}
+
+async function collectSseEvents(
+  serverUrl: string,
+  scope: EventScope,
+  options?: { limit?: number; timeoutMs?: number; runIdHint?: string; taskIdHint?: string; sessionIdHint?: string }
+): Promise<RunEventRecord[]> {
+  const eventPath = scope === 'session' ? '/event' : '/global/event';
+  const limit = Math.max(1, asNumber(options?.limit) || DEFAULT_EVENT_LIMIT);
+  const timeoutMs = Math.max(200, asNumber(options?.timeoutMs) || DEFAULT_OBS_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const events: RunEventRecord[] = [];
+  try {
+    const response = await fetch(`${serverUrl.replace(/\/$/, "")}${eventPath}`, {
+      headers: { Accept: 'text/event-stream' },
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) return events;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (events.length < limit) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      const parsed = parseSseFramesFromBuffer(buffer);
+      buffer = parsed.remainder;
+
+      for (const frame of parsed.frames) {
+        const typed = normalizeTypedEventV1(frame, scope);
+        events.push({
+          index: events.length,
+          scope,
+          rawLine: frame.raw,
+          data: typed.payload,
+          normalizedKind: typed.kind,
+          summary: typed.summary,
+          runId: typed.runId || options?.runIdHint,
+          taskId: typed.taskId || options?.taskIdHint,
+          sessionId: typed.sessionId || options?.sessionIdHint,
+          typedEvent: typed,
+          timestamp: new Date().toISOString(),
+        });
+        if (events.length >= limit) break;
+      }
+    }
+
+    if (events.length < limit && buffer.trim()) {
+      const tail = parseSseFramesFromBuffer(`${buffer}\n\n`);
+      for (const frame of tail.frames) {
+        const typed = normalizeTypedEventV1(frame, scope);
+        events.push({
+          index: events.length,
+          scope,
+          rawLine: frame.raw,
+          data: typed.payload,
+          normalizedKind: typed.kind,
+          summary: typed.summary,
+          runId: typed.runId || options?.runIdHint,
+          taskId: typed.taskId || options?.taskIdHint,
+          sessionId: typed.sessionId || options?.sessionIdHint,
+          typedEvent: typed,
+          timestamp: new Date().toISOString(),
+        });
+        if (events.length >= limit) break;
+      }
+    }
+
+    try { controller.abort(); } catch {}
+    try { await reader.cancel(); } catch {}
+    return events;
+  } catch {
+    return events;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function executeHooksAgentCallback(hookBaseUrl: string, hookToken: string, callback: HooksAgentCallbackPayload) {
   const response = await fetch(`${hookBaseUrl.replace(/\/$/, "")}/hooks/agent`, {
     method: "POST",
@@ -671,6 +874,230 @@ const plugin = {
       async execute(_id: string, params: any) {
         const evaluation = evaluateLifecycle({ lastEventKind: params.lastEventKind, lastEventAtMs: asNumber(params.lastEventAtMs), nowMs: asNumber(params.nowMs), softStallMs: asNumber(params.softStallMs), hardStallMs: asNumber(params.hardStallMs) });
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, evaluation }, null, 2) }] };
+      }
+    }, { optional: true });
+
+    api.registerTool({
+      name: "opencode_run_status",
+      label: "OpenCode Run Status",
+      description: "Read-only run snapshot: hợp nhất artifact run status local và API snapshot từ OpenCode serve (/global/health, /session, /session/status).",
+      parameters: {
+        type: "object",
+        properties: {
+          runId: { type: "string" },
+          sessionId: { type: "string" },
+          opencodeServerUrl: { type: "string" },
+        }
+      },
+      async execute(_id: string, params: any) {
+        const serverUrl = resolveServerUrl(cfg, params);
+        const runId = asString(params?.runId);
+        const artifact = runId ? readRunStatus(runId) : null;
+
+        const [healthRes, sessionRes, sessionStatusRes] = await Promise.all([
+          fetchJsonSafe(`${serverUrl.replace(/\/$/, "")}/global/health`),
+          fetchJsonSafe(`${serverUrl.replace(/\/$/, "")}/session`),
+          fetchJsonSafe(`${serverUrl.replace(/\/$/, "")}/session/status`),
+        ]);
+
+        const sessionList = Array.isArray(sessionRes.data) ? sessionRes.data : [];
+        const resolution = resolveSessionForRun({
+          sessionId: asString(params?.sessionId),
+          runStatus: artifact,
+          sessionList,
+          runId,
+        });
+        const sessionId = resolution.sessionId;
+        const state = artifact?.state || (sessionId ? "running" : "queued");
+
+        const response: RunStatusResponse = {
+          ok: true,
+          source: {
+            runStatusArtifact: Boolean(artifact),
+            opencodeApi: true,
+          },
+          runId: runId || undefined,
+          taskId: artifact?.taskId,
+          projectId: artifact?.envelope?.project_id,
+          sessionId,
+          correlation: {
+            sessionResolution: {
+              strategy: resolution.strategy,
+              ...(resolution.score !== undefined ? { score: resolution.score } : {}),
+            },
+          },
+          state,
+          lastEvent: artifact?.lastEvent,
+          lastSummary: artifact?.lastSummary,
+          updatedAt: new Date().toISOString(),
+          timestamps: {
+            ...(artifact?.updatedAt ? { artifactUpdatedAt: artifact.updatedAt } : {}),
+            apiFetchedAt: new Date().toISOString(),
+          },
+          health: {
+            ok: Boolean(healthRes.ok && (healthRes.data?.healthy === true || healthRes.status === 200)),
+            ...(asString(healthRes?.data?.version) ? { version: asString(healthRes?.data?.version) } : {}),
+          },
+          apiSnapshot: {
+            health: healthRes.data,
+            sessionList,
+            sessionStatus: sessionStatusRes.data,
+            fetchedAt: new Date().toISOString(),
+          },
+          ...(artifact ? {} : { note: "No local run artifact found for runId. Returned API-only snapshot." }),
+        };
+
+        return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
+      }
+    }, { optional: true });
+
+    api.registerTool({
+      name: "opencode_run_events",
+      label: "OpenCode Run Events",
+      description: "Read-only event probe: lấy SSE event từ /event hoặc /global/event, normalize sơ bộ về OpenCodeEventKind.",
+      parameters: {
+        type: "object",
+        properties: {
+          scope: { type: "string", enum: ["session", "global"] },
+          limit: { type: "number" },
+          timeoutMs: { type: "number" },
+          runId: { type: "string" },
+          sessionId: { type: "string" },
+          opencodeServerUrl: { type: "string" },
+        }
+      },
+      async execute(_id: string, params: any) {
+        const serverUrl = resolveServerUrl(cfg, params);
+        const runId = asString(params?.runId);
+        const artifact = runId ? readRunStatus(runId) : null;
+        const scope: EventScope = params?.scope === "global" ? "global" : "session";
+        const timeoutMs = Math.max(200, asNumber(params?.timeoutMs) || DEFAULT_OBS_TIMEOUT_MS);
+        const limit = Math.max(1, asNumber(params?.limit) || DEFAULT_EVENT_LIMIT);
+
+        const sessionListRes = await fetchJsonSafe(`${serverUrl.replace(/\/$/, "")}/session`);
+        const sessionList = Array.isArray(sessionListRes.data) ? sessionListRes.data : [];
+        const resolution = resolveSessionForRun({
+          sessionId: asString(params?.sessionId),
+          runStatus: artifact,
+          sessionList,
+          runId,
+        });
+        const sessionId = resolution.sessionId;
+
+        const events = await collectSseEvents(serverUrl, scope, {
+          limit,
+          timeoutMs,
+          runIdHint: runId,
+          taskIdHint: artifact?.taskId,
+          sessionIdHint: sessionId,
+        });
+        const response: RunEventsResponse = {
+          ok: true,
+          ...(runId ? { runId } : {}),
+          ...(artifact?.taskId ? { taskId: artifact.taskId } : {}),
+          ...(sessionId ? { sessionId } : {}),
+          correlation: {
+            sessionResolution: {
+              strategy: resolution.strategy,
+              ...(resolution.score !== undefined ? { score: resolution.score } : {}),
+            },
+          },
+          scope,
+          schemaVersion: "opencode.event.v1",
+          eventPath: scope === "global" ? "/global/event" : "/event",
+          eventCount: events.length,
+          events,
+          truncated: events.length >= limit,
+          timeoutMs,
+        };
+        return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
+      }
+    }, { optional: true });
+
+    api.registerTool({
+      name: "opencode_session_tail",
+      label: "OpenCode Session Tail",
+      description: "Read-only session tail: đọc message tail từ /session/{id}/message và optional diff từ /session/{id}/diff.",
+      parameters: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          runId: { type: "string" },
+          limit: { type: "number" },
+          includeDiff: { type: "boolean" },
+          opencodeServerUrl: { type: "string" },
+        }
+      },
+      async execute(_id: string, params: any) {
+        const serverUrl = resolveServerUrl(cfg, params);
+        const runId = asString(params?.runId);
+        const artifact = runId ? readRunStatus(runId) : null;
+
+        const sessionListRes = await fetchJsonSafe(`${serverUrl.replace(/\/$/, "")}/session`);
+        const sessionList = Array.isArray(sessionListRes.data) ? sessionListRes.data : [];
+        const resolution = resolveSessionForRun({
+          sessionId: asString(params?.sessionId),
+          runStatus: artifact,
+          sessionList,
+          runId,
+        });
+        const sessionId = resolution.sessionId;
+        if (!sessionId) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Missing sessionId and could not resolve from run artifact/session list." }, null, 2) }]
+          };
+        }
+
+        const limit = Math.max(1, asNumber(params?.limit) || DEFAULT_TAIL_LIMIT);
+        const includeDiff = params?.includeDiff !== false;
+
+        const [messagesRes, diffRes, sessionRes] = await Promise.all([
+          fetchJsonSafe(`${serverUrl.replace(/\/$/, "")}/session/${sessionId}/message`),
+          includeDiff ? fetchJsonSafe(`${serverUrl.replace(/\/$/, "")}/session/${sessionId}/diff`) : Promise.resolve({ ok: false, data: undefined }),
+          fetchJsonSafe(`${serverUrl.replace(/\/$/, "")}/session/${sessionId}`),
+        ]);
+
+        const rawMessages = Array.isArray(messagesRes.data) ? messagesRes.data : [];
+        const tail = rawMessages.slice(Math.max(0, rawMessages.length - limit)).map((msg: any, idx: number) => {
+          const info = msg?.info || {};
+          const parts = Array.isArray(msg?.parts) ? msg.parts : [];
+          const text = parts
+            .filter((p: any) => p?.type === 'text' && typeof p?.text === 'string')
+            .map((p: any) => p.text)
+            .join("\n");
+          return {
+            index: idx,
+            role: asString(info.role),
+            text: text || undefined,
+            createdAt: info?.time?.created,
+            id: asString(info.id),
+            agent: asString(info.agent),
+            model: asString(info?.model?.modelID),
+            raw: msg,
+          } as SessionTailMessage;
+        });
+
+        const response: SessionTailResponse = {
+          ok: true,
+          sessionId,
+          ...(runId ? { runId } : {}),
+          ...(artifact?.taskId ? { taskId: artifact.taskId } : {}),
+          correlation: {
+            sessionResolution: {
+              strategy: resolution.strategy,
+              ...(resolution.score !== undefined ? { score: resolution.score } : {}),
+            },
+          },
+          limit,
+          totalMessages: rawMessages.length,
+          messages: tail,
+          ...(includeDiff ? { diff: diffRes.data } : {}),
+          latestSummary: sessionRes.data,
+          fetchedAt: new Date().toISOString(),
+        };
+
+        return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
       }
     }, { optional: true });
 

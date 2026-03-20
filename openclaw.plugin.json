@@ -1,0 +1,44 @@
+{
+  "id": "opencode-bridge",
+  "name": "OpenCode Bridge",
+  "description": "Bridge plugin scaffold for OpenClaw ↔ OpenCode orchestration.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "opencodeServerUrl": {
+        "type": "string",
+        "description": "Base URL of the OpenCode serve instance for this bridge."
+      },
+      "projectRegistry": {
+        "type": "array",
+        "description": "Optional project-to-server registry entries.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "projectId": { "type": "string" },
+            "repoRoot": { "type": "string" },
+            "serverUrl": { "type": "string" },
+            "idleTimeoutMs": { "type": "number" }
+          },
+          "required": ["projectId", "repoRoot", "serverUrl"]
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "opencodeServerUrl": {
+      "label": "OpenCode Server URL",
+      "placeholder": "http://127.0.0.1:4096"
+    },
+    "hookBaseUrl": {
+      "label": "OpenClaw Hook Base URL",
+      "placeholder": "http://127.0.0.1:18789"
+    },
+    "hookToken": {
+      "label": "OpenClaw Hook Token"
+    }
+  }
+}

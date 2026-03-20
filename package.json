@@ -1,0 +1,28 @@
+{
+  "name": "@mrc2204/openclaw-opencode-bridge",
+  "version": "0.1.0",
+  "description": "OpenClaw ↔ OpenCode bridge plugin for routing, callback, SSE probing, and runtime-ops scaffolding.",
+  "type": "module",
+  "main": "src/index.ts",
+  "private": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cong91/openclaw-opencode-bridge.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "openclaw": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src/",
+    "skills/",
+    "README.md",
+    "README.en.md",
+    "openclaw.plugin.json"
+  ]
+}

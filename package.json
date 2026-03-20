@@ -3,7 +3,15 @@
   "version": "0.1.0",
   "description": "OpenClaw ↔ OpenCode bridge plugin for routing, callback, SSE probing, and runtime-ops scaffolding.",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
   "private": false,
   "license": "MIT",
   "repository": {
@@ -13,13 +21,26 @@
   "publishConfig": {
     "access": "public"
   },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "tsup src/index.ts src/observability.ts --format esm --dts --clean",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/run-tests.ts",
+    "prepublishOnly": "npm run build && npm run test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
   "openclaw": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ]
   },
   "files": [
-    "src/",
+    "dist/",
     "skills/",
     "README.md",
     "README.en.md",

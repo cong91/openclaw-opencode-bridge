@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildEnvelope, buildHooksAgentCallback, resolveExecutionAgent } from "../src/runtime";
+import { assertCallbackTargetSessionKey, buildEnvelope, buildHooksAgentCallback, resolveExecutionAgent, resolveSessionForRun } from "../src/runtime";
 
 test("resolveExecutionAgent uses explicit executionAgentId when provided", () => {
   const resolved = resolveExecutionAgent({
@@ -78,4 +78,90 @@ test("buildHooksAgentCallback routes callback to requester agent + origin sessio
   assert.equal(callback.sessionId, "origin-session-2");
   assert.match(callback.message, /requestedAgent=creator/);
   assert.match(callback.message, /resolvedAgent=coder-lane/);
+});
+
+test("assertCallbackTargetSessionKey fails fast when callback_target_session_key is missing", () => {
+  const envelope = buildEnvelope({
+    taskId: "task-2b",
+    runId: "run-2b",
+    requestedAgentId: "creator",
+    resolvedAgentId: "coder-lane",
+    originSessionKey: "session:origin:key:2b",
+    projectId: "proj-2b",
+    repoRoot: "/tmp/repo2b",
+    serverUrl: "http://127.0.0.1:4097",
+  });
+
+  const brokenEnvelope = { ...envelope } as any;
+  delete brokenEnvelope.callback_target_session_key;
+
+  assert.throws(() => assertCallbackTargetSessionKey(brokenEnvelope), /missing callback_target_session_key/i);
+  assert.throws(() => buildHooksAgentCallback({ event: "task.progress", envelope: brokenEnvelope }), /missing callback_target_session_key/i);
+});
+
+test("resolveSessionForRun prefers callback_target_session_id over execution session artifacts", () => {
+  const runStatus = {
+    taskId: "task-3",
+    runId: "run-3",
+    state: "running",
+    updatedAt: new Date().toISOString(),
+    envelope: {
+      task_id: "task-3",
+      run_id: "run-3",
+      agent_id: "coder-lane",
+      requested_agent_id: "creator",
+      resolved_agent_id: "coder-lane",
+      session_key: "hook:opencode:coder-lane:task-3",
+      origin_session_key: "session:origin:key:3",
+      callback_target_session_key: "session:origin:key:3",
+      callback_target_session_id: "sess-origin-3",
+      project_id: "proj-3",
+      repo_root: "/tmp/repo3",
+      opencode_server_url: "http://127.0.0.1:4098",
+    },
+  } as any;
+
+  const resolved = resolveSessionForRun({
+    runStatus,
+    sessionList: [
+      { id: "sess-exec-3", time: { updated: 300 }, metadata: { run_id: "run-3", session_key: "hook:opencode:coder-lane:task-3" } },
+      { id: "sess-origin-3", time: { updated: 200 }, metadata: { session_key: "session:origin:key:3" } },
+    ],
+  });
+
+  assert.equal(resolved.sessionId, "sess-origin-3");
+  assert.equal(resolved.strategy, "artifact");
+});
+
+test("resolveSessionForRun falls back to callback target session key before execution session key", () => {
+  const runStatus = {
+    taskId: "task-4",
+    runId: "run-4",
+    state: "running",
+    updatedAt: new Date().toISOString(),
+    envelope: {
+      task_id: "task-4",
+      run_id: "run-4",
+      agent_id: "coder-lane",
+      requested_agent_id: "creator",
+      resolved_agent_id: "coder-lane",
+      session_key: "hook:opencode:coder-lane:task-4",
+      origin_session_key: "session:origin:key:4",
+      callback_target_session_key: "session:origin:key:4",
+      project_id: "proj-4",
+      repo_root: "/tmp/repo4",
+      opencode_server_url: "http://127.0.0.1:4099",
+    },
+  } as any;
+
+  const resolved = resolveSessionForRun({
+    runStatus,
+    sessionList: [
+      { id: "sess-exec-4", time: { updated: 400 }, metadata: { run_id: "run-4", session_key: "hook:opencode:coder-lane:task-4" } },
+      { id: "sess-origin-4", time: { updated: 250 }, metadata: { session_key: "session:origin:key:4" } },
+    ],
+  });
+
+  assert.equal(resolved.sessionId, "sess-origin-4");
+  assert.equal(resolved.strategy, "scored_fallback");
 });

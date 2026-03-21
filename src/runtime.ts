@@ -244,6 +244,14 @@ export function mapEventToState(event: OpenCodeEventKind): BridgeLifecycleState 
   }
 }
 
+export function assertCallbackTargetSessionKey(envelope: RoutingEnvelope): string {
+  const callbackTargetSessionKey = asString((envelope as any)?.callback_target_session_key);
+  if (!callbackTargetSessionKey) {
+    throw new Error("Invalid routing envelope: missing callback_target_session_key (required for current-session callback integrity)");
+  }
+  return callbackTargetSessionKey;
+}
+
 export function buildHooksAgentCallback(input: {
   event: OpenCodeEventKind;
   envelope: RoutingEnvelope;
@@ -254,12 +262,14 @@ export function buildHooksAgentCallback(input: {
     input.summary ||
     `OpenCode event=${input.event} state=${state} task=${input.envelope.task_id} run=${input.envelope.run_id} project=${input.envelope.project_id} requestedAgent=${input.envelope.requested_agent_id} resolvedAgent=${input.envelope.resolved_agent_id}`;
 
+  const callbackTargetSessionKey = assertCallbackTargetSessionKey(input.envelope);
+
   return {
     message,
     name: "OpenCode",
     // callback should wake requester/origin lane, not execution lane
     agentId: input.envelope.requested_agent_id,
-    sessionKey: input.envelope.callback_target_session_key,
+    sessionKey: callbackTargetSessionKey,
     ...(input.envelope.callback_target_session_id ? { sessionId: input.envelope.callback_target_session_id } : {}),
     wakeMode: "now",
     deliver: false,
@@ -551,14 +561,36 @@ export function resolveSessionForRun(input: {
   runId?: string;
 }): { sessionId?: string; strategy: string; score?: number } {
   const artifactEnvelope = input.runStatus?.envelope as any;
+
+  // Prefer callback/origin correlation over execution lane keys to preserve
+  // "current caller session" integrity when resolving observability surfaces.
+  const callbackTargetSessionId =
+    typeof artifactEnvelope?.callback_target_session_id === "string" ? artifactEnvelope.callback_target_session_id : undefined;
+  const originSessionId = typeof artifactEnvelope?.origin_session_id === "string" ? artifactEnvelope.origin_session_id : undefined;
+
+  const callbackTargetSessionKey =
+    typeof artifactEnvelope?.callback_target_session_key === "string" ? artifactEnvelope.callback_target_session_key : undefined;
+  const originSessionKey = typeof artifactEnvelope?.origin_session_key === "string" ? artifactEnvelope.origin_session_key : undefined;
+  const executionSessionKey = typeof artifactEnvelope?.session_key === "string" ? artifactEnvelope.session_key : undefined;
+
+  const artifactSessionId =
+    callbackTargetSessionId ||
+    originSessionId ||
+    (typeof artifactEnvelope?.session_id === "string" ? artifactEnvelope.session_id : undefined) ||
+    (typeof artifactEnvelope?.sessionId === "string" ? artifactEnvelope.sessionId : undefined);
+
+  const artifactSessionKey = callbackTargetSessionKey || originSessionKey || executionSessionKey;
+
+  // When callback target key is available, avoid biasing scored fallback toward
+  // execution lane sessions via runId/taskId tokens.
+  const hasCallerSessionKey = Boolean(callbackTargetSessionKey || originSessionKey);
+
   const resolved = resolveSessionId({
     explicitSessionId: input.sessionId,
-    runId: input.runId || input.runStatus?.runId,
-    taskId: input.runStatus?.taskId,
-    sessionKey: artifactEnvelope?.session_key,
-    artifactSessionId:
-      (typeof artifactEnvelope?.session_id === "string" ? artifactEnvelope.session_id : undefined) ||
-      (typeof artifactEnvelope?.sessionId === "string" ? artifactEnvelope.sessionId : undefined),
+    runId: hasCallerSessionKey ? undefined : input.runId || input.runStatus?.runId,
+    taskId: hasCallerSessionKey ? undefined : input.runStatus?.taskId,
+    sessionKey: artifactSessionKey,
+    artifactSessionId,
     sessionList: input.sessionList,
   });
   return { sessionId: resolved.sessionId, strategy: resolved.strategy, ...(resolved.score !== undefined ? { score: resolved.score } : {}) };

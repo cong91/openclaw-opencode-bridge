@@ -1,6 +1,6 @@
 {
   "name": "@mrc2204/opencode-bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "OpenClaw ↔ OpenCode bridge plugin for routing, callback, SSE probing, and runtime-ops scaffolding.",
   "type": "module",
   "main": "./dist/index.js",

@@ -1,9 +1,11 @@
 import { registerOpenCodeBridgeTools } from "./registrar";
 
+const PLUGIN_VERSION = "0.1.1";
+
 const plugin = {
   id: "opencode-bridge",
   name: "OpenCode Bridge",
-  version: "0.1.0",
+  version: PLUGIN_VERSION,
   register(api: any) {
     const cfg = (api as any)?.pluginConfig || {};
     registerOpenCodeBridgeTools(api, cfg);

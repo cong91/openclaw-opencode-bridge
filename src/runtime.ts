@@ -8,6 +8,7 @@ import {
   parseSseFramesFromBuffer,
   normalizeTypedEventV1,
   resolveSessionId,
+  summarizeLifecycle,
 } from "./observability";
 import type {
   BridgeConfigFile,
@@ -229,6 +230,7 @@ export function buildEnvelope(input: {
 export function mapEventToState(event: OpenCodeEventKind): BridgeLifecycleState {
   switch (event) {
     case "task.started":
+      return "planning";
     case "task.progress":
       return "running";
     case "permission.requested":
@@ -633,6 +635,11 @@ export async function collectSseEvents(
           data: typed.payload,
           normalizedKind: typed.kind,
           summary: typed.summary,
+          lifecycle_state: typed.lifecycleState,
+          files_changed: typed.filesChanged,
+          verify_summary: typed.verifySummary,
+          blockers: typed.blockers,
+          completion_summary: typed.completionSummary,
           runId: typed.runId || options?.runIdHint,
           taskId: typed.taskId || options?.taskIdHint,
           sessionId: typed.sessionId || options?.sessionIdHint,
@@ -654,6 +661,11 @@ export async function collectSseEvents(
           data: typed.payload,
           normalizedKind: typed.kind,
           summary: typed.summary,
+          lifecycle_state: typed.lifecycleState,
+          files_changed: typed.filesChanged,
+          verify_summary: typed.verifySummary,
+          blockers: typed.blockers,
+          completion_summary: typed.completionSummary,
           runId: typed.runId || options?.runIdHint,
           taskId: typed.taskId || options?.taskIdHint,
           sessionId: typed.sessionId || options?.sessionIdHint,

@@ -7,6 +7,7 @@ import {
   unwrapGlobalPayload,
   normalizeTypedEventV1,
   resolveSessionId,
+  summarizeLifecycle,
 } from "../src/observability";
 
 test("parseSseFramesFromBuffer parses event/id/data frames", () => {
@@ -121,4 +122,45 @@ test("resolveSessionId prefers explicit then artifact then scored fallback", () 
 test("parseSseData returns raw wrapper for non-json payload", () => {
   const parsed = parseSseData("not-json");
   assert.deepEqual(parsed, { raw: "not-json" });
+});
+
+test("normalizeTypedEventV1 + summarizeLifecycle extract semantic lifecycle envelope", () => {
+  const frames = [
+    {
+      event: "message",
+      id: "evt-plan",
+      data: JSON.stringify({ payload: { type: "task.progress", text: "planning discovery phase" } }),
+      raw: "data: ...",
+    },
+    {
+      event: "message",
+      id: "evt-code",
+      data: JSON.stringify({ payload: { type: "task.progress", tool: "apply_patch", files: ["src/runtime.ts"] } }),
+      raw: "data: ...",
+    },
+    {
+      event: "message",
+      id: "evt-verify",
+      data: JSON.stringify({ payload: { type: "task.progress", state: { input: { command: "npm test" }, metadata: { exit: 0, output: "PASS" } } } }),
+      raw: "data: ...",
+    },
+    {
+      event: "message",
+      id: "evt-done",
+      data: JSON.stringify({ payload: { type: "task.completed", text: "done summary" } }),
+      raw: "data: ...",
+    },
+  ];
+
+  const typed = frames.map((frame) => normalizeTypedEventV1(frame, "global"));
+  const summary = summarizeLifecycle(typed);
+
+  assert.equal(typed[0].lifecycleState, "planning");
+  assert.equal(typed[1].lifecycleState, "coding");
+  assert.equal(typed[2].lifecycleState, "verifying");
+  assert.equal(summary.current_state, "completed");
+  assert.deepEqual(summary.files_changed, ["src/runtime.ts"]);
+  assert.equal(summary.verify_summary.length, 1);
+  assert.equal(summary.verify_summary[0].command, "npm test");
+  assert.equal(summary.completion_summary, "done summary");
 });

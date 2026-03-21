@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { assertCallbackTargetSessionKey, buildEnvelope, buildHooksAgentCallback, resolveExecutionAgent, resolveSessionForRun } from "../src/runtime";
+import { assertCallbackTargetSessionKey, buildEnvelope, buildHooksAgentCallback, evaluateServeIdle, resolveExecutionAgent, resolveSessionForRun } from "../src/runtime";
 
 test("resolveExecutionAgent uses explicit executionAgentId when provided", () => {
   const resolved = resolveExecutionAgent({
@@ -164,4 +164,19 @@ test("resolveSessionForRun falls back to callback target session key before exec
 
   assert.equal(resolved.sessionId, "sess-origin-4");
   assert.equal(resolved.strategy, "scored_fallback");
+});
+
+test("evaluateServeIdle returns shutdown signal when idle timeout is exceeded", () => {
+  const now = Date.now();
+  const result = evaluateServeIdle({
+    project_id: "proj-idle",
+    repo_root: "/tmp/repo-idle",
+    opencode_server_url: "http://127.0.0.1:5000",
+    last_event_at: new Date(now - 20_000).toISOString(),
+    idle_timeout_ms: 5_000,
+    updated_at: new Date(now).toISOString(),
+  });
+
+  assert.equal(result.shouldShutdown, true);
+  assert.equal(result.reason, "idle_timeout_exceeded");
 });

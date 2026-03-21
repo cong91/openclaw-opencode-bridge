@@ -35,6 +35,10 @@ export type BridgeLifecycleState =
   | "server_ready"
   | "session_created"
   | "prompt_sent"
+  | "planning"
+  | "coding"
+  | "verifying"
+  | "blocked"
   | "running"
   | "awaiting_permission"
   | "stalled"
@@ -87,8 +91,15 @@ export type RunStatusResponse = {
     };
   };
   state: BridgeLifecycleState;
+  current_state?: BridgeLifecycleState | null;
   lastEvent?: OpenCodeEventKind | null;
+  last_event_kind?: OpenCodeEventKind | null;
   lastSummary?: string;
+  last_event_at?: string | null;
+  files_changed?: string[];
+  verify_summary?: { command?: string; exit?: number | null; output_preview?: string | null }[];
+  blockers?: string[];
+  completion_summary?: string | null;
   updatedAt: string;
   timestamps: {
     artifactUpdatedAt?: string;
@@ -109,6 +120,11 @@ export type RunEventRecord = {
   data?: any;
   normalizedKind?: OpenCodeEventKind | null;
   summary?: string;
+  lifecycle_state?: BridgeLifecycleState | null;
+  files_changed?: string[];
+  verify_summary?: { command?: string; exit?: number | null; output_preview?: string | null } | null;
+  blockers?: string[];
+  completion_summary?: string | null;
   runId?: string;
   taskId?: string;
   sessionId?: string;

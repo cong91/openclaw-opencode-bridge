@@ -134,6 +134,10 @@ test("opencode_run_status resolves current caller session via callback_target_se
     assert.equal(payload.ok, true);
     assert.equal(payload.sessionId, "sess-caller");
     assert.equal(payload.correlation?.sessionResolution?.strategy, "artifact");
+    assert.equal(payload.current_state, "running");
+    assert.ok(Array.isArray(payload.files_changed));
+    assert.ok(Array.isArray(payload.verify_summary));
+    assert.ok(Array.isArray(payload.blockers));
   } finally {
     await mock.close();
     harness.cleanup();
@@ -210,6 +214,8 @@ test("opencode_run_status prefers callback target session key over execution ses
     assert.equal(payload.ok, true);
     assert.equal(payload.sessionId, "sess-caller-2");
     assert.equal(payload.correlation?.sessionResolution?.strategy, "scored_fallback");
+    assert.ok(Array.isArray(payload.verify_summary));
+    assert.ok(Array.isArray(payload.blockers));
   } finally {
     await mock.close();
     harness.cleanup();

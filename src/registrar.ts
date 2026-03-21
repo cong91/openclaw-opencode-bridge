@@ -6,6 +6,7 @@ import type {
   ServeRegistryEntry,
 } from "./types";
 import type { EventScope } from "./observability";
+import { summarizeLifecycle } from "./observability";
 import {
   DEFAULT_OBS_TIMEOUT_MS,
   DEFAULT_EVENT_LIMIT,
@@ -171,7 +172,27 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
         runId,
       });
       const sessionId = resolution.sessionId;
-      const state = artifact?.state || (sessionId ? "running" : "queued");
+      const eventScope: EventScope = sessionId ? "session" : "global";
+      const events = await collectSseEvents(serverUrl, eventScope, {
+        limit: DEFAULT_EVENT_LIMIT,
+        timeoutMs: DEFAULT_OBS_TIMEOUT_MS,
+        runIdHint: runId,
+        taskIdHint: artifact?.taskId,
+        sessionIdHint: sessionId,
+      });
+      const lifecycleSummary = summarizeLifecycle(
+        events.map((event) => ({
+          kind: event.normalizedKind,
+          summary: event.summary,
+          lifecycleState: event.lifecycle_state as any,
+          filesChanged: event.files_changed,
+          verifySummary: event.verify_summary as any,
+          blockers: event.blockers,
+          completionSummary: event.completion_summary,
+          timestamp: event.timestamp,
+        }))
+      );
+      const state = (lifecycleSummary.current_state as any) || artifact?.state || (sessionId ? "running" : "queued");
 
       const response: RunStatusResponse = {
         ok: true,
@@ -190,8 +211,15 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
           },
         },
         state,
+        current_state: (lifecycleSummary.current_state as any) || state,
         lastEvent: artifact?.lastEvent,
+        last_event_kind: artifact?.lastEvent,
         lastSummary: artifact?.lastSummary,
+        last_event_at: artifact?.updatedAt || new Date().toISOString(),
+        files_changed: lifecycleSummary.files_changed,
+        verify_summary: lifecycleSummary.verify_summary,
+        blockers: lifecycleSummary.blockers,
+        completion_summary: lifecycleSummary.completion_summary || artifact?.lastSummary || null,
         updatedAt: new Date().toISOString(),
         timestamps: {
           ...(artifact?.updatedAt ? { artifactUpdatedAt: artifact.updatedAt } : {}),

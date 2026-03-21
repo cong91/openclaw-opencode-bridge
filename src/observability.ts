@@ -23,6 +23,11 @@ export type TypedEventV1 = {
   eventId?: string;
   kind: OpenCodeEventKind | null;
   summary?: string;
+  lifecycleState?: "planning" | "coding" | "verifying" | "blocked" | "running" | "awaiting_permission" | "stalled" | "failed" | "completed";
+  filesChanged?: string[];
+  verifySummary?: { command?: string; exit?: number | null; output_preview?: string | null } | null;
+  blockers?: string[];
+  completionSummary?: string | null;
   runId?: string;
   taskId?: string;
   sessionId?: string;
@@ -111,27 +116,128 @@ function pickFirstString(obj: any, keys: string[]): string | undefined {
   return undefined;
 }
 
-export function normalizeOpenCodeEvent(raw: any): { kind: OpenCodeEventKind | null; summary?: string; raw: any } {
+function asObject(value: any): Record<string, any> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+
+function asArray<T = any>(value: any): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim()))];
+}
+
+function inferLifecycleState(raw: any): TypedEventV1["lifecycleState"] {
   const text = JSON.stringify(raw || {}).toLowerCase();
+  if (text.includes("permission") || text.includes("question.asked")) return "awaiting_permission";
+  if (text.includes("blocked") || text.includes("missing config") || text.includes("missing token") || text.includes("missing api_key")) return "blocked";
+  if (text.includes("error") || text.includes("failed")) return "failed";
+  if (text.includes("stalled")) return "stalled";
+  if (text.includes("compile") || text.includes("pytest") || text.includes("test") || text.includes("verify")) return "verifying";
+  if (text.includes("apply_patch") || text.includes("diff") || text.includes("edit") || text.includes("write")) return "coding";
+  if (text.includes("plan") || text.includes("discovery") || text.includes("ground") || text.includes("calibrate")) return "planning";
+  if (text.includes("complete") || text.includes("completed") || text.includes("done")) return "completed";
+  return "running";
+}
+
+function extractFilesChanged(raw: any): string[] {
+  const files: string[] = [];
+  const root = asObject(raw) || {};
+  const payload = asObject(root.payload) || root;
+  const state = asObject(root.state) || asObject(payload.state) || {};
+  const metadata = asObject(state.metadata) || asObject(payload.metadata) || {};
+
+  for (const file of asArray(metadata.files)) {
+    const obj = asObject(file);
+    if (!obj) continue;
+    if (typeof obj.relativePath === "string") files.push(obj.relativePath);
+    else if (typeof obj.filePath === "string") files.push(obj.filePath);
+  }
+
+  for (const file of asArray(root.files)) {
+    if (typeof file === "string") files.push(file);
+  }
+
+  return uniqueStrings(files);
+}
+
+function extractVerifySummary(raw: any): { command?: string; exit?: number | null; output_preview?: string | null } | null {
+  const root = asObject(raw) || {};
+  const payload = asObject(root.payload) || root;
+  const state = asObject(root.state) || asObject(payload.state);
+  const input = asObject(state?.input);
+  const metadata = asObject(state?.metadata);
+  const command = typeof input?.command === "string" ? input.command : undefined;
+  const exit = typeof metadata?.exit === "number" ? metadata.exit : null;
+  const output = typeof state?.output === "string" ? state.output : typeof metadata?.output === "string" ? metadata.output : null;
+  if (!command && output == null) return null;
+  return {
+    command,
+    exit,
+    output_preview: typeof output === "string" ? output.slice(0, 500) : null,
+  };
+}
+
+function extractBlockers(raw: any): string[] {
+  const text = JSON.stringify(raw || {}).toLowerCase();
+  const blockers: string[] = [];
+  if (text.includes("no module named pytest")) blockers.push("pytest_missing");
+  if (text.includes("missing token") || text.includes("missing api_key") || text.includes("pow service not configured")) blockers.push("runtime_config_missing");
+  if (text.includes("permission") || text.includes("question.asked")) blockers.push("awaiting_permission");
+  return uniqueStrings(blockers);
+}
+
+function extractCompletionSummary(raw: any): string | null {
+  const root = asObject(raw) || {};
+  const text = typeof root.text === "string" ? root.text : typeof root.summary === "string" ? root.summary : null;
+  return text ? text.slice(0, 2000) : null;
+}
+
+export function normalizeOpenCodeEvent(raw: any): {
+  kind: OpenCodeEventKind | null;
+  summary?: string;
+  raw: any;
+  lifecycleState?: TypedEventV1["lifecycleState"];
+  filesChanged?: string[];
+  verifySummary?: { command?: string; exit?: number | null; output_preview?: string | null } | null;
+  blockers?: string[];
+  completionSummary?: string | null;
+} {
+  const text = JSON.stringify(raw || {}).toLowerCase();
+  let kind: OpenCodeEventKind | null = null;
+  let summary: string | undefined;
+
   if (text.includes("permission") || text.includes("question.asked")) {
-    return { kind: "permission.requested", summary: "OpenCode đang chờ permission/user input", raw };
+    kind = "permission.requested";
+    summary = "OpenCode đang chờ permission/user input";
+  } else if (text.includes("error") || text.includes("failed")) {
+    kind = "task.failed";
+    summary = "OpenCode task failed";
+  } else if (text.includes("stalled")) {
+    kind = "task.stalled";
+    summary = "OpenCode task stalled";
+  } else if (text.includes("complete") || text.includes("completed") || text.includes("done")) {
+    kind = "task.completed";
+    summary = "OpenCode task completed";
+  } else if (text.includes("progress") || text.includes("delta") || text.includes("assistant")) {
+    kind = "task.progress";
+    summary = "OpenCode task made progress";
+  } else if (text.includes("start") || text.includes("created") || text.includes("connected")) {
+    kind = "task.started";
+    summary = "OpenCode task/server started";
   }
-  if (text.includes("error") || text.includes("failed")) {
-    return { kind: "task.failed", summary: "OpenCode task failed", raw };
-  }
-  if (text.includes("stalled")) {
-    return { kind: "task.stalled", summary: "OpenCode task stalled", raw };
-  }
-  if (text.includes("complete") || text.includes("completed") || text.includes("done")) {
-    return { kind: "task.completed", summary: "OpenCode task completed", raw };
-  }
-  if (text.includes("progress") || text.includes("delta") || text.includes("assistant")) {
-    return { kind: "task.progress", summary: "OpenCode task made progress", raw };
-  }
-  if (text.includes("start") || text.includes("created") || text.includes("connected")) {
-    return { kind: "task.started", summary: "OpenCode task/server started", raw };
-  }
-  return { kind: null, raw };
+
+  return {
+    kind,
+    summary,
+    raw,
+    lifecycleState: inferLifecycleState(raw),
+    filesChanged: extractFilesChanged(raw),
+    verifySummary: extractVerifySummary(raw),
+    blockers: extractBlockers(raw),
+    completionSummary: extractCompletionSummary(raw),
+  };
 }
 
 export function normalizeTypedEventV1(frame: SseFrame, scope: EventScope): TypedEventV1 {
@@ -146,6 +252,11 @@ export function normalizeTypedEventV1(frame: SseFrame, scope: EventScope): Typed
     eventId: frame.id,
     kind: normalized.kind,
     summary: normalized.summary,
+    lifecycleState: normalized.lifecycleState,
+    filesChanged: normalized.filesChanged,
+    verifySummary: normalized.verifySummary,
+    blockers: normalized.blockers,
+    completionSummary: normalized.completionSummary,
     runId: pickFirstString(unwrapped.payload, ["run_id", "runId"]),
     taskId: pickFirstString(unwrapped.payload, ["task_id", "taskId"]),
     sessionId: pickFirstString(unwrapped.payload, ["session_id", "sessionId", "session"]),
@@ -176,6 +287,45 @@ function scoreSessionCandidate(candidate: any, ctx: { runId?: string; taskId?: s
   if (taskId && id.toLowerCase().includes(taskId)) score += 20;
   score += Math.max(0, 20 - ctx.recencyRank);
   return score;
+}
+
+export function summarizeLifecycle(events: Array<{
+  kind?: OpenCodeEventKind | null;
+  summary?: string;
+  lifecycleState?: TypedEventV1["lifecycleState"];
+  filesChanged?: string[];
+  verifySummary?: { command?: string; exit?: number | null; output_preview?: string | null } | null;
+  blockers?: string[];
+  completionSummary?: string | null;
+  timestamp?: string;
+}> = []) {
+  let current_state: TypedEventV1["lifecycleState"] | null = null;
+  let last_event_kind: OpenCodeEventKind | null = null;
+  let last_event_at: string | null = null;
+  const files_changed = new Set<string>();
+  const verify_summary: { command?: string; exit?: number | null; output_preview?: string | null }[] = [];
+  const blockers = new Set<string>();
+  let completion_summary: string | null = null;
+
+  for (const item of events) {
+    if (item.lifecycleState) current_state = item.lifecycleState;
+    if (item.kind) last_event_kind = item.kind;
+    if (item.timestamp) last_event_at = item.timestamp;
+    for (const file of item.filesChanged || []) files_changed.add(file);
+    if (item.verifySummary) verify_summary.push(item.verifySummary);
+    for (const blocker of item.blockers || []) blockers.add(blocker);
+    if (item.completionSummary) completion_summary = item.completionSummary;
+  }
+
+  return {
+    current_state,
+    last_event_kind,
+    last_event_at,
+    files_changed: [...files_changed],
+    verify_summary,
+    blockers: [...blockers],
+    completion_summary,
+  };
 }
 
 export function resolveSessionId(input: {

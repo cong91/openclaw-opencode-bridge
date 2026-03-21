@@ -500,6 +500,38 @@ Agents must describe these limits honestly and avoid over-claiming completion.
 
 ### Execution lane assumptions (MANDATORY)
 
+### Current-session callback integrity (MANDATORY)
+
+Bridge-aware execution must preserve caller identity and callback destination explicitly.
+
+Required fields to preserve whenever available:
+- `requested_agent_id`
+- `resolved_agent_id`
+- `origin_session_key`
+- `origin_session_id`
+- `callback_target_session_key`
+- `callback_target_session_id`
+
+Operational rules:
+- Callback must return to the **current caller session**, not an arbitrary latest/execution session.
+- If bridge/runtime cannot resolve the requested execution agent cleanly, it must **fail fast** instead of silently falling back to a default agent.
+- If callback target session information is missing or inconsistent, treat that as a routing integrity error, not a soft warning.
+- Reporting/trace should always expose:
+  - requested agent
+  - resolved execution agent
+  - callback target session key/id
+  - whether fallback was used
+
+### Runtime hygiene after completion (MANDATORY)
+
+When a task or epic is marked `done/closed`, any OpenCode serve/process that was started only for that execution must be shut down immediately unless there is an explicit reason to keep it alive.
+
+Operational rules:
+- Do not leave lingering OpenCode serves after work completes.
+- Treat serve shutdown as part of completion hygiene, not optional cleanup.
+- If a serve remains alive intentionally, the agent must report the reason explicitly.
+
+
 1. **One project = one OpenCode serve instance**
    - Do not assume one shared serve is safe for multiple repos.
    - Always bind execution to a single project/repo root.

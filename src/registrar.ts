@@ -4,6 +4,7 @@ import type {
   SessionTailMessage,
   SessionTailResponse,
   ServeRegistryEntry,
+  BridgeRunStatus,
 } from "./types";
 import type { EventScope } from "./observability";
 import { summarizeLifecycle } from "./observability";
@@ -37,14 +38,36 @@ import {
   getBridgeStateDir,
   getRunStateDir,
   getAuditDir,
+  startExecutionRun,
+  listRunStatuses,
 } from "./runtime";
 
-const PLUGIN_VERSION = "0.1.1";
+const PLUGIN_VERSION = "0.1.3";
+
+function buildExecutionPrompt(params: any, envelope: any): string {
+  const providedPrompt = asString(params?.prompt);
+  if (providedPrompt) return providedPrompt;
+  const objective = asString(params?.objective) || asString(params?.message) || `Complete task ${envelope.task_id}`;
+  const constraints = Array.isArray(params?.constraints) ? params.constraints.filter((x: any) => typeof x === "string" && x.trim()) : [];
+  const acceptance = Array.isArray(params?.acceptanceCriteria) ? params.acceptanceCriteria.filter((x: any) => typeof x === "string" && x.trim()) : [];
+  return [
+    `Task: ${objective}`,
+    `Run ID: ${envelope.run_id}`,
+    `Task ID: ${envelope.task_id}`,
+    `Requested agent: ${envelope.requested_agent_id}`,
+    `Resolved execution agent: ${envelope.resolved_agent_id}`,
+    constraints.length ? `Constraints:\n- ${constraints.join("\n- ")}` : undefined,
+    acceptance.length ? `Acceptance criteria:\n- ${acceptance.join("\n- ")}` : undefined,
+    "When complete, summarize files changed, verification performed, blockers (if any), and completion outcome in the session output.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
 
 export function registerOpenCodeBridgeTools(api: any, cfg: any) {
-  console.log("[opencode-bridge] scaffold loaded");
+  console.log("[opencode-bridge] plugin loaded");
   console.log(`[opencode-bridge] opencodeServerUrl=${cfg.opencodeServerUrl || "(unset)"}`);
-  console.log("[opencode-bridge] registering opencode_* tool set");
+  console.log("[opencode-bridge] registering opencode_* tools");
 
   api.registerTool({
     name: "opencode_status",
@@ -55,7 +78,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
       const runtimeCfg = getRuntimeConfig(cfg);
       const registry = normalizeRegistry(runtimeCfg.projectRegistry);
       return {
-        content: [{ type: "text", text: JSON.stringify({ ok: true, pluginId: "opencode-bridge", version: PLUGIN_VERSION, assumption: "1 project = 1 opencode serve instance", sessionKeyConvention: "hook:opencode:<agentId>:<taskId>", lifecycleStates: ["queued", "server_ready", "session_created", "prompt_sent", "running", "awaiting_permission", "stalled", "failed", "completed"], requiredEnvelopeFields: ["task_id", "run_id", "agent_id", "requested_agent_id", "resolved_agent_id", "session_key", "origin_session_key", "callback_target_session_key", "project_id", "repo_root", "opencode_server_url"], callbackPrimary: "/hooks/agent", callbackNotPrimary: ["/hooks/wake", "cron", "group:sessions"], config: { bridgeConfigPath: getBridgeConfigPath(), opencodeServerUrl: runtimeCfg.opencodeServerUrl || null, hookBaseUrl: runtimeCfg.hookBaseUrl || null, hookTokenPresent: Boolean(runtimeCfg.hookToken), projectRegistry: registry, executionAgentMappings: runtimeCfg.executionAgentMappings || [], stateDir: getBridgeStateDir(), runStateDir: getRunStateDir(), auditDir: getAuditDir() }, note: "Runtime-ops scaffold in progress. Plugin-owned config/state is stored under ~/.openclaw/opencode-bridge. New projects are auto-registered only when using opencode_serve_spawn (not by passive envelope build alone)." }, null, 2) }]
+        content: [{ type: "text", text: JSON.stringify({ ok: true, pluginId: "opencode-bridge", version: PLUGIN_VERSION, assumption: "1 project = 1 opencode serve instance", sessionKeyConvention: "hook:opencode:<agentId>:<taskId>", lifecycleStates: ["queued", "server_ready", "session_created", "prompt_sent", "planning", "coding", "verifying", "blocked", "running", "awaiting_permission", "stalled", "failed", "completed"], requiredEnvelopeFields: ["task_id", "run_id", "agent_id", "requested_agent_id", "resolved_agent_id", "session_key", "origin_session_key", "callback_target_session_key", "project_id", "repo_root", "opencode_server_url"], primaryCallbackPath: "/hooks/agent", alternativeSignalPaths: ["/hooks/wake", "cron", "group:sessions"], config: { bridgeConfigPath: getBridgeConfigPath(), opencodeServerUrl: runtimeCfg.opencodeServerUrl || null, hookBaseUrl: runtimeCfg.hookBaseUrl || null, hookTokenPresent: Boolean(runtimeCfg.hookToken), projectRegistry: registry, executionAgentMappings: runtimeCfg.executionAgentMappings || [], stateDir: getBridgeStateDir(), runStateDir: getRunStateDir(), auditDir: getAuditDir() }, note: "Plugin-owned config/state is stored under ~/.openclaw/opencode-bridge. New projects are auto-registered only when using opencode_serve_spawn, not by passive envelope build alone." }, null, 2) }]
       };
     }
   }, { optional: true });
@@ -131,6 +154,102 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
   }, { optional: true });
 
   api.registerTool({
+    name: "opencode_execute_task",
+    label: "OpenCode Execute Task",
+    description: "Execution entrypoint: resolve/spawn serve, create session, send prompt async, start SSE-driven watcher, callback once về /hooks/agent khi terminal.",
+    parameters: {
+      type: "object",
+      properties: {
+        taskId: { type: "string" },
+        runId: { type: "string" },
+        agentId: { type: "string", description: "Requester/origin agent id" },
+        executionAgentId: { type: "string" },
+        originSessionKey: { type: "string" },
+        originSessionId: { type: "string" },
+        projectId: { type: "string" },
+        repoRoot: { type: "string" },
+        prompt: { type: "string" },
+        objective: { type: "string" },
+        message: { type: "string" },
+        constraints: { type: "array", items: { type: "string" } },
+        acceptanceCriteria: { type: "array", items: { type: "string" } },
+        channel: { type: "string" },
+        to: { type: "string" },
+        deliver: { type: "boolean" },
+        priority: { type: "string" },
+        idleTimeoutMs: { type: "number" },
+        pollIntervalMs: { type: "number" },
+        maxWaitMs: { type: "number" }
+      },
+      required: ["taskId", "runId", "agentId", "originSessionKey", "projectId", "repoRoot"]
+    },
+    async execute(_id: string, params: any) {
+      const resolved = resolveExecutionAgent({
+        cfg,
+        requestedAgentId: asString(params?.agentId) || "",
+        explicitExecutionAgentId: asString(params?.executionAgentId),
+      });
+      if (!resolved.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: JSON.stringify({ ok: false, error: resolved.error, requestedAgentId: resolved.requestedAgentId, mappingConfigured: resolved.mappingConfigured }, null, 2) }],
+        };
+      }
+
+      const spawned = await spawnServeForProject({
+        project_id: params.projectId,
+        repo_root: params.repoRoot,
+        idle_timeout_ms: asNumber(params.idleTimeoutMs),
+      });
+      const serverUrl = spawned.entry.opencode_server_url;
+      const envelope = buildEnvelope({
+        taskId: params.taskId,
+        runId: params.runId,
+        requestedAgentId: resolved.requestedAgentId,
+        resolvedAgentId: resolved.resolvedAgentId,
+        originSessionKey: params.originSessionKey,
+        originSessionId: asString(params.originSessionId),
+        projectId: params.projectId,
+        repoRoot: params.repoRoot,
+        serverUrl,
+        channel: params.channel,
+        to: params.to,
+        deliver: params.deliver,
+        priority: params.priority,
+      });
+      const prompt = buildExecutionPrompt(params, envelope);
+      const execution = await startExecutionRun({
+        cfg,
+        envelope,
+        prompt,
+        pollIntervalMs: asNumber(params.pollIntervalMs),
+        maxWaitMs: asNumber(params.maxWaitMs),
+      });
+      const snapshot = listRunStatuses().find((item: BridgeRunStatus) => item.runId === params.runId) || null;
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            ok: true,
+            spawned,
+            envelope,
+            prompt,
+            execution: {
+              ok: execution.ok,
+              runId: execution.runId,
+              taskId: execution.taskId,
+              sessionId: execution.sessionId,
+              state: execution.state,
+              watcherStarted: execution.watcherStarted,
+            },
+            runStatus: snapshot,
+          }, null, 2)
+        }]
+      };
+    }
+  }, { optional: true });
+
+  api.registerTool({
     name: "opencode_evaluate_lifecycle",
     label: "OpenCode Evaluate Lifecycle",
     description: "Đánh giá lifecycle state hiện tại từ event cuối cùng hoặc thời gian im lặng để hỗ trợ stalled/permission/failure handling baseline.",
@@ -192,12 +311,12 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
           timestamp: event.timestamp,
         }))
       );
-      const state = (lifecycleSummary.current_state as any) || artifact?.state || (sessionId ? "running" : "queued");
+      const state = (lifecycleSummary.currentState as any) || artifact?.state || (sessionId ? "running" : "queued");
 
       const response: RunStatusResponse = {
         ok: true,
         source: {
-          runStatusArtifact: Boolean(artifact),
+          runArtifact: Boolean(artifact),
           opencodeApi: true,
         },
         runId: runId || undefined,
@@ -211,7 +330,8 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
           },
         },
         state,
-        current_state: (lifecycleSummary.current_state as any) || state,
+        currentState: (lifecycleSummary.currentState as any) || state,
+        current_state: (lifecycleSummary.currentState as any) || state,
         lastEvent: artifact?.lastEvent,
         last_event_kind: artifact?.lastEvent,
         lastSummary: artifact?.lastSummary,

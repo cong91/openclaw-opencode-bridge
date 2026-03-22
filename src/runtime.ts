@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
@@ -10,12 +10,13 @@ import {
   resolveSessionId,
   summarizeLifecycle,
 } from "./observability";
+import { buildTaggedSessionTitle } from "./shared-contracts";
 import type {
   BridgeConfigFile,
   BridgeLifecycleState,
   CallbackAuditRecord,
   HooksAgentCallbackPayload,
-  Phase3RunStatus,
+  BridgeRunStatus,
   ProjectRegistryEntry,
   RoutingEnvelope,
   RunEventRecord,
@@ -321,7 +322,7 @@ export function getRunStateDir(): string {
   return join(getBridgeStateDir(), "runs");
 }
 
-export function writeRunStatus(status: Phase3RunStatus) {
+export function writeRunStatus(status: BridgeRunStatus) {
   const dir = getRunStateDir();
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${status.runId}.json`);
@@ -329,10 +330,33 @@ export function writeRunStatus(status: Phase3RunStatus) {
   return path;
 }
 
-export function readRunStatus(runId: string): Phase3RunStatus | null {
+export function readRunStatus(runId: string): BridgeRunStatus | null {
   const path = join(getRunStateDir(), `${runId}.json`);
   if (!existsSync(path)) return null;
-  return JSON.parse(readFileSync(path, "utf8")) as Phase3RunStatus;
+  return JSON.parse(readFileSync(path, "utf8")) as BridgeRunStatus;
+}
+
+export function patchRunStatus(runId: string, patch: Partial<BridgeRunStatus> | ((current: BridgeRunStatus) => BridgeRunStatus)) {
+  const current = readRunStatus(runId);
+  if (!current) return null;
+  const next = typeof patch === "function" ? patch(current) : ({ ...current, ...patch } as BridgeRunStatus);
+  writeRunStatus(next);
+  return next;
+}
+
+export function listRunStatuses(): BridgeRunStatus[] {
+  const dir = getRunStateDir();
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => {
+      try {
+        return JSON.parse(readFileSync(join(dir, name), "utf8")) as BridgeRunStatus;
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean) as BridgeRunStatus[];
 }
 
 export function getAuditDir(): string {
@@ -435,6 +459,39 @@ export async function waitForHealth(serverUrl: string, timeoutMs = 10000) {
   return false;
 }
 
+export async function fetchServeProjectBinding(serverUrl: string): Promise<{ ok: boolean; directory?: string; project?: any; path?: any; error?: string }> {
+  const normalizedUrl = serverUrl.replace(/\/$/, "");
+  const [projectRes, pathRes] = await Promise.all([
+    fetchJsonSafe(`${normalizedUrl}/project/current`),
+    fetchJsonSafe(`${normalizedUrl}/path`),
+  ]);
+
+  const project = projectRes.ok ? projectRes.data : undefined;
+  const path = pathRes.ok ? pathRes.data : undefined;
+  const directory =
+    asString(project?.directory) ||
+    asString(project?.path) ||
+    asString(path?.directory) ||
+    asString(path?.cwd) ||
+    asString(path?.path);
+
+  if (directory) {
+    return { ok: true, directory, project, path };
+  }
+
+  return {
+    ok: false,
+    project,
+    path,
+    error: projectRes.error || pathRes.error || "Could not determine serve project binding",
+  };
+}
+
+export async function isServeBoundToRepo(serverUrl: string, repoRoot: string): Promise<boolean> {
+  const binding = await fetchServeProjectBinding(serverUrl);
+  return binding.ok && binding.directory === repoRoot;
+}
+
 export async function spawnServeForProject(input: {
   project_id: string;
   repo_root: string;
@@ -444,11 +501,15 @@ export async function spawnServeForProject(input: {
   if (existing && existing.status === "running") {
     const healthy = await waitForHealth(existing.opencode_server_url, 2000);
     if (healthy) {
-      return { reused: true, entry: existing, registryPath: getServeRegistryPath() };
+      const boundToRepo = await isServeBoundToRepo(existing.opencode_server_url, input.repo_root);
+      if (boundToRepo) {
+        return { reused: true, entry: existing, registryPath: getServeRegistryPath() };
+      }
     }
   }
   const port = await allocatePort();
   const child = spawn("opencode", ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
+    cwd: input.repo_root,
     detached: true,
     stdio: "ignore",
   });
@@ -558,7 +619,7 @@ export async function fetchJsonSafe(url: string): Promise<{ ok: boolean; status?
 
 export function resolveSessionForRun(input: {
   sessionId?: string;
-  runStatus?: Phase3RunStatus | null;
+  runStatus?: BridgeRunStatus | null;
   sessionList?: any[];
   runId?: string;
 }): { sessionId?: string; strategy: string; score?: number } {
@@ -707,9 +768,306 @@ export async function executeHooksAgentCallback(hookBaseUrl: string, hookToken: 
   };
 }
 
+function coerceLifecycleState(value: string | undefined | null): BridgeLifecycleState {
+  if (!value) return "running";
+  if (
+    value === "queued" ||
+    value === "server_ready" ||
+    value === "session_created" ||
+    value === "prompt_sent" ||
+    value === "planning" ||
+    value === "coding" ||
+    value === "verifying" ||
+    value === "blocked" ||
+    value === "running" ||
+    value === "awaiting_permission" ||
+    value === "stalled" ||
+    value === "failed" ||
+    value === "completed"
+  ) {
+    return value;
+  }
+  return "running";
+}
+
+function isTerminalLifecycleState(state: BridgeLifecycleState): boolean {
+  return state === "completed" || state === "failed";
+}
+
+function buildTerminalEventFromState(state: BridgeLifecycleState, fallback?: OpenCodeEventKind | null): OpenCodeEventKind {
+  if (state === "completed") return "task.completed";
+  if (state === "failed") return "task.failed";
+  return fallback || "task.progress";
+}
+
+export async function createSessionForEnvelope(envelope: RoutingEnvelope): Promise<{ sessionId: string; created: any }> {
+  const serverUrl = envelope.opencode_server_url.replace(/\/$/, "");
+  const taggedTitle = buildTaggedSessionTitle({
+    runId: envelope.run_id,
+    taskId: envelope.task_id,
+    requested: envelope.requested_agent_id,
+    resolved: envelope.resolved_agent_id,
+    callbackSession: envelope.callback_target_session_key,
+    callbackSessionId: envelope.callback_target_session_id,
+    projectId: envelope.project_id,
+    repoRoot: envelope.repo_root,
+  });
+  const createdRes = await fetch(`${serverUrl}/session`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: taggedTitle }),
+  });
+  const createdText = await createdRes.text();
+  let created: any;
+  try {
+    created = createdText ? JSON.parse(createdText) : null;
+  } catch {
+    created = { raw: createdText };
+  }
+  if (!createdRes.ok) {
+    throw new Error(`session create failed: ${createdRes.status} ${createdText}`);
+  }
+  const sessionId = asString(created?.id);
+  if (!sessionId) {
+    throw new Error("session create failed: missing session id");
+  }
+  return { sessionId, created };
+}
+
+export async function sendPromptAsyncForEnvelope(envelope: RoutingEnvelope, sessionId: string, prompt: string): Promise<void> {
+  const serverUrl = envelope.opencode_server_url.replace(/\/$/, "");
+  const response = await fetch(`${serverUrl}/session/${sessionId}/prompt_async`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      agent: envelope.resolved_agent_id,
+      parts: [{ type: "text", text: prompt }],
+    }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`prompt_async failed: ${response.status} ${text}`);
+  }
+}
+
+export async function maybeSendTerminalCallback(input: {
+  cfg: any;
+  runStatus: BridgeRunStatus;
+  event: OpenCodeEventKind;
+  summary?: string;
+}) {
+  const runtimeCfg = getRuntimeConfig(input.cfg);
+  if (!runtimeCfg.hookBaseUrl || !runtimeCfg.hookToken) {
+    const updated = patchRunStatus(input.runStatus.runId, (current) => ({
+      ...current,
+      callbackError: "hook config missing",
+      callbackAttempts: (current.callbackAttempts || 0) + 1,
+      updatedAt: new Date().toISOString(),
+    }));
+    return { ok: false, skipped: true, reason: "hook_config_missing", runStatus: updated || input.runStatus };
+  }
+
+  if (input.runStatus.callbackSentAt) {
+    return { ok: true, skipped: true, reason: "already_sent", runStatus: input.runStatus };
+  }
+
+  const callback = buildHooksAgentCallback({
+    event: input.event,
+    envelope: input.runStatus.envelope,
+    summary: input.summary || input.runStatus.lastSummary,
+  });
+
+  const attempts = (input.runStatus.callbackAttempts || 0) + 1;
+  try {
+    const result = await executeHooksAgentCallback(runtimeCfg.hookBaseUrl, runtimeCfg.hookToken, callback);
+    const createdAt = new Date().toISOString();
+    appendAudit({
+      taskId: input.runStatus.taskId,
+      runId: input.runStatus.runId,
+      agentId: callback.agentId,
+      requestedAgentId: input.runStatus.envelope.requested_agent_id,
+      resolvedAgentId: input.runStatus.envelope.resolved_agent_id,
+      sessionKey: input.runStatus.envelope.session_key,
+      callbackTargetSessionKey: input.runStatus.envelope.callback_target_session_key,
+      callbackTargetSessionId: input.runStatus.envelope.callback_target_session_id,
+      event: input.event,
+      callbackStatus: result.status,
+      callbackOk: result.ok,
+      callbackBody: result.body,
+      createdAt,
+    });
+    const updated = patchRunStatus(input.runStatus.runId, (current) => ({
+      ...current,
+      callbackAttempts: attempts,
+      callbackSentAt: result.ok ? createdAt : current.callbackSentAt,
+      callbackStatus: result.status,
+      callbackOk: result.ok,
+      callbackBody: result.body,
+      callbackError: result.ok ? undefined : `hook returned status=${result.status}`,
+      updatedAt: createdAt,
+    }));
+    return { ok: result.ok, skipped: false, callback, result, runStatus: updated || input.runStatus };
+  } catch (error: any) {
+    const message = error?.message || String(error);
+    const updated = patchRunStatus(input.runStatus.runId, (current) => ({
+      ...current,
+      callbackAttempts: attempts,
+      callbackError: message,
+      updatedAt: new Date().toISOString(),
+    }));
+    return { ok: false, skipped: false, error: message, runStatus: updated || input.runStatus };
+  }
+}
+
+export async function watchRunToTerminal(input: { cfg: any; runId: string; pollIntervalMs?: number; maxWaitMs?: number }) {
+  const pollIntervalMs = Math.max(250, asNumber(input.pollIntervalMs) || 1000);
+  const maxWaitMs = Math.max(1000, asNumber(input.maxWaitMs) || 5 * 60 * 1000);
+  const startedAt = Date.now();
+
+  let current = patchRunStatus(input.runId, (status) => ({
+    ...status,
+    watcherStartedAt: status.watcherStartedAt || new Date().toISOString(),
+    watcherHeartbeatAt: new Date().toISOString(),
+    watcherState: "active",
+    updatedAt: new Date().toISOString(),
+  }));
+  if (!current) {
+    throw new Error(`Run status not found for runId=${input.runId}`);
+  }
+
+  while (Date.now() - startedAt <= maxWaitMs) {
+    current = readRunStatus(input.runId);
+    if (!current) throw new Error(`Run status disappeared for runId=${input.runId}`);
+
+    const events = await collectSseEvents(current.envelope.opencode_server_url, "global", {
+      limit: DEFAULT_EVENT_LIMIT,
+      timeoutMs: Math.max(200, pollIntervalMs),
+      runIdHint: current.runId,
+      taskIdHint: current.taskId,
+      sessionIdHint: current.sessionId,
+    });
+
+    if (events.length > 0) {
+      const summary = summarizeLifecycle(
+        events.map((event) => ({
+          kind: event.normalizedKind,
+          summary: event.summary,
+          lifecycleState: event.lifecycle_state as any,
+          filesChanged: event.files_changed,
+          verifySummary: event.verify_summary as any,
+          blockers: event.blockers,
+          completionSummary: event.completion_summary,
+          timestamp: event.timestamp,
+        }))
+      );
+      current = patchRunStatus(input.runId, (status) => ({
+        ...status,
+        state: coerceLifecycleState(summary.currentState as string | undefined),
+        lastEvent: summary.last_event_kind || status.lastEvent || null,
+        lastSummary: summary.completion_summary || events[events.length - 1]?.summary || status.lastSummary,
+        sessionId: status.sessionId || events.find((event) => event.sessionId)?.sessionId,
+        watcherHeartbeatAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      })) || current;
+    } else {
+      current = patchRunStatus(input.runId, (status) => ({
+        ...status,
+        watcherHeartbeatAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      })) || current;
+    }
+
+    if (isTerminalLifecycleState(current.state)) {
+      const callback = await maybeSendTerminalCallback({
+        cfg: input.cfg,
+        runStatus: current,
+        event: buildTerminalEventFromState(current.state, current.lastEvent),
+        summary: current.lastSummary,
+      });
+      current = patchRunStatus(input.runId, (status) => ({
+        ...status,
+        watcherCompletedAt: new Date().toISOString(),
+        watcherState: callback.ok ? "completed" : "failed",
+        updatedAt: new Date().toISOString(),
+      })) || current;
+      return { ok: callback.ok, terminal: true, runStatus: current, callback };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+
+  current = patchRunStatus(input.runId, (status) => ({
+    ...status,
+    watcherCompletedAt: new Date().toISOString(),
+    watcherState: "failed",
+    callbackError: status.callbackError || "watcher_timeout",
+    updatedAt: new Date().toISOString(),
+  })) || current;
+  return { ok: false, terminal: false, timeout: true, runStatus: current };
+}
+
+export async function startExecutionRun(input: {
+  cfg: any;
+  envelope: RoutingEnvelope;
+  prompt: string;
+  pollIntervalMs?: number;
+  maxWaitMs?: number;
+}) {
+  const initial: BridgeRunStatus = {
+    taskId: input.envelope.task_id,
+    runId: input.envelope.run_id,
+    state: "queued",
+    lastEvent: null,
+    lastSummary: undefined,
+    updatedAt: new Date().toISOString(),
+    envelope: input.envelope,
+    watcherState: "pending",
+  };
+  writeRunStatus(initial);
+
+  const session = await createSessionForEnvelope(input.envelope);
+  let current = patchRunStatus(input.envelope.run_id, (status) => ({
+    ...status,
+    sessionId: session.sessionId,
+    state: "session_created",
+    updatedAt: new Date().toISOString(),
+  })) || initial;
+
+  await sendPromptAsyncForEnvelope(input.envelope, session.sessionId, input.prompt);
+  current = patchRunStatus(input.envelope.run_id, (status) => ({
+    ...status,
+    state: "prompt_sent",
+    updatedAt: new Date().toISOString(),
+  })) || current;
+
+  void watchRunToTerminal({
+    cfg: input.cfg,
+    runId: input.envelope.run_id,
+    pollIntervalMs: input.pollIntervalMs,
+    maxWaitMs: input.maxWaitMs,
+  }).catch((error: any) => {
+    patchRunStatus(input.envelope.run_id, (status) => ({
+      ...status,
+      watcherCompletedAt: new Date().toISOString(),
+      watcherState: "failed",
+      callbackError: status.callbackError || error?.message || String(error),
+      updatedAt: new Date().toISOString(),
+    }));
+  });
+
+  return {
+    ok: true,
+    runId: input.envelope.run_id,
+    taskId: input.envelope.task_id,
+    sessionId: session.sessionId,
+    state: current.state,
+    watcherStarted: true,
+  };
+}
+
 export function buildHookPolicyChecklist(agentId: string, sessionKey: string) {
   return {
-    callbackPrimary: "/hooks/agent",
+    primaryCallbackPath: "/hooks/agent",
     requirements: {
       hooksEnabled: true,
       allowRequestSessionKey: true,

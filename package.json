@@ -1,15 +1,15 @@
 {
   "name": "@mrc2204/opencode-bridge",
-  "version": "0.1.2",
-  "description": "OpenClaw ↔ OpenCode bridge plugin for routing, callback, SSE probing, and runtime-ops scaffolding.",
+  "version": "0.1.3",
+  "description": "OpenClaw ↔ OpenCode bridge plugin for hybrid routing, callback orchestration, and multi-project-safe runtime control.",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js",
+      "default": "./dist/src/index.js"
     }
   },
   "private": false,
@@ -23,9 +23,13 @@
   },
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "tsup src/index.ts src/observability.ts --format esm --dts --clean",
+    "build": "tsup --config tsup.config.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx test/run-tests.ts",
+    "materialize:opencode-plugin:project": "node ./scripts/materialize-opencode-plugin.mjs --mode project",
+    "materialize:opencode-plugin:global": "node ./scripts/materialize-opencode-plugin.mjs --mode global",
+    "install:bridge:project": "node ./scripts/install-bridge.mjs --mode project",
+    "install:bridge:global": "node ./scripts/install-bridge.mjs --mode global",
     "prepublishOnly": "npm run build && npm run test"
   },
   "devDependencies": {
@@ -36,12 +40,16 @@
   },
   "openclaw": {
     "extensions": [
-      "./dist/index.js"
+      "./dist/src/index.js"
     ]
   },
   "files": [
     "dist/",
     "skills/",
+    "opencode-plugin/",
+    "scripts/materialize-opencode-plugin.mjs",
+    "scripts/install-bridge.mjs",
+    "src/shared-contracts.ts",
     "README.md",
     "README.en.md",
     "openclaw.plugin.json"

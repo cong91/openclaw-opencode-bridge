@@ -280,71 +280,81 @@ Escalate to orchestrator (`scrum`/owner session) when:
 
 ---
 
-## Minimal runtime bridge (v0-min)
+## Execution strategy (current standard)
 
-To avoid ad-hoc `exec opencode ...`, use standard entrypoint:
+Use a **hybrid execution model**:
 
-- `node scripts/opencode-coding-runner.mjs --workstream coding_execution ...`
+- **CLI-direct** for lightweight one-shot execution
+- **serve/plugin mode** for canonical callback, event-driven lifecycle, observability, and multi-project-safe control plane
 
-Bridge rules:
+Rules:
 
-- Accept only `workstream=coding_execution`.
-- Other workstreams are rejected with exit code `2`.
-- Runner must always emit metadata JSON (stdout + `--out` file) with at least:
-  - `invocation.command/rendered`
-  - `opencode.agent/model`
-  - `process.exit_code`
-  - `result.status/error`
-  - `evidence.git_commit`
+- Do not assume `serve` is required for every coding task.
+- Do not assume `CLI-direct` is sufficient when callback/lifecycle tracking matters.
+- Choose the lane deliberately and report which lane was used.
 
-Suggested packet usage:
+### Prefer CLI-direct when
+- the task is lightweight or one-shot
+- no callback or long-lived lifecycle tracking is required
+- no serve/session registry management is needed
 
-- `--packet <path-to-packet.json>` to auto-map `task_id`, `owner_agent`, `objective`.
+### Prefer serve/plugin mode when
+- callback correctness matters
+- event-driven lifecycle handling is required
+- multi-project safety matters
+- observability/session/event introspection is required
+- multiple tasks may reuse the same project-bound runtime
 
 ## OpenCode Bridge usage (current team standard)
 
 Current team workflow after planning is:
 
 1. `using-superpowers`
-2. `brainstorming` (khi cần làm rõ design/spec)
+2. `brainstorming` (when design/spec clarification is needed)
 3. `writing-plans`
 4. `execute`
 5. `verification-before-completion`
 
-Trong bước **execute**, nếu routing đi vào OpenCode lane thì phải ưu tiên dùng **`opencode-bridge`** / bridge contract hiện tại thay vì ad-hoc pattern cũ.
+During **execute**, if routing goes into the OpenCode lane, use the bridge-aware strategy and choose one of these execution lanes explicitly:
+
+### Lane A — CLI-direct
+Use for lightweight tasks where callback/lifecycle tracking is not the main requirement.
+
+Rules:
+- bind the repo explicitly with `--dir <absolute-repo-path>`
+- prefer explicit `--model` if agent resolution is uncertain
+- report clearly that the task used CLI-direct execution
+
+### Lane B — serve/plugin mode (canonical callback lane)
+Use when callback correctness, observability, event-driven lifecycle handling, or multi-project-safe control plane is required.
+
+Rules:
+- bind execution to one project-bound serve instance only
+- keep routing envelope fields explicit
+- treat `/hooks/agent` as the primary callback path
+- use OpenCode-side plugin callback for terminal lifecycle signaling
 
 ### Current implementation status (important)
-Bridge hiện đã chứng minh được các capability cốt lõi:
+The bridge stack has already proven these capabilities:
 - routing envelope build
 - callback payload build
-- callback execution thật về `/hooks/agent`
-- status artifact persistence
-- mini listener runner / SSE probe ở mức PoC
-- runtime assumption: **1 project = 1 OpenCode serve instance**
-
-### How to think about execution now
-- **Do not** assume one shared `opencode serve` is safe for many projects.
-- **Do** bind every coding task to:
-  - `project_id`
-  - `repo_root`
-  - `opencode_server_url`
-  - `task_id`
-  - `run_id`
-  - `agent_id`
-  - `session_key`
-- **Do** treat `/hooks/agent` as callback primary.
-- **Do not** use `cron` or `group:sessions` as the callback mechanism.
+- callback execution to `/hooks/agent`
+- run-status artifact persistence
+- serve binding fail-closed by `repo_root`
+- OpenCode-side plugin callback path with `session.idle` as canonical trigger
+- materialized OpenCode-side plugin artifact and install flow
 
 ### Practical guidance for agents
 When handing off into OpenCode execution:
 - mention the intended repo explicitly
 - ensure the execution packet is file-driven
-- ensure the repo binding uses `--dir <repo>` or an equivalent project-bound path
+- ensure repo binding is explicit (`--dir <repo>` for CLI-direct, project-bound serve for serve/plugin mode)
 - prefer bridge-aware execution over free-form `opencode run` whenever the flow needs:
   - callback
   - task/run tracking
   - serve/session registry
   - multi-agent lane routing
+  - event-driven terminal signaling
 
 ### Mandatory reporting after execution handoff
 Outer agents should report:
@@ -584,25 +594,22 @@ Use when you need to resolve which OpenCode serve should be used for a given:
 #### `opencode_build_envelope`
 Use when you are about to delegate a concrete task into OpenCode lane and need the canonical routing envelope.
 
-#### `opencode_build_callback`
-Use when mapping a known OpenCode event into a callback payload for OpenClaw.
+#### `opencode_execute_task`
+Use as the standard serve/plugin-mode execution entrypoint:
+- resolve/spawn project-bound serve
+- create session
+- send prompt async
+- start watcher path
+- persist run artifact
 
-#### `opencode_execute_callback`
-Use when executing the callback into `/hooks/agent` for a payload that has already been built.
+#### `opencode_run_status`
+Use to inspect run state and event-derived lifecycle summary.
 
-#### `opencode_probe_sse`
-Use when verifying that OpenCode serve is alive and emitting SSE events.
+#### `opencode_run_events`
+Use to inspect normalized SSE event output for a run/session.
 
-#### `opencode_listen_once`
-Use for a small, single-shot proof that the bridge can:
-- read an event
-- normalize it
-- callback
-- write artifact
-
-#### `opencode_listen_loop`
-Use for baseline runtime-ops experiments where repeated event consumption and lifecycle handling are needed.
-Treat it as baseline runtime manager logic, not a production-perfect daemon.
+#### `opencode_session_tail`
+Use to inspect session messages and diff/tail evidence when available.
 
 #### `opencode_run_status`
 Use to inspect the artifact state of a previously handled run.
@@ -642,21 +649,23 @@ Use to mark a serve as stopped and send shutdown for a project serve entry.
 When a task must enter OpenCode execution lane, use this order:
 
 1. Prepare/verify execution packet via the outer workflow (`using-superpowers` → `brainstorming` if needed → `writing-plans`)
-2. Resolve project/server:
-   - `opencode_resolve_project`
+2. Classify execution shape:
+   - CLI-direct
+   - serve/plugin mode
+3. If using **CLI-direct**:
+   - run with explicit `--dir <repo>`
+   - prefer explicit `--model` if needed
+   - report no callback expectation unless a separate tracking path is in place
+4. If using **serve/plugin mode**:
+   - resolve project/server via `opencode_resolve_project`
    - or spawn one via `opencode_serve_spawn`
-3. Build routing envelope:
-   - `opencode_build_envelope`
-4. Verify serve/event path as needed:
-   - `opencode_probe_sse`
-   - `opencode_listen_once`
-5. Build and/or execute callbacks:
-   - `opencode_build_callback`
-   - `opencode_execute_callback`
-   - or `opencode_callback_from_event`
-6. Check run artifact/status:
+   - build routing envelope via `opencode_build_envelope`
+   - keep callback expectation explicit through `/hooks/agent`
+5. For serve/plugin mode, inspect artifacts as needed:
    - `opencode_run_status`
-7. Only then proceed to outer verification:
+   - `opencode_run_events`
+   - `opencode_session_tail`
+6. Only then proceed to outer verification:
    - `verification-before-completion`
 
 ### Reporting requirements
@@ -672,14 +681,15 @@ When handing work into OpenCode lane, the outer agent should report:
 #### Do
 - Do keep OpenCode execution project-bound.
 - Do keep callback/session routing explicit.
+- Do choose execution lane explicitly: CLI-direct vs serve/plugin mode.
 - Do use `opencode-orchestration` when coordination or bridge semantics matter.
 - Do use `verification-before-completion` before claiming completion.
 
 #### Don’t
-- Don’t use ad-hoc `opencode run` when the work needs callback, lifecycle tracking, or registry-aware execution.
+- Don’t use ad-hoc `opencode run` for callback/lifecycle-sensitive work without explicit lane selection.
 - Don’t assume a single serve is multi-project-safe.
 - Don’t assume bridge/runtime-manager features are production-perfect without verification.
-- Don’t over-claim that the bridge is fully autonomous when only PoC/baseline behavior has been verified.
+- Don’t over-claim that the bridge is fully autonomous when only functionally verified/hardened behavior is available.
 
 ## Guardrails
 

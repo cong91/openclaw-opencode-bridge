@@ -2,3 +2,8 @@ import "./observability.test";
 import "./runtime-integrity.test";
 import "./contract-envelope-callback.test";
 import "./session-callback-integrity.test";
+import "./serve-binding.test";
+import "./multi-project-contract-smoke.test";
+import "./plugin-callback-contract.test";
+import "./plugin-openclaw-audit-bridge.test";
+import "./execution-callback-loop.test";

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { assertCallbackTargetSessionKey, buildEnvelope, buildHooksAgentCallback, evaluateServeIdle, resolveExecutionAgent, resolveSessionForRun } from "../src/runtime";
+import { assertCallbackTargetSessionKey, buildEnvelope, buildHooksAgentCallback, evaluateServeIdle, resolveExecutionAgent, resolveSessionForRun, fetchServeProjectBinding } from "../src/runtime";
 
 test("resolveExecutionAgent uses explicit executionAgentId when provided", () => {
   const resolved = resolveExecutionAgent({

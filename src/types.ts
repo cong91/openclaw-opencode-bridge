@@ -57,7 +57,7 @@ export type HooksAgentCallbackPayload = {
   to?: string;
 };
 
-export type Phase3RunStatus = {
+export type BridgeRunStatus = {
   taskId: string;
   runId: string;
   state: BridgeLifecycleState;
@@ -65,6 +65,17 @@ export type Phase3RunStatus = {
   lastSummary?: string;
   updatedAt: string;
   envelope: RoutingEnvelope;
+  sessionId?: string;
+  callbackSentAt?: string;
+  callbackStatus?: number;
+  callbackOk?: boolean;
+  callbackBody?: string;
+  callbackAttempts?: number;
+  callbackError?: string;
+  watcherStartedAt?: string;
+  watcherCompletedAt?: string;
+  watcherHeartbeatAt?: string;
+  watcherState?: "pending" | "active" | "completed" | "failed";
 };
 
 export type OpenCodeApiSnapshot = {
@@ -74,10 +85,21 @@ export type OpenCodeApiSnapshot = {
   fetchedAt: string;
 };
 
+export type LifecycleSummary = {
+  currentState: BridgeLifecycleState | null;
+  current_state?: BridgeLifecycleState | null;
+  last_event_kind: OpenCodeEventKind | null;
+  last_event_at: string | null;
+  files_changed: string[];
+  verify_summary: { command?: string; exit?: number | null; output_preview?: string | null }[];
+  blockers: string[];
+  completion_summary: string | null;
+};
+
 export type RunStatusResponse = {
   ok: boolean;
   source: {
-    runStatusArtifact: boolean;
+    runArtifact: boolean;
     opencodeApi: boolean;
   };
   runId?: string;
@@ -91,6 +113,7 @@ export type RunStatusResponse = {
     };
   };
   state: BridgeLifecycleState;
+  currentState?: BridgeLifecycleState | null;
   current_state?: BridgeLifecycleState | null;
   lastEvent?: OpenCodeEventKind | null;
   last_event_kind?: OpenCodeEventKind | null;

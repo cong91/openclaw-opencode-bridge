@@ -299,7 +299,7 @@ export function summarizeLifecycle(events: Array<{
   completionSummary?: string | null;
   timestamp?: string;
 }> = []) {
-  let current_state: TypedEventV1["lifecycleState"] | null = null;
+  let currentState: TypedEventV1["lifecycleState"] | null = null;
   let last_event_kind: OpenCodeEventKind | null = null;
   let last_event_at: string | null = null;
   const files_changed = new Set<string>();
@@ -308,7 +308,7 @@ export function summarizeLifecycle(events: Array<{
   let completion_summary: string | null = null;
 
   for (const item of events) {
-    if (item.lifecycleState) current_state = item.lifecycleState;
+    if (item.lifecycleState) currentState = item.lifecycleState;
     if (item.kind) last_event_kind = item.kind;
     if (item.timestamp) last_event_at = item.timestamp;
     for (const file of item.filesChanged || []) files_changed.add(file);
@@ -318,7 +318,8 @@ export function summarizeLifecycle(events: Array<{
   }
 
   return {
-    current_state,
+    currentState,
+    current_state: currentState,
     last_event_kind,
     last_event_at,
     files_changed: [...files_changed],

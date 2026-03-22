@@ -1,6 +1,6 @@
 import { registerOpenCodeBridgeTools } from "./registrar";
 
-const PLUGIN_VERSION = "0.1.1";
+const PLUGIN_VERSION = "0.1.3";
 
 const plugin = {
   id: "opencode-bridge",

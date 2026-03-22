@@ -2,116 +2,95 @@
 
 > English README: [README.en.md](./README.en.md)
 
-Plugin bridge giữa **OpenClaw** và **OpenCode** cho orchestration multi-agent, callback routing, SSE probing, run observability và serve runtime management.
+`opencode-bridge` là cầu nối giữa OpenClaw và OpenCode theo hướng hybrid execution, callback orchestration và runtime control an toàn cho nhiều project.
 
-## Mục tiêu
-- Chuẩn hóa callback path từ OpenCode về OpenClaw qua `/hooks/agent`
-- Chuẩn hóa `sessionKey` / `routing envelope`
-- Hỗ trợ mô hình vận hành: **1 project = 1 OpenCode serve instance**
-- Cung cấp runtime-ops baseline:
-  - SSE probe / event normalize
-  - run status / run events / session tail
-  - serve registry / spawn / reuse / shutdown / idle evaluation
+## Package này làm gì
+Package này nối 2 phía runtime:
+- **OpenClaw side**: routing theo project, run state, serve management, observability, callback policy
+- **OpenCode side**: plugin callback bắt event terminal bên trong OpenCode runtime
 
-## Cài package từ npm
+Mục tiêu thực dụng:
+- execution theo project rõ ràng
+- callback quay về OpenClaw qua `/hooks/agent`
+- artifact OpenCode-side cài được theo project hoặc global
+- multi-project-safe boundary
+
+## Cài đặt
+### 1) OpenClaw side
 ```bash
 openclaw plugins install @mrc2204/openclaw-opencode-bridge
 ```
 
-## Cấu trúc repo (build-based)
-```text
-openclaw-opencode-bridge/
-├── openclaw.plugin.json
-├── package.json
-├── tsconfig.json
-├── src/
-│   ├── index.ts
-│   ├── observability.ts
-│   └── types.ts
-├── dist/                  # artifact tạo bởi npm run build
-├── test/
-│   ├── run-tests.ts
-│   └── observability.test.ts
-├── skills/
-│   └── opencode-orchestration/
-│       └── SKILL.md
-├── README.md
-└── README.en.md
+### 2) OpenCode side — cài theo project
+```bash
+npm run materialize:opencode-plugin:project
 ```
 
-## Tool hiện có
-- `opencode_status`
-- `opencode_resolve_project`
-- `opencode_build_envelope`
-- `opencode_check_hook_policy`
-- `opencode_evaluate_lifecycle`
-- `opencode_run_status`
-- `opencode_run_events`
-- `opencode_session_tail`
-- `opencode_serve_spawn`
-- `opencode_registry_get`
-- `opencode_registry_upsert`
-- `opencode_registry_cleanup`
-- `opencode_serve_shutdown`
-- `opencode_serve_idle_check`
+### 3) OpenCode side — cài global
+```bash
+npm run materialize:opencode-plugin:global
+```
 
-## Assumptions hiện tại
-- `1 project = 1 opencode serve instance`
-- callback primary = `/hooks/agent`
-- `sessionKey` convention = `hook:opencode:<agentId>:<taskId>`
-- `opencode_server_url` là field bắt buộc trong envelope routing thực tế
+Global mode sẽ tự patch `~/.config/opencode/opencode.json` khi file này tồn tại.
 
-## Build/Test
+### 4) Một lệnh cài
+Project mode:
+```bash
+npm run install:bridge:project
+```
+
+Global mode:
+```bash
+npm run install:bridge:global
+```
+
+## Environment callback tối thiểu
+OpenCode-side callback plugin cần:
+- `OPENCLAW_HOOK_BASE_URL`
+- `OPENCLAW_HOOK_TOKEN`
+
+Optional:
+- `OPENCLAW_BRIDGE_AUDIT_DIR`
+- `OPENCLAW_BRIDGE_OPENCLAW_AUDIT_PATH`
+
+## Mô hình runtime
+### Hybrid execution strategy
+`opencode-bridge` hỗ trợ 2 lane thực dụng:
+- **CLI-direct**: execution nhẹ cho task đơn giản
+- **serve/plugin mode**: đường canonical cho callback, observability và event-driven lifecycle
+
+### Multi-project safety
+Contract hiện tại giả định:
+- `1 project = 1 OpenCode serve bind đúng repo`
+- chỉ reuse serve khi runtime introspection xác nhận đúng `repo_root`
+- session tag phải giữ đủ callback identity theo run/session
+
+## Build và verify
 ```bash
 npm install
 npm run build
-npm run typecheck
-npm run test
+npm test -- --runInBand
 ```
 
-Sau `npm run build`, entrypoint runtime dùng artifact trong `dist/`:
-- `main`: `./dist/index.js`
-- `types`: `./dist/index.d.ts`
-- `openclaw.extensions`: `./dist/index.js`
-
-## Publish flow (safe)
-```bash
-npm run build
-npm run test
-npm pack --dry-run
-# nếu OK:
-# npm publish
-```
-
-`npm pack --dry-run` dùng để kiểm tra package chỉ publish artifact cần thiết (`dist/`, `skills/`, readme, plugin manifest), không trỏ trực tiếp vào source TypeScript.
-
-## Config runtime
-Plugin dùng plugin-owned config tại:
+## Cấu trúc artifact
 ```text
-~/.openclaw/opencode-bridge/config.json
+openclaw-opencode-bridge/
+├── src/                 # OpenClaw-side runtime
+├── opencode-plugin/     # canonical OpenCode-side plugin source
+├── scripts/             # materialize/install helpers
+├── dist/                # built artifacts
+├── docs/                # install / architecture / contracts
+└── skills/              # bridge-related skills/docs
 ```
 
-Ví dụ:
-```json
-{
-  "opencodeServerUrl": "http://127.0.0.1:4096",
-  "hookBaseUrl": "http://127.0.0.1:18789",
-  "hookToken": "<OPENCLAW_HOOK_TOKEN>",
-  "projectRegistry": [
-    {
-      "projectId": "agent-smart-memo",
-      "repoRoot": "/Users/me/Work/projects/agent-smart-memo",
-      "serverUrl": "http://127.0.0.1:4096",
-      "idleTimeoutMs": 900000
-    }
-  ]
-}
-```
+## Tài liệu liên quan
+- `docs/install/quick-start-2026-03-22.md`
+- `docs/install/production-ish-install-2026-03-22.md`
+- `docs/contracts/multi-project-contract-draft-2026-03-22.md`
+- `docs/architecture/hybrid-execution-strategy-2026-03-22.md`
 
-## Local dev plugin install
-```bash
-openclaw plugins install -l ~/Work/projects/opencode-bridge
-```
+Ghi chú: local debug/dev notes được tách khỏi README public-facing. Xem:
+- `docs/install/developer-local-debug-2026-03-22.md`
 
-## License
-MIT
+## Trạng thái
+Hiện tại package đã ở mức functional + productized usable, với hardening/test/docs đã đi khá xa.

@@ -1,6 +1,6 @@
 {
   "name": "@mrc2204/opencode-bridge",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "OpenClaw ↔ OpenCode bridge plugin for hybrid routing, callback orchestration, and multi-project-safe runtime control.",
   "type": "module",
   "main": "./dist/src/index.js",

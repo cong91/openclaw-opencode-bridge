@@ -2,7 +2,7 @@
   "id": "opencode-bridge",
   "name": "OpenCode Bridge",
   "description": "Bridge plugin for OpenClaw ↔ OpenCode orchestration, execution routing, and callback observability.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

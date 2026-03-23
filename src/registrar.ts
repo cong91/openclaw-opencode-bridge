@@ -42,7 +42,7 @@ import {
   listRunStatuses,
 } from "./runtime";
 
-const PLUGIN_VERSION = "0.1.3";
+const PLUGIN_VERSION = "0.1.4";
 
 function buildExecutionPrompt(params: any, envelope: any): string {
   const providedPrompt = asString(params?.prompt);

@@ -6,4 +6,6 @@ import "./serve-binding.test";
 import "./multi-project-contract-smoke.test";
 import "./plugin-callback-contract.test";
 import "./plugin-openclaw-audit-bridge.test";
+import "./attach-run-timeout-classification.test";
+import "./supervisor-retry-loop.test";
 import "./execution-callback-loop.test";

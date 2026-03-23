@@ -50,12 +50,15 @@ function buildExecutionPrompt(params: any, envelope: any): string {
   const objective = asString(params?.objective) || asString(params?.message) || `Complete task ${envelope.task_id}`;
   const constraints = Array.isArray(params?.constraints) ? params.constraints.filter((x: any) => typeof x === "string" && x.trim()) : [];
   const acceptance = Array.isArray(params?.acceptanceCriteria) ? params.acceptanceCriteria.filter((x: any) => typeof x === "string" && x.trim()) : [];
+  const beadId = asString(params?.beadId);
   return [
     `Task: ${objective}`,
     `Run ID: ${envelope.run_id}`,
     `Task ID: ${envelope.task_id}`,
+    beadId ? `Bead ID: ${beadId}` : undefined,
     `Requested agent: ${envelope.requested_agent_id}`,
     `Resolved execution agent: ${envelope.resolved_agent_id}`,
+    beadId ? `Use bead/task identity '${beadId}' as the execution identity inside OpenCode. Do not call 'br show ${envelope.task_id}' if that Jira key is not a bead id; use the bead id above when interacting with beads.` : undefined,
     constraints.length ? `Constraints:\n- ${constraints.join("\n- ")}` : undefined,
     acceptance.length ? `Acceptance criteria:\n- ${acceptance.join("\n- ")}` : undefined,
     "When complete, summarize files changed, verification performed, blockers (if any), and completion outcome in the session output.",
@@ -78,7 +81,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
       const runtimeCfg = getRuntimeConfig(cfg);
       const registry = normalizeRegistry(runtimeCfg.projectRegistry);
       return {
-        content: [{ type: "text", text: JSON.stringify({ ok: true, pluginId: "opencode-bridge", version: PLUGIN_VERSION, assumption: "1 project = 1 opencode serve instance", sessionKeyConvention: "hook:opencode:<agentId>:<taskId>", lifecycleStates: ["queued", "server_ready", "session_created", "prompt_sent", "planning", "coding", "verifying", "blocked", "running", "awaiting_permission", "stalled", "failed", "completed"], requiredEnvelopeFields: ["task_id", "run_id", "agent_id", "requested_agent_id", "resolved_agent_id", "session_key", "origin_session_key", "callback_target_session_key", "project_id", "repo_root", "opencode_server_url"], primaryCallbackPath: "/hooks/agent", alternativeSignalPaths: ["/hooks/wake", "cron", "group:sessions"], config: { bridgeConfigPath: getBridgeConfigPath(), opencodeServerUrl: runtimeCfg.opencodeServerUrl || null, hookBaseUrl: runtimeCfg.hookBaseUrl || null, hookTokenPresent: Boolean(runtimeCfg.hookToken), projectRegistry: registry, executionAgentMappings: runtimeCfg.executionAgentMappings || [], stateDir: getBridgeStateDir(), runStateDir: getRunStateDir(), auditDir: getAuditDir() }, note: "Plugin-owned config/state is stored under ~/.openclaw/opencode-bridge. New projects are auto-registered only when using opencode_serve_spawn, not by passive envelope build alone." }, null, 2) }]
+        content: [{ type: "text", text: JSON.stringify({ ok: true, pluginId: "opencode-bridge", version: PLUGIN_VERSION, assumption: "1 project = 1 opencode serve instance", sessionKeyConvention: "hook:opencode:<agentId>:<taskId>", lifecycleStates: ["queued", "server_ready", "session_created", "prompt_sent", "planning", "coding", "verifying", "blocked", "running", "awaiting_permission", "stalled", "failed_retryable", "failed", "completed"], requiredEnvelopeFields: ["task_id", "run_id", "agent_id", "requested_agent_id", "resolved_agent_id", "session_key", "origin_session_key", "callback_target_session_key", "project_id", "repo_root", "opencode_server_url"], statusFields: ["state", "currentState", "current_state", "lastEvent", "last_event_kind", "lastSummary", "retryCount", "maxAutoRetries", "supervisorState", "retryHistory"], primaryCallbackPath: "/hooks/agent", alternativeSignalPaths: ["/hooks/wake", "cron", "group:sessions"], config: { bridgeConfigPath: getBridgeConfigPath(), opencodeServerUrl: runtimeCfg.opencodeServerUrl || null, hookBaseUrl: runtimeCfg.hookBaseUrl || null, hookTokenPresent: Boolean(runtimeCfg.hookToken), projectRegistry: registry, executionAgentMappings: runtimeCfg.executionAgentMappings || [], stateDir: getBridgeStateDir(), runStateDir: getRunStateDir(), auditDir: getAuditDir(), maxAutoRetries: (runtimeCfg as any).maxAutoRetries ?? 1 }, note: "Plugin-owned config/state is stored under ~/.openclaw/opencode-bridge. New projects are auto-registered only when using opencode_serve_spawn, not by passive envelope build alone." }, null, 2) }]
       };
     }
   }, { optional: true });
@@ -126,6 +129,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
         runId: params.runId,
         requestedAgentId: resolved.requestedAgentId,
         resolvedAgentId: resolved.resolvedAgentId,
+        executionAgentExplicit: resolved.executionAgentExplicit,
         originSessionKey: params.originSessionKey,
         originSessionId: asString(params.originSessionId),
         projectId: params.projectId,
@@ -177,6 +181,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
         to: { type: "string" },
         deliver: { type: "boolean" },
         priority: { type: "string" },
+        model: { type: "string" },
         idleTimeoutMs: { type: "number" },
         pollIntervalMs: { type: "number" },
         maxWaitMs: { type: "number" }
@@ -222,6 +227,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
         cfg,
         envelope,
         prompt,
+        model: asString(params.model),
         pollIntervalMs: asNumber(params.pollIntervalMs),
         maxWaitMs: asNumber(params.maxWaitMs),
       });
@@ -340,6 +346,10 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
         verify_summary: lifecycleSummary.verify_summary,
         blockers: lifecycleSummary.blockers,
         completion_summary: lifecycleSummary.completion_summary || artifact?.lastSummary || null,
+        ...(artifact?.retryCount !== undefined ? { retryCount: artifact.retryCount } : {}),
+        ...(artifact?.maxAutoRetries !== undefined ? { maxAutoRetries: artifact.maxAutoRetries } : {}),
+        ...(artifact?.supervisorState ? { supervisorState: artifact.supervisorState } : {}),
+        ...(artifact?.retryHistory ? { retryHistory: artifact.retryHistory } : {}),
         updatedAt: new Date().toISOString(),
         timestamps: {
           ...(artifact?.updatedAt ? { artifactUpdatedAt: artifact.updatedAt } : {}),

@@ -16,6 +16,7 @@ export type RoutingEnvelope = {
   requested_agent_id: string;
   // Explicit resolved execution agent id (same value as agent_id for audit clarity)
   resolved_agent_id: string;
+  execution_agent_explicit?: boolean;
   session_key: string;
   origin_session_key: string;
   origin_session_id?: string;
@@ -42,6 +43,7 @@ export type BridgeLifecycleState =
   | "running"
   | "awaiting_permission"
   | "stalled"
+  | "failed_retryable"
   | "failed"
   | "completed";
 
@@ -76,6 +78,25 @@ export type BridgeRunStatus = {
   watcherCompletedAt?: string;
   watcherHeartbeatAt?: string;
   watcherState?: "pending" | "active" | "completed" | "failed";
+  executionLane?: "session_api" | "attach_run";
+  retryCount?: number;
+  maxAutoRetries?: number;
+  supervisorState?: "idle" | "retrying" | "exhausted" | "completed";
+  retryHistory?: {
+    at: string;
+    reason: string;
+    retryCount: number;
+    exitCode?: number | null;
+    signal?: string | null;
+  }[];
+  attachRun?: {
+    command?: string;
+    args?: string[];
+    stdout?: string;
+    stderr?: string;
+    exitCode?: number | null;
+    signal?: string | null;
+  };
 };
 
 export type OpenCodeApiSnapshot = {
@@ -123,6 +144,16 @@ export type RunStatusResponse = {
   verify_summary?: { command?: string; exit?: number | null; output_preview?: string | null }[];
   blockers?: string[];
   completion_summary?: string | null;
+  retryCount?: number;
+  maxAutoRetries?: number;
+  supervisorState?: "idle" | "retrying" | "exhausted" | "completed";
+  retryHistory?: {
+    at: string;
+    reason: string;
+    retryCount: number;
+    exitCode?: number | null;
+    signal?: string | null;
+  }[];
   updatedAt: string;
   timestamps: {
     artifactUpdatedAt?: string;

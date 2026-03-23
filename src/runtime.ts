@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import {
   type EventScope,
@@ -189,6 +189,7 @@ export function resolveExecutionAgent(input: {
     requestedAgentId,
     resolvedAgentId: requestedAgentId,
     strategy: "identity",
+    executionAgentExplicit: false,
   };
 }
 
@@ -213,6 +214,7 @@ export function buildEnvelope(input: {
     agent_id: input.resolvedAgentId,
     requested_agent_id: input.requestedAgentId,
     resolved_agent_id: input.resolvedAgentId,
+    ...(input.executionAgentExplicit !== undefined ? { execution_agent_explicit: input.executionAgentExplicit } : {}),
     session_key: buildSessionKey(input.resolvedAgentId, input.taskId),
     origin_session_key: input.originSessionKey,
     ...(input.originSessionId ? { origin_session_id: input.originSessionId } : {}),
@@ -782,6 +784,7 @@ function coerceLifecycleState(value: string | undefined | null): BridgeLifecycle
     value === "running" ||
     value === "awaiting_permission" ||
     value === "stalled" ||
+    value === "failed_retryable" ||
     value === "failed" ||
     value === "completed"
   ) {
@@ -798,6 +801,19 @@ function buildTerminalEventFromState(state: BridgeLifecycleState, fallback?: Ope
   if (state === "completed") return "task.completed";
   if (state === "failed") return "task.failed";
   return fallback || "task.progress";
+}
+
+function shouldAutoRetryRun(status: BridgeRunStatus): { retry: boolean; reason: string } {
+  if (status.state === "failed_retryable") {
+    return { retry: true, reason: status.callbackError || status.lastSummary || "failed_retryable" };
+  }
+  if (status.attachRun?.signal === "SIGTERM") {
+    return { retry: true, reason: "attach_run_sigterm" };
+  }
+  if ((status.attachRun?.exitCode ?? 0) !== 0 && status.state !== "failed") {
+    return { retry: true, reason: `attach_run_exit_${status.attachRun?.exitCode}` };
+  }
+  return { retry: false, reason: "not_retryable" };
 }
 
 export async function createSessionForEnvelope(envelope: RoutingEnvelope): Promise<{ sessionId: string; created: any }> {
@@ -834,20 +850,43 @@ export async function createSessionForEnvelope(envelope: RoutingEnvelope): Promi
   return { sessionId, created };
 }
 
-export async function sendPromptAsyncForEnvelope(envelope: RoutingEnvelope, sessionId: string, prompt: string): Promise<void> {
-  const serverUrl = envelope.opencode_server_url.replace(/\/$/, "");
-  const response = await fetch(`${serverUrl}/session/${sessionId}/prompt_async`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      agent: envelope.resolved_agent_id,
-      parts: [{ type: "text", text: prompt }],
-    }),
+export async function runAttachExecutionForEnvelope(input: { envelope: RoutingEnvelope; prompt: string; model?: string }) {
+  const taggedTitle = buildTaggedSessionTitle({
+    runId: input.envelope.run_id,
+    taskId: input.envelope.task_id,
+    requested: input.envelope.requested_agent_id,
+    resolved: input.envelope.resolved_agent_id,
+    callbackSession: input.envelope.callback_target_session_key,
+    callbackSessionId: input.envelope.callback_target_session_id,
+    projectId: input.envelope.project_id,
+    repoRoot: input.envelope.repo_root,
   });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`prompt_async failed: ${response.status} ${text}`);
+  const args = [
+    "run",
+    "--attach", input.envelope.opencode_server_url,
+    "--dir", input.envelope.repo_root,
+    "--title", taggedTitle,
+  ];
+  if (input.envelope.execution_agent_explicit && input.envelope.resolved_agent_id) {
+    args.push("--agent", input.envelope.resolved_agent_id);
   }
+  if (input.model) {
+    args.push("--model", input.model);
+  }
+  args.push(input.prompt);
+  const result = spawnSync("opencode", args, {
+    cwd: input.envelope.repo_root,
+    encoding: "utf8",
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  return {
+    command: "opencode",
+    args,
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+    exitCode: typeof result.status === "number" ? result.status : null,
+    signal: result.signal || null,
+  };
 }
 
 export async function maybeSendTerminalCallback(input: {
@@ -922,7 +961,9 @@ export async function maybeSendTerminalCallback(input: {
 export async function watchRunToTerminal(input: { cfg: any; runId: string; pollIntervalMs?: number; maxWaitMs?: number }) {
   const pollIntervalMs = Math.max(250, asNumber(input.pollIntervalMs) || 1000);
   const maxWaitMs = Math.max(1000, asNumber(input.maxWaitMs) || 5 * 60 * 1000);
-  const startedAt = Date.now();
+  const runtimeCfg = getRuntimeConfig(input.cfg);
+  const maxAutoRetries = Math.max(0, asNumber((runtimeCfg as any).maxAutoRetries) || 1);
+  let attemptStartedAt = Date.now();
 
   let current = patchRunStatus(input.runId, (status) => ({
     ...status,
@@ -935,17 +976,25 @@ export async function watchRunToTerminal(input: { cfg: any; runId: string; pollI
     throw new Error(`Run status not found for runId=${input.runId}`);
   }
 
-  while (Date.now() - startedAt <= maxWaitMs) {
+  while (Date.now() - attemptStartedAt <= maxWaitMs) {
     current = readRunStatus(input.runId);
     if (!current) throw new Error(`Run status disappeared for runId=${input.runId}`);
 
-    const events = await collectSseEvents(current.envelope.opencode_server_url, "global", {
+    const sessionEvents = await collectSseEvents(current.envelope.opencode_server_url, "session", {
       limit: DEFAULT_EVENT_LIMIT,
       timeoutMs: Math.max(200, pollIntervalMs),
       runIdHint: current.runId,
       taskIdHint: current.taskId,
       sessionIdHint: current.sessionId,
     });
+    const globalEvents = sessionEvents.length > 0 ? [] : await collectSseEvents(current.envelope.opencode_server_url, "global", {
+      limit: DEFAULT_EVENT_LIMIT,
+      timeoutMs: Math.max(200, pollIntervalMs),
+      runIdHint: current.runId,
+      taskIdHint: current.taskId,
+      sessionIdHint: current.sessionId,
+    });
+    const events = sessionEvents.length > 0 ? sessionEvents : globalEvents;
 
     if (events.length > 0) {
       const summary = summarizeLifecycle(
@@ -977,6 +1026,55 @@ export async function watchRunToTerminal(input: { cfg: any; runId: string; pollI
       })) || current;
     }
 
+    if (current.state === "failed_retryable") {
+      const retryDecision = shouldAutoRetryRun(current);
+      const retryCount = current.retryCount || 0;
+      if (retryDecision.retry && retryCount < maxAutoRetries) {
+        const retriedExecution = await runAttachExecutionForEnvelope({
+          envelope: current.envelope,
+          prompt: current.lastSummary || "Retrying previous execution after retryable failure.",
+        });
+        current = patchRunStatus(input.runId, (status) => ({
+          ...status,
+          retryCount: retryCount + 1,
+          maxAutoRetries,
+          supervisorState: "retrying",
+          retryHistory: [
+            ...(status.retryHistory || []),
+            {
+              at: new Date().toISOString(),
+              reason: retryDecision.reason,
+              retryCount: retryCount + 1,
+              exitCode: retriedExecution.exitCode,
+              signal: retriedExecution.signal,
+            },
+          ],
+          attachRun: retriedExecution,
+          state: retriedExecution.exitCode === 0 ? "running" : "failed_retryable",
+          lastSummary: retriedExecution.exitCode === 0
+            ? `Auto-retry #${retryCount + 1} started after ${retryDecision.reason}`
+            : (retriedExecution.stderr || retriedExecution.stdout || `Auto-retry #${retryCount + 1} failed to start`),
+          watcherCompletedAt: undefined,
+          watcherHeartbeatAt: new Date().toISOString(),
+          watcherState: "active",
+          callbackError: retriedExecution.exitCode === 0 ? undefined : status.callbackError,
+          updatedAt: new Date().toISOString(),
+        })) || current;
+        attemptStartedAt = Date.now();
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        continue;
+      }
+
+      current = patchRunStatus(input.runId, (status) => ({
+        ...status,
+        state: "failed",
+        supervisorState: "exhausted",
+        lastSummary: status.lastSummary || "Retry budget exhausted",
+        watcherCompletedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      })) || current;
+    }
+
     if (isTerminalLifecycleState(current.state)) {
       const callback = await maybeSendTerminalCallback({
         cfg: input.cfg,
@@ -986,6 +1084,7 @@ export async function watchRunToTerminal(input: { cfg: any; runId: string; pollI
       });
       current = patchRunStatus(input.runId, (status) => ({
         ...status,
+        supervisorState: status.state === "completed" ? "completed" : (status.supervisorState || "idle"),
         watcherCompletedAt: new Date().toISOString(),
         watcherState: callback.ok ? "completed" : "failed",
         updatedAt: new Date().toISOString(),
@@ -996,20 +1095,81 @@ export async function watchRunToTerminal(input: { cfg: any; runId: string; pollI
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
 
+  const sessionTail = current.sessionId
+    ? await fetchJsonSafe(`${current.envelope.opencode_server_url.replace(/\/$/, "")}/session/${current.sessionId}/message`)
+    : { ok: false };
+  const sessionDiff = current.sessionId
+    ? await fetchJsonSafe(`${current.envelope.opencode_server_url.replace(/\/$/, "")}/session/${current.sessionId}/diff`)
+    : { ok: false };
+  const hasMessages = sessionTail.ok && Array.isArray(sessionTail.data) && sessionTail.data.length > 0;
+  const hasDiff = sessionDiff.ok && Array.isArray(sessionDiff.data) && sessionDiff.data.length > 0;
+  const materialized = hasMessages || hasDiff;
+
   current = patchRunStatus(input.runId, (status) => ({
     ...status,
-    watcherCompletedAt: new Date().toISOString(),
-    watcherState: "failed",
-    callbackError: status.callbackError || "watcher_timeout",
+    state: materialized ? "verifying" : "failed_retryable",
+    lastSummary: materialized
+      ? (status.lastSummary || "Execution materialized output before clean terminal event; promoted to verifying")
+      : (status.lastSummary || "Attach-run made no observable progress before timeout; marked retryable"),
+    watcherCompletedAt: materialized ? new Date().toISOString() : undefined,
+    watcherState: materialized ? "completed" : "failed",
+    callbackError: materialized ? status.callbackError : (status.callbackError || "watcher_timeout"),
     updatedAt: new Date().toISOString(),
   })) || current;
-  return { ok: false, terminal: false, timeout: true, runStatus: current };
+
+  if (!materialized) {
+    const retryDecision = shouldAutoRetryRun(current);
+    const retryCount = current.retryCount || 0;
+    if (retryDecision.retry && retryCount < maxAutoRetries) {
+      const retriedExecution = await runAttachExecutionForEnvelope({
+        envelope: current.envelope,
+        prompt: current.lastSummary || "Retrying previous execution after timeout.",
+      });
+      current = patchRunStatus(input.runId, (status) => ({
+        ...status,
+        retryCount: retryCount + 1,
+        maxAutoRetries,
+        supervisorState: "retrying",
+        retryHistory: [
+          ...(status.retryHistory || []),
+          {
+            at: new Date().toISOString(),
+            reason: retryDecision.reason,
+            retryCount: retryCount + 1,
+            exitCode: retriedExecution.exitCode,
+            signal: retriedExecution.signal,
+          },
+        ],
+        attachRun: retriedExecution,
+        state: retriedExecution.exitCode === 0 ? "running" : "failed_retryable",
+        lastSummary: retriedExecution.exitCode === 0
+          ? `Auto-retry #${retryCount + 1} started after ${retryDecision.reason}`
+          : (retriedExecution.stderr || retriedExecution.stdout || `Auto-retry #${retryCount + 1} failed to start`),
+        watcherCompletedAt: undefined,
+        watcherHeartbeatAt: new Date().toISOString(),
+        watcherState: "active",
+        updatedAt: new Date().toISOString(),
+      })) || current;
+      return watchRunToTerminal(input);
+    }
+
+    current = patchRunStatus(input.runId, (status) => ({
+      ...status,
+      state: "failed",
+      supervisorState: "exhausted",
+      watcherCompletedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    })) || current;
+  }
+
+  return { ok: false, terminal: false, timeout: true, materialized, runStatus: current };
 }
 
 export async function startExecutionRun(input: {
   cfg: any;
   envelope: RoutingEnvelope;
   prompt: string;
+  model?: string;
   pollIntervalMs?: number;
   maxWaitMs?: number;
 }) {
@@ -1022,23 +1182,75 @@ export async function startExecutionRun(input: {
     updatedAt: new Date().toISOString(),
     envelope: input.envelope,
     watcherState: "pending",
+    retryCount: 0,
+    maxAutoRetries: Math.max(0, asNumber((getRuntimeConfig(input.cfg) as any).maxAutoRetries) || 1),
+    supervisorState: "idle",
+    retryHistory: [],
   };
   writeRunStatus(initial);
 
-  const session = await createSessionForEnvelope(input.envelope);
+  const executionResult = await runAttachExecutionForEnvelope({
+    envelope: input.envelope,
+    prompt: input.prompt,
+    model: input.model,
+  });
+
+  const sessionsRes = await fetchJsonSafe(`${input.envelope.opencode_server_url.replace(/\/$/, "")}/session`);
+  const sessionList = sessionsRes.ok && Array.isArray(sessionsRes.data) ? sessionsRes.data : [];
+  const taggedTitle = buildTaggedSessionTitle({
+    runId: input.envelope.run_id,
+    taskId: input.envelope.task_id,
+    requested: input.envelope.requested_agent_id,
+    resolved: input.envelope.resolved_agent_id,
+    callbackSession: input.envelope.callback_target_session_key,
+    callbackSessionId: input.envelope.callback_target_session_id,
+    projectId: input.envelope.project_id,
+    repoRoot: input.envelope.repo_root,
+  });
+  const matchingSessions = sessionList.filter((item: any) => asString(item?.title) === taggedTitle);
+  matchingSessions.sort((a: any, b: any) => Number(b?.time?.updated || 0) - Number(a?.time?.updated || 0));
+  const createdSession = matchingSessions[0];
+  const sessionId = asString(createdSession?.id);
+
   let current = patchRunStatus(input.envelope.run_id, (status) => ({
     ...status,
-    sessionId: session.sessionId,
-    state: "session_created",
+    sessionId: sessionId || status.sessionId,
+    executionLane: "attach_run",
+    attachRun: executionResult,
+    state: executionResult.exitCode === 0 ? "running" : "failed_retryable",
+    lastSummary: executionResult.exitCode === 0 ? "Attach-run execution started" : (executionResult.stderr || executionResult.stdout || "Attach-run execution failed"),
     updatedAt: new Date().toISOString(),
   })) || initial;
 
-  await sendPromptAsyncForEnvelope(input.envelope, session.sessionId, input.prompt);
-  current = patchRunStatus(input.envelope.run_id, (status) => ({
-    ...status,
-    state: "prompt_sent",
-    updatedAt: new Date().toISOString(),
-  })) || current;
+  if (current.state === "failed_retryable" && (current.retryCount || 0) < (current.maxAutoRetries || 0)) {
+    const retryDecision = shouldAutoRetryRun(current);
+    const retriedExecution = await runAttachExecutionForEnvelope({
+      envelope: input.envelope,
+      prompt: current.lastSummary || input.prompt,
+      model: input.model,
+    });
+    current = patchRunStatus(input.envelope.run_id, (status) => ({
+      ...status,
+      retryCount: (status.retryCount || 0) + 1,
+      supervisorState: "retrying",
+      retryHistory: [
+        ...(status.retryHistory || []),
+        {
+          at: new Date().toISOString(),
+          reason: retryDecision.reason,
+          retryCount: (status.retryCount || 0) + 1,
+          exitCode: retriedExecution.exitCode,
+          signal: retriedExecution.signal,
+        },
+      ],
+      attachRun: retriedExecution,
+      state: retriedExecution.exitCode === 0 ? "running" : "failed_retryable",
+      lastSummary: retriedExecution.exitCode === 0
+        ? `Auto-retry #${(status.retryCount || 0) + 1} started after ${retryDecision.reason}`
+        : (retriedExecution.stderr || retriedExecution.stdout || `Auto-retry #${(status.retryCount || 0) + 1} failed to start`),
+      updatedAt: new Date().toISOString(),
+    })) || current;
+  }
 
   void watchRunToTerminal({
     cfg: input.cfg,
@@ -1056,12 +1268,13 @@ export async function startExecutionRun(input: {
   });
 
   return {
-    ok: true,
+    ok: executionResult.exitCode === 0,
     runId: input.envelope.run_id,
     taskId: input.envelope.task_id,
-    sessionId: session.sessionId,
+    sessionId: sessionId || null,
     state: current.state,
     watcherStarted: true,
+    attachRun: executionResult,
   };
 }
 
@@ -1086,3 +1299,4 @@ export function buildHookPolicyChecklist(agentId: string, sessionKey: string) {
     },
   };
 }
+

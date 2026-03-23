@@ -88,19 +88,12 @@ test("opencode_execute_task starts execution, writes run state, and callback loo
       res.end(JSON.stringify({ healthy: true, version: "test" }));
       return;
     }
-    if (req.method === "POST" && url === "/session") {
-      createdSessionCount += 1;
+    if (req.method === "GET" && url === "/session") {
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ id: "sess-exec-1", title: "mock session" }));
+      res.end(JSON.stringify([{ id: "sess-exec-1", title: "task-exec-1 runId=run-exec-1 taskId=task-exec-1 requested=creator resolved=creator callbackSession=session:origin:exec-1 callbackSessionId=origin-session-1 projectId=proj-exec-1 repoRoot=" + repoRoot }]));
       return;
     }
-    if (req.method === "POST" && url === "/session/sess-exec-1/prompt_async") {
-      promptAsyncCount += 1;
-      res.statusCode = 204;
-      res.end();
-      return;
-    }
-    if (req.method === "GET" && url === "/global/event") {
+    if (req.method === "GET" && (url === "/event" || url === "/global/event")) {
       eventReadCount += 1;
       res.setHeader("content-type", "text/event-stream");
       if (eventReadCount === 1) {
@@ -146,13 +139,14 @@ test("opencode_execute_task starts execution, writes run state, and callback loo
   mkdirSync(fakeBinDir, { recursive: true });
   writeFileSync(
     join(fakeBinDir, "opencode"),
-    `#!/bin/sh\nif [ "$1" = "serve" ]; then\n  exec python3 -m http.server ${new URL(mock.baseUrl).port} --bind 127.0.0.1 >/dev/null 2>&1\nfi\nexit 1\n`,
+    `#!/bin/sh\nif [ "$1" = "serve" ]; then\n  exec python3 -m http.server ${new URL(mock.baseUrl).port} --bind 127.0.0.1 >/dev/null 2>&1\nfi\nif [ "$1" = "run" ]; then\n  exit 0\nfi\nexit 1\n`,
     { encoding: "utf8", mode: 0o755 }
   );
   process.env.PATH = `${fakeBinDir}:${originalPath || ""}`;
   process.on("uncaughtException", swallowSpawnEnoent);
 
   let spawnedBaseUrl: string | null = null;
+  let sessionListReads = 0;
   globalThis.fetch = async (input: any, init?: any) => {
     const url = typeof input === "string" ? input : input?.url;
     if (typeof url === "string") {
@@ -194,8 +188,6 @@ test("opencode_execute_task starts execution, writes run state, and callback loo
     assert.equal(payload.ok, true);
     assert.equal(payload.execution.sessionId, "sess-exec-1");
     assert.equal(payload.execution.watcherStarted, true);
-    assert.equal(createdSessionCount, 1);
-    assert.equal(promptAsyncCount, 1);
 
     await new Promise((resolve) => setTimeout(resolve, 300));
 
@@ -203,7 +195,8 @@ test("opencode_execute_task starts execution, writes run state, and callback loo
     assert.equal(existsSync(runPath), true);
     const runStatus = JSON.parse(readFileSync(runPath, "utf8"));
     assert.equal(runStatus.state, "completed");
-    assert.equal(runStatus.sessionId, "sess-exec-1");
+    assert.equal(runStatus.executionLane, "attach_run");
+    assert.equal(runStatus.attachRun.exitCode, 0);
     assert.equal(runStatus.callbackOk, true);
     assert.equal(typeof runStatus.callbackSentAt, "string");
     assert.equal(runStatus.callbackAttempts, 1);

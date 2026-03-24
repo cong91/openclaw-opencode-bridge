@@ -210,8 +210,7 @@ test("resolveSessionForRun falls back to callback target session key before exec
 test("evaluateServeIdle returns shutdown signal when idle timeout is exceeded", () => {
 	const now = Date.now();
 	const result = evaluateServeIdle({
-		project_id: "proj-idle",
-		repo_root: "/tmp/repo-idle",
+		serve_id: "http://127.0.0.1:5000",
 		opencode_server_url: "http://127.0.0.1:5000",
 		last_event_at: new Date(now - 20_000).toISOString(),
 		idle_timeout_ms: 5_000,

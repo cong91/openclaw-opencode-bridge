@@ -282,8 +282,7 @@ export type CallbackAuditRecord = {
 };
 
 export type ServeRegistryEntry = {
-	project_id: string;
-	repo_root: string;
+	serve_id: string;
 	opencode_server_url: string;
 	pid?: number;
 	status?: "running" | "stopped" | "unknown";
@@ -294,6 +293,23 @@ export type ServeRegistryEntry = {
 
 export type ServeRegistryFile = {
 	entries: ServeRegistryEntry[];
+};
+
+export type SessionRegistryEntry = {
+	session_id: string;
+	serve_id: string;
+	opencode_server_url: string;
+	directory: string;
+	project_id?: string;
+	session_title?: string;
+	session_updated_at?: string;
+	status?: "active" | "stale" | "closed";
+	is_current_for_directory?: boolean;
+	updated_at: string;
+};
+
+export type SessionRegistryFile = {
+	entries: SessionRegistryEntry[];
 };
 
 export type BridgeConfigFile = {

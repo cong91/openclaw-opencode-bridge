@@ -22,11 +22,14 @@ import {
 	getRunStateDir,
 	getRuntimeConfig,
 	getServeRegistryPath,
+	getSessionRegistryPath,
 	listRunStatuses,
 	normalizeRegistry,
 	normalizeServeRegistry,
+	normalizeSessionRegistry,
 	readRunStatus,
 	readServeRegistry,
+	readSessionRegistry,
 	resolveExecutionAgent,
 	resolveServerUrl,
 	resolveSessionForRun,
@@ -36,6 +39,7 @@ import {
 	upsertServeRegistry,
 	cleanupExpiredServes,
 	writeServeRegistryFile,
+	writeSessionRegistryFile,
 } from "./runtime";
 import { OPENCODE_CALLBACK_HTTP_PATH } from "./shared-contracts";
 import type { OpenCodeContinuationCallbackMetadata } from "./types";
@@ -97,6 +101,104 @@ function appendCallbackDebugAudit(record: Record<string, unknown>) {
 	return path;
 }
 
+function parseJsonObject(raw: string): Record<string, unknown> | null {
+	try {
+		const parsed = JSON.parse(raw);
+		return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+	} catch {
+		return null;
+	}
+}
+
+function buildContinuationCommandPayload(input: {
+	runStatus: BridgeRunStatus;
+	metadata: OpenCodeContinuationCallbackMetadata | null;
+	step: NonNullable<OpenCodeRunContinuation["nextOnSuccess"]>;
+}) {
+	return {
+		version: "v1",
+		sourceRunId: input.metadata?.runId || input.runStatus.runId,
+		sourceTaskId: input.metadata?.taskId || input.runStatus.taskId,
+		eventType: input.metadata?.eventType || null,
+		projectId: input.runStatus.envelope.project_id,
+		repoRoot: input.runStatus.envelope.repo_root,
+		requestedAgentId: input.runStatus.envelope.requested_agent_id,
+		resolvedAgentId: input.runStatus.envelope.resolved_agent_id,
+		originSessionKey: input.runStatus.envelope.origin_session_key,
+		originSessionId: input.runStatus.envelope.origin_session_id,
+		callbackTargetSessionKey: input.runStatus.envelope.callback_target_session_key,
+		callbackTargetSessionId: input.runStatus.envelope.callback_target_session_id,
+		workflowId: input.runStatus.continuation?.workflowId,
+		stepId: input.runStatus.continuation?.stepId,
+		next: input.step,
+	};
+}
+
+function registerContinuationCommand(api: any, cfg: any) {
+	if (typeof api?.registerCommand !== "function") return;
+	api.registerCommand({
+		name: "opencode-continue",
+		description: "Continue a bridge-managed workflow step after OpenCode callback",
+		acceptsArgs: true,
+		requireAuth: false,
+		handler: async ({ args }: { args?: string }) => {
+			const payload = parseJsonObject(args || "");
+			if (!payload) {
+				return { text: "❌ Invalid /opencode-continue payload." };
+			}
+			const next = payload.next as Record<string, unknown> | undefined;
+			const taskId = asString(next?.taskId) || asString(payload.sourceTaskId) || "opencode-continue";
+			const runId = `${taskId}-${Date.now()}`;
+			const requestedAgentId = asString(payload.requestedAgentId) || "creator";
+			const resolvedAgentId =
+				asString(payload.resolvedAgentId) || requestedAgentId || "creator";
+			const projectId = asString(payload.projectId) || "unknown-project";
+			const repoRoot = asString(payload.repoRoot) || ".";
+			const originSessionKey = asString(payload.originSessionKey) || "session:unknown";
+			const serverUrl =
+				findRegistryEntry({
+					cfg,
+					projectId,
+					repoRoot,
+				})?.serverUrl || resolveServerUrl(cfg);
+			const envelope = buildEnvelope({
+				taskId,
+				runId,
+				requestedAgentId,
+				resolvedAgentId,
+				originSessionKey,
+				originSessionId: asString(payload.originSessionId),
+				projectId,
+				repoRoot,
+				serverUrl,
+				deliver: true,
+			});
+			const continuation = asString(payload.workflowId)
+				? {
+					workflowId: asString(payload.workflowId),
+					stepId: asString(next?.taskId) || asString(payload.stepId),
+					callbackEventKind: "opencode.callback" as const,
+				}
+				: undefined;
+			await startExecutionRun({
+				cfg,
+				envelope,
+				prompt:
+					asString(next?.prompt) ||
+					asString(next?.objective) ||
+					"Continue workflow step.",
+				continuation,
+			});
+			appendCallbackDebugAudit({
+				phase: "plugin_command_child_run_started",
+				taskId,
+				runId,
+				sourceRunId: asString(payload.sourceRunId) || null,
+			});
+			return { text: `▶️ Continued workflow as ${taskId} (${runId}).` };
+		},
+	});
+}
 
 function parseOpencodeCallbackPayload(raw: string): {
 	ok: true;
@@ -108,6 +210,8 @@ function parseOpencodeCallbackPayload(raw: string): {
 		sessionId?: string;
 		wakeMode?: "now" | "next-heartbeat";
 		deliver?: boolean;
+		channel?: string;
+		to?: string;
 	};
 	metadata: OpenCodeContinuationCallbackMetadata | null;
 } | {
@@ -142,6 +246,8 @@ function parseOpencodeCallbackPayload(raw: string): {
 			wakeMode:
 				parsed?.wakeMode === "next-heartbeat" ? "next-heartbeat" : "now",
 			deliver: parsed?.deliver === true,
+			...(asString(parsed?.channel) ? { channel: asString(parsed?.channel) } : {}),
+			...(asString(parsed?.to) ? { to: asString(parsed?.to) } : {}),
 		},
 		metadata,
 	};
@@ -185,6 +291,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			const dedupeKey = parsed.metadata?.runId && parsed.metadata?.eventType
 				? `opencode:${parsed.metadata.runId}:${parsed.metadata.eventType}`
 				: undefined;
+			const runStatus = parsed.metadata?.runId ? readRunStatus(parsed.metadata.runId) : null;
 			api.runtime.system.enqueueSystemEvent(callback.message, {
 				sessionKey: callback.sessionKey,
 				...(dedupeKey ? { contextKey: dedupeKey } : {}),
@@ -197,6 +304,42 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					sessionKey: callback.sessionKey,
 					...(dedupeKey ? { contextKey: `${dedupeKey}:visible-ack` } : {}),
 				});
+				const telegramDirectMatch = callback.sessionKey.match(/^agent:[^:]+:telegram:direct:(.+)$/);
+				const telegramDirectTo = asString(callback.to) || telegramDirectMatch?.[1];
+				if (
+					(callback.channel === "telegram" || telegramDirectTo) &&
+					typeof api?.runtime?.channel?.telegram?.sendMessageTelegram === "function" &&
+					telegramDirectTo
+				) {
+					try {
+						await api.runtime.channel.telegram.sendMessageTelegram(
+							telegramDirectTo,
+							ackText,
+							{
+								...(dedupeKey ? { contextKey: `${dedupeKey}:visible-ack:telegram` } : {}),
+								silent: false,
+							},
+						);
+						appendCallbackDebugAudit({
+							phase: "visible_ack_telegram_sent",
+							sessionKey: callback.sessionKey,
+							telegramTo: telegramDirectTo,
+							dedupeKey,
+							runId: parsed.metadata?.runId || null,
+							ackText,
+						});
+					} catch (error) {
+						appendCallbackDebugAudit({
+							phase: "visible_ack_telegram_failed",
+							sessionKey: callback.sessionKey,
+							telegramTo: telegramDirectTo,
+							dedupeKey,
+							runId: parsed.metadata?.runId || null,
+							ackText,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
 				appendCallbackDebugAudit({
 					phase: "visible_ack_enqueued",
 					sessionKey: callback.sessionKey,
@@ -217,7 +360,57 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				runId: parsed.metadata?.runId || null,
 				eventType: parsed.metadata?.eventType || null,
 				deliver: callback.deliver === true,
+				hasContinuation: Boolean(runStatus?.continuation),
+				continuation: runStatus?.continuation || null,
 			});
+			if (runStatus?.continuation) {
+				const step = (parsed.metadata?.eventType === "task.failed" || parsed.metadata?.eventType === "task.stalled")
+					? runStatus.continuation.nextOnFailure
+					: runStatus.continuation.nextOnSuccess;
+				appendCallbackDebugAudit({
+					phase: "continuation_evaluated",
+					sessionKey: callback.sessionKey,
+					dedupeKey,
+					runId: parsed.metadata?.runId || null,
+					eventType: parsed.metadata?.eventType || null,
+					selectedStep: step || null,
+				});
+				if (step?.action === "launch_run") {
+					const commandPayload = buildContinuationCommandPayload({
+						runStatus,
+						metadata: parsed.metadata,
+						step,
+					});
+					const command = `/opencode-continue ${JSON.stringify(commandPayload)}`;
+					api.runtime.system.enqueueSystemEvent(command, {
+						sessionKey: callback.sessionKey,
+						...(dedupeKey ? { contextKey: `${dedupeKey}:continuation-command` } : {}),
+					});
+					appendCallbackDebugAudit({
+						phase: "continuation_command_enqueued",
+						sessionKey: callback.sessionKey,
+						dedupeKey,
+						runId: parsed.metadata?.runId || null,
+						commandPayload,
+					});
+				} else if (step?.action === "notify") {
+					const notifyMessage = [
+						`OpenCode callback received for run ${parsed.metadata?.runId || "unknown-run"}.`,
+						step.objective || step.prompt || "Next step requires operator notice.",
+					].join("\n");
+					api.runtime.system.enqueueSystemEvent(notifyMessage, {
+						sessionKey: callback.sessionKey,
+						...(dedupeKey ? { contextKey: `${dedupeKey}:continuation-notify` } : {}),
+					});
+					appendCallbackDebugAudit({
+						phase: "continuation_notify_enqueued",
+						sessionKey: callback.sessionKey,
+						dedupeKey,
+						runId: parsed.metadata?.runId || null,
+						notifyMessage,
+					});
+				}
+			}
 			sendJson(res, 200, {
 				ok: true,
 				routed: {
@@ -275,6 +468,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 		`[opencode-bridge] opencodeServerUrl=${cfg.opencodeServerUrl || "(unset)"}`,
 	);
 	console.log("[opencode-bridge] registering opencode_* tools");
+	registerContinuationCommand(api, cfg);
 	registerCallbackIngressRoute(api, cfg);
 
 	api.registerTool(
@@ -623,7 +817,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				],
 			},
 			async execute(_id: string, params: any) {
-				const opportunisticCleanup = cleanupExpiredServes();
+				const opportunisticCleanup = await cleanupExpiredServes();
 				const resolved = resolveExecutionAgent({
 					cfg,
 					requestedAgentId: asString(params?.agentId) || "",
@@ -679,6 +873,32 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				const continuationEnabled = Boolean(
 					workflowId || stepId || nextOnSuccess || nextOnFailure,
 				);
+				if (params.deliver === true && !continuationEnabled) {
+					return {
+						isError: true,
+						content: [
+							{
+								type: "text",
+								text: JSON.stringify(
+									{
+										ok: false,
+										error:
+											"deliver=true requires continuation metadata (workflowId/stepId and nextOnSuccess or nextOnFailure) so callback can resume work instead of wake-only.",
+										requiredForAutoResume: true,
+										provided: {
+											workflowId,
+											stepId,
+											nextOnSuccess: nextOnSuccess || null,
+											nextOnFailure: nextOnFailure || null,
+										},
+									},
+									null,
+									2,
+								),
+							},
+						],
+					};
+				}
 				const continuation = continuationEnabled
 					? {
 							...(workflowId ? { workflowId } : {}),
@@ -1144,7 +1364,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				required: ["project_id", "repo_root"],
 			},
 			async execute(_id: string, params: any) {
-				const opportunisticCleanup = cleanupExpiredServes();
+				const opportunisticCleanup = await cleanupExpiredServes();
 				const result = await spawnServeForProject({
 					project_id: params.project_id,
 					repo_root: params.repo_root,
@@ -1168,16 +1388,23 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 			name: "opencode_registry_get",
 			label: "OpenCode Registry Get",
 			description:
-				"Đọc serve registry hiện tại của OpenCode bridge để xem mapping project -> serve URL -> pid -> status.",
+				"Đọc session-centric registry hiện tại của OpenCode bridge để xem serve registry và session registry.",
 			parameters: { type: "object", properties: {} },
 			async execute() {
-				const registry = readServeRegistry();
+				const serveRegistry = readServeRegistry();
+				const sessionRegistry = readSessionRegistry();
 				return {
 					content: [
 						{
 							type: "text",
 							text: JSON.stringify(
-								{ ok: true, path: getServeRegistryPath(), registry },
+								{
+									ok: true,
+									servePath: getServeRegistryPath(),
+									sessionPath: getSessionRegistryPath(),
+									serveRegistry,
+									sessionRegistry,
+								},
 								null,
 								2,
 							),
@@ -1198,20 +1425,18 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 			parameters: {
 				type: "object",
 				properties: {
-					project_id: { type: "string" },
-					repo_root: { type: "string" },
+					serve_id: { type: "string" },
 					opencode_server_url: { type: "string" },
 					pid: { type: "number" },
 					status: { type: "string", enum: ["running", "stopped", "unknown"] },
 					last_event_at: { type: "string" },
 					idle_timeout_ms: { type: "number" },
 				},
-				required: ["project_id", "repo_root", "opencode_server_url"],
+				required: ["serve_id", "opencode_server_url"],
 			},
 			async execute(_id: string, params: any) {
 				const entry: ServeRegistryEntry = {
-					project_id: params.project_id,
-					repo_root: params.repo_root,
+					serve_id: params.serve_id,
 					opencode_server_url: params.opencode_server_url,
 					...(params.pid !== undefined ? { pid: Number(params.pid) } : {}),
 					...(params.status ? { status: params.status } : {}),
@@ -1251,18 +1476,29 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 			name: "opencode_registry_cleanup",
 			label: "OpenCode Registry Cleanup",
 			description:
-				"Cleanup/normalize serve registry: loại bỏ entry không đủ field hoặc normalize schema lưu trữ hiện tại.",
+				"Cleanup/normalize serve + session registry theo schema session-centric hiện tại.",
 			parameters: { type: "object", properties: {} },
 			async execute() {
-				const before = readServeRegistry();
-				const normalized = normalizeServeRegistry(before);
-				const path = writeServeRegistryFile(normalized);
+				const beforeServes = readServeRegistry();
+				const beforeSessions = readSessionRegistry();
+				const normalizedServes = normalizeServeRegistry(beforeServes);
+				const normalizedSessions = normalizeSessionRegistry(beforeSessions);
+				const servePath = writeServeRegistryFile(normalizedServes);
+				const sessionPath = writeSessionRegistryFile(normalizedSessions);
 				return {
 					content: [
 						{
 							type: "text",
 							text: JSON.stringify(
-								{ ok: true, path, before, after: normalized },
+								{
+									ok: true,
+									servePath,
+									sessionPath,
+									beforeServes,
+									afterServes: normalizedServes,
+									beforeSessions,
+									afterSessions: normalizedSessions,
+								},
 								null,
 								2,
 							),
@@ -1279,16 +1515,17 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 			name: "opencode_serve_shutdown",
 			label: "OpenCode Serve Shutdown",
 			description:
-				"Đánh dấu stopped và gửi SIGTERM cho serve của một project nếu registry có pid.",
+				"Đánh dấu stopped và gửi SIGTERM cho serve theo serve_id hoặc server URL nếu registry có pid.",
 			parameters: {
 				type: "object",
-				properties: { project_id: { type: "string" } },
-				required: ["project_id"],
+				properties: { project_id: { type: "string" }, serve_id: { type: "string" } },
+				required: [],
 			},
 			async execute(_id: string, params: any) {
+				const target = asString(params.serve_id) || asString(params.project_id);
 				const registry = normalizeServeRegistry(readServeRegistry());
 				const entry = registry.entries.find(
-					(x) => x.project_id === params.project_id,
+					(x) => x.serve_id === target || x.opencode_server_url === target,
 				);
 				if (!entry) {
 					return {
@@ -1325,14 +1562,16 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				type: "object",
 				properties: {
 					project_id: { type: "string" },
+					serve_id: { type: "string" },
 					nowMs: { type: "number" },
 				},
-				required: ["project_id"],
+				required: [],
 			},
 			async execute(_id: string, params: any) {
+				const target = asString(params.serve_id) || asString(params.project_id);
 				const registry = normalizeServeRegistry(readServeRegistry());
 				const entry = registry.entries.find(
-					(x) => x.project_id === params.project_id,
+					(x) => x.serve_id === target || x.opencode_server_url === target,
 				);
 				if (!entry) {
 					return {

@@ -30,6 +30,8 @@ import type {
 	RunEventRecord,
 	ServeRegistryEntry,
 	ServeRegistryFile,
+	SessionRegistryEntry,
+	SessionRegistryFile,
 } from "./types";
 
 export const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
@@ -136,8 +138,8 @@ export function findRegistryEntry(
 	const dynamicRegistry = normalizeServeRegistry(
 		readServeRegistry(),
 	).entries.map((x) => ({
-		projectId: x.project_id,
-		repoRoot: x.repo_root,
+		projectId: undefined,
+		repoRoot: undefined,
 		serverUrl: x.opencode_server_url,
 		idleTimeoutMs: x.idle_timeout_ms,
 	}));
@@ -465,13 +467,23 @@ export function appendAudit(record: CallbackAuditRecord) {
 }
 
 export function getServeRegistryPath(): string {
-	return join(getBridgeStateDir(), "registry.json");
+	return join(getBridgeStateDir(), "serves.json");
+}
+
+export function getSessionRegistryPath(): string {
+	return join(getBridgeStateDir(), "sessions.json");
 }
 
 export function readServeRegistry(): ServeRegistryFile {
 	const path = getServeRegistryPath();
-	if (!existsSync(path)) return { entries: [] };
-	return JSON.parse(readFileSync(path, "utf8")) as ServeRegistryFile;
+	if (existsSync(path)) {
+		return JSON.parse(readFileSync(path, "utf8")) as ServeRegistryFile;
+	}
+	const legacyPath = join(getBridgeStateDir(), "registry.json");
+	if (existsSync(legacyPath)) {
+		return JSON.parse(readFileSync(legacyPath, "utf8")) as ServeRegistryFile;
+	}
+	return { entries: [] };
 }
 
 export function normalizeServeRegistry(
@@ -483,13 +495,11 @@ export function normalizeServeRegistry(
 				entry && typeof entry === "object"
 					? (entry as Record<string, unknown>)
 					: {};
-			const project_id = asString(e.project_id);
-			const repo_root = asString(e.repo_root);
+			const serve_id = asString(e.serve_id) || asString(e.opencode_server_url);
 			const opencode_server_url = asString(e.opencode_server_url);
-			if (!project_id || !repo_root || !opencode_server_url) return null;
+			if (!serve_id || !opencode_server_url) return null;
 			return {
-				project_id,
-				repo_root,
+				serve_id,
 				opencode_server_url,
 				...(asNumber(e.pid) !== undefined ? { pid: asNumber(e.pid) } : {}),
 				...(asString(e.status)
@@ -506,6 +516,45 @@ export function normalizeServeRegistry(
 	return { entries };
 }
 
+export function readSessionRegistry(): SessionRegistryFile {
+	const path = getSessionRegistryPath();
+	if (existsSync(path)) {
+		return JSON.parse(readFileSync(path, "utf8")) as SessionRegistryFile;
+	}
+	return { entries: [] };
+}
+
+export function normalizeSessionRegistry(
+	registry: SessionRegistryFile,
+): SessionRegistryFile {
+	const entries = asArray(registry.entries)
+		.map((entry) => {
+			const e =
+				entry && typeof entry === "object"
+					? (entry as Record<string, unknown>)
+					: {};
+			const session_id = asString(e.session_id);
+			const serve_id = asString(e.serve_id);
+			const opencode_server_url = asString(e.opencode_server_url);
+			const directory = asString(e.directory);
+			if (!session_id || !serve_id || !opencode_server_url || !directory) return null;
+			return {
+				session_id,
+				serve_id,
+				opencode_server_url,
+				directory,
+				...(asString(e.project_id) ? { project_id: asString(e.project_id) } : {}),
+				...(asString(e.session_title) ? { session_title: asString(e.session_title) } : {}),
+				...(asString(e.session_updated_at) ? { session_updated_at: asString(e.session_updated_at) } : {}),
+				...(asString(e.status) ? { status: asString(e.status) as SessionRegistryEntry["status"] } : {}),
+				...(typeof e.is_current_for_directory === "boolean" ? { is_current_for_directory: e.is_current_for_directory } : {}),
+				updated_at: asString(e.updated_at) || new Date().toISOString(),
+			} as SessionRegistryEntry;
+		})
+		.filter(Boolean) as SessionRegistryEntry[];
+	return { entries };
+}
+
 export function writeServeRegistryFile(data: ServeRegistryFile) {
 	const path = getServeRegistryPath();
 	writeFileSync(
@@ -516,14 +565,40 @@ export function writeServeRegistryFile(data: ServeRegistryFile) {
 	return path;
 }
 
+export function writeSessionRegistryFile(data: SessionRegistryFile) {
+	const path = getSessionRegistryPath();
+	writeFileSync(
+		path,
+		JSON.stringify(normalizeSessionRegistry(data), null, 2),
+		"utf8",
+	);
+	return path;
+}
+
 export function upsertServeRegistry(entry: ServeRegistryEntry) {
 	const registry = normalizeServeRegistry(readServeRegistry());
 	const idx = registry.entries.findIndex(
-		(x) => x.project_id === entry.project_id || x.repo_root === entry.repo_root,
+		(x) => x.serve_id === entry.serve_id || x.opencode_server_url === entry.opencode_server_url,
 	);
 	if (idx >= 0) registry.entries[idx] = entry;
 	else registry.entries.push(entry);
 	const path = writeServeRegistryFile(registry);
+	return { path, registry };
+}
+
+export function upsertSessionRegistry(entry: SessionRegistryEntry) {
+	const registry = normalizeSessionRegistry(readSessionRegistry());
+	for (const item of registry.entries) {
+		if (item.serve_id === entry.serve_id && item.directory === entry.directory) {
+			item.is_current_for_directory = false;
+		}
+	}
+	const idx = registry.entries.findIndex(
+		(x) => x.session_id === entry.session_id,
+	);
+	if (idx >= 0) registry.entries[idx] = entry;
+	else registry.entries.push(entry);
+	const path = writeSessionRegistryFile(registry);
 	return { path, registry };
 }
 
@@ -577,16 +652,21 @@ export async function fetchServeProjectBinding(serverUrl: string): Promise<{
 	directory?: string;
 	project?: any;
 	path?: any;
+	session?: any;
 	error?: string;
 }> {
 	const normalizedUrl = serverUrl.replace(/\/$/, "");
-	const [projectRes, pathRes] = await Promise.all([
+	const [projectRes, pathRes, sessionRes] = await Promise.all([
 		fetchJsonSafe(`${normalizedUrl}/project/current`),
 		fetchJsonSafe(`${normalizedUrl}/path`),
+		fetchJsonSafe(`${normalizedUrl}/session`),
 	]);
 
 	const project = projectRes.ok ? projectRes.data : undefined;
 	const path = pathRes.ok ? pathRes.data : undefined;
+	const session = sessionRes.ok && Array.isArray(sessionRes.data)
+		? sessionRes.data[0]
+		: undefined;
 	const directory =
 		asString(project?.directory) ||
 		asString(project?.path) ||
@@ -595,16 +675,18 @@ export async function fetchServeProjectBinding(serverUrl: string): Promise<{
 		asString(path?.path);
 
 	if (directory) {
-		return { ok: true, directory, project, path };
+		return { ok: true, directory, project, path, session };
 	}
 
 	return {
 		ok: false,
 		project,
 		path,
+		session,
 		error:
 			projectRes.error ||
 			pathRes.error ||
+			sessionRes.error ||
 			"Could not determine serve project binding",
 	};
 }
@@ -622,24 +704,16 @@ export async function spawnServeForProject(input: {
 	repo_root: string;
 	idle_timeout_ms?: number;
 }) {
-	const existing = normalizeServeRegistry(readServeRegistry()).entries.find(
-		(x) => x.project_id === input.project_id || x.repo_root === input.repo_root,
-	);
-	if (existing && existing.status === "running") {
+	const registry = normalizeServeRegistry(readServeRegistry());
+	for (const existing of registry.entries) {
+		if (existing.status !== "running") continue;
 		const healthy = await waitForHealth(existing.opencode_server_url, 2000);
-		if (healthy) {
-			const boundToRepo = await isServeBoundToRepo(
-				existing.opencode_server_url,
-				input.repo_root,
-			);
-			if (boundToRepo) {
-				return {
-					reused: true,
-					entry: existing,
-					registryPath: getServeRegistryPath(),
-				};
-			}
-		}
+		if (!healthy) continue;
+		return {
+			reused: true,
+			entry: existing,
+			registryPath: getServeRegistryPath(),
+		};
 	}
 	const port = await allocatePort();
 	const runtimeCfg = getRuntimeConfig({});
@@ -665,8 +739,7 @@ export async function spawnServeForProject(input: {
 	const serverUrl = `http://127.0.0.1:${port}`;
 	const healthy = await waitForHealth(serverUrl, 10000);
 	const entry: ServeRegistryEntry = {
-		project_id: input.project_id,
-		repo_root: input.repo_root,
+		serve_id: serverUrl,
 		opencode_server_url: serverUrl,
 		pid: child.pid,
 		status: healthy ? "running" : "unknown",
@@ -678,10 +751,10 @@ export async function spawnServeForProject(input: {
 	return { reused: false, entry, healthy, registryPath: result.path };
 }
 
-export function markServeStopped(projectId: string) {
+export function markServeStopped(serveId: string) {
 	const registry = normalizeServeRegistry(readServeRegistry());
-	const entry = registry.entries.find((x) => x.project_id === projectId);
-	if (!entry) return { ok: false, error: "Project entry not found" };
+	const entry = registry.entries.find((x) => x.serve_id === serveId || x.opencode_server_url === serveId);
+	if (!entry) return { ok: false, error: "Serve entry not found" };
 	entry.status = "stopped";
 	entry.updated_at = new Date().toISOString();
 	const path = writeServeRegistryFile(registry);
@@ -694,10 +767,10 @@ export function shutdownServe(entry: ServeRegistryEntry) {
 			process.kill(entry.pid, "SIGTERM");
 		} catch {}
 	}
-	return markServeStopped(entry.project_id);
+	return markServeStopped(entry.serve_id);
 }
 
-export function cleanupExpiredServes(nowMs?: number) {
+export async function cleanupExpiredServes(nowMs?: number) {
 	const registry = normalizeServeRegistry(readServeRegistry());
 	const results: Array<{
 		project_id: string;
@@ -705,28 +778,58 @@ export function cleanupExpiredServes(nowMs?: number) {
 		reason: string;
 		idleMs?: number | null;
 		idleTimeoutMs?: number;
+		runtimeState?: string;
 	}> = [];
 	for (const entry of registry.entries) {
 		if (entry.status !== "running") continue;
 		const evaluation = evaluateServeIdle(entry, nowMs);
-		if (evaluation.shouldShutdown) {
-			shutdownServe(entry);
+		if (!evaluation.shouldShutdown) {
 			results.push({
-				project_id: entry.project_id,
-				status: "stopped",
-				reason: evaluation.reason,
-				idleMs: evaluation.idleMs,
-				idleTimeoutMs: evaluation.idleTimeoutMs,
-			});
-		} else {
-			results.push({
-				project_id: entry.project_id,
+				project_id: entry.serve_id,
 				status: entry.status,
 				reason: evaluation.reason,
 				idleMs: evaluation.idleMs,
 				idleTimeoutMs: evaluation.idleTimeoutMs,
 			});
+			continue;
 		}
+
+		const sessionStatus = await fetchJsonSafe(
+			`${entry.opencode_server_url.replace(/\/$/, "")}/session/status`,
+		);
+		const sessionList = await fetchJsonSafe(
+			`${entry.opencode_server_url.replace(/\/$/, "")}/session`,
+		);
+		const statusData = sessionStatus.ok && sessionStatus.data && typeof sessionStatus.data === "object"
+			? (sessionStatus.data as Record<string, any>)
+			: {};
+		const sessions = sessionList.ok && Array.isArray(sessionList.data) ? sessionList.data : [];
+		const hasBusySession = sessions.some((session: any) => {
+			const sid = asString(session?.id);
+			const state = sid ? statusData[sid] : undefined;
+			return state && typeof state === "object" && asString((state as any).type) === "busy";
+		});
+		if (hasBusySession) {
+			results.push({
+				project_id: entry.serve_id,
+				status: entry.status,
+				reason: "runtime_busy_session_detected",
+				idleMs: evaluation.idleMs,
+				idleTimeoutMs: evaluation.idleTimeoutMs,
+				runtimeState: "busy",
+			});
+			continue;
+		}
+
+		shutdownServe(entry);
+		results.push({
+			project_id: entry.serve_id,
+			status: "stopped",
+			reason: evaluation.reason,
+			idleMs: evaluation.idleMs,
+			idleTimeoutMs: evaluation.idleTimeoutMs,
+			runtimeState: "idle_or_unknown",
+		});
 	}
 	return {
 		ok: true,
@@ -1043,20 +1146,12 @@ export async function createSessionForEnvelope(
 	envelope: RoutingEnvelope,
 ): Promise<{ sessionId: string; created: any }> {
 	const serverUrl = envelope.opencode_server_url.replace(/\/$/, "");
-	const taggedTitle = buildTaggedSessionTitle({
-		runId: envelope.run_id,
-		taskId: envelope.task_id,
-		requested: envelope.requested_agent_id,
-		resolved: envelope.resolved_agent_id,
-		callbackSession: envelope.callback_target_session_key,
-		callbackSessionId: envelope.callback_target_session_id,
-		projectId: envelope.project_id,
-		repoRoot: envelope.repo_root,
-	});
 	const createdRes = await fetch(`${serverUrl}/session`, {
 		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ title: taggedTitle }),
+		headers: {
+			"x-opencode-directory": envelope.repo_root,
+		},
+		body: null,
 	});
 	const createdText = await createdRes.text();
 	let created: any;
@@ -1075,6 +1170,61 @@ export async function createSessionForEnvelope(
 		throw new Error("session create failed: missing session id");
 	}
 	return { sessionId, created };
+}
+
+function resolvePromptAsyncModel(model?: string) {
+	const raw = asString(model);
+	if (!raw) return undefined;
+	const parts = raw.split("/");
+	if (parts.length === 2 && parts[0] && parts[1]) {
+		return { providerID: parts[0], modelID: parts[1] };
+	}
+	return { providerID: "proxy", modelID: raw };
+}
+
+export async function promptAsyncForSession(input: {
+	envelope: RoutingEnvelope;
+	sessionId: string;
+	prompt: string;
+	model?: string;
+}) {
+	const serverUrl = input.envelope.opencode_server_url.replace(/\/$/, "");
+	const payload = {
+		agent: input.envelope.resolved_agent_id,
+		...(resolvePromptAsyncModel(input.model)
+			? { model: resolvePromptAsyncModel(input.model) }
+			: {}),
+		messageID: `msg_${input.envelope.run_id}`,
+		parts: [
+			{
+				id: `prt_${input.envelope.run_id}`,
+				type: "text",
+				text: input.prompt,
+			},
+		],
+	};
+	const response = await fetch(
+		`${serverUrl}/session/${input.sessionId}/prompt_async`,
+		{
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-opencode-directory": input.envelope.repo_root,
+			},
+			body: JSON.stringify(payload),
+		},
+	);
+	const text = await response.text();
+	let data: any;
+	try {
+		data = text ? JSON.parse(text) : null;
+	} catch {
+		data = { raw: text };
+	}
+	if (!response.ok) {
+		throw new Error(`prompt_async failed: ${response.status} ${text}`);
+	}
+	return { ok: true, payload, response: data };
 }
 
 export async function runAttachExecutionForEnvelope(input: {
@@ -1186,61 +1336,87 @@ export async function startExecutionRun(input: {
 	};
 	writeRunStatus(initial);
 
-	const executionResult = await runAttachExecutionForEnvelope({
-		cfg: input.cfg,
+	const serveRegistry = normalizeServeRegistry(readServeRegistry());
+	const serveEntry = serveRegistry.entries.find(
+		(entry) => entry.opencode_server_url === input.envelope.opencode_server_url,
+	);
+	const sessionRegistry = normalizeSessionRegistry(readSessionRegistry());
+	const sessionEntry = sessionRegistry.entries.find(
+		(entry) =>
+			entry.opencode_server_url === input.envelope.opencode_server_url &&
+			entry.directory === input.envelope.repo_root &&
+			entry.is_current_for_directory === true,
+	);
+	const reuseSessionId = sessionEntry?.session_id;
+	const activeSessionId = reuseSessionId
+		? reuseSessionId
+		: (await createSessionForEnvelope(input.envelope)).sessionId;
+	const promptAsync = await promptAsyncForSession({
 		envelope: input.envelope,
+		sessionId: activeSessionId,
 		prompt: input.prompt,
 		model: input.model,
 	});
 
-	const sessionsRes = await fetchJsonSafe(
+	const refreshedSessions = await fetchJsonSafe(
 		`${input.envelope.opencode_server_url.replace(/\/$/, "")}/session`,
 	);
-	const sessionList =
-		sessionsRes.ok && Array.isArray(sessionsRes.data) ? sessionsRes.data : [];
-	const taggedTitle = buildTaggedSessionTitle({
-		runId: input.envelope.run_id,
-		taskId: input.envelope.task_id,
-		requested: input.envelope.requested_agent_id,
-		resolved: input.envelope.resolved_agent_id,
-		callbackSession: input.envelope.callback_target_session_key,
-		callbackSessionId: input.envelope.callback_target_session_id,
-		callbackDeliver: input.envelope.deliver,
-		projectId: input.envelope.project_id,
-		repoRoot: input.envelope.repo_root,
-	});
-	const matchingSessions = sessionList.filter(
-		(item: any) => asString(item?.title) === taggedTitle,
+	const sessionList = refreshedSessions.ok && Array.isArray(refreshedSessions.data)
+		? refreshedSessions.data
+		: [];
+	const activeSession = sessionList.find(
+		(session: any) => asString(session?.id) === activeSessionId,
 	);
-	matchingSessions.sort(
-		(a: any, b: any) =>
-			Number(b?.time?.updated || 0) - Number(a?.time?.updated || 0),
-	);
-	const createdSession = matchingSessions[0];
-	const sessionId = asString(createdSession?.id);
+	const nowIso = new Date().toISOString();
+	if (serveEntry) {
+		upsertServeRegistry({
+			...serveEntry,
+			last_event_at: nowIso,
+			updated_at: nowIso,
+		});
+	}
+	const updatedSessionEntry: SessionRegistryEntry = {
+		session_id: activeSessionId,
+		serve_id: serveEntry?.serve_id || input.envelope.opencode_server_url,
+		opencode_server_url: input.envelope.opencode_server_url,
+		directory: input.envelope.repo_root,
+		project_id: input.envelope.project_id,
+		...(asString(activeSession?.title)
+			? { session_title: asString(activeSession?.title) }
+			: {}),
+		session_updated_at:
+			activeSession?.time?.updated
+				? new Date(Number(activeSession.time.updated)).toISOString()
+				: nowIso,
+		status: "active",
+		is_current_for_directory: true,
+		updated_at: nowIso,
+	};
+	upsertSessionRegistry(updatedSessionEntry);
 
 	const current =
 		patchRunStatus(input.envelope.run_id, (status) => ({
 			...status,
-			sessionId: sessionId || status.sessionId,
-			executionLane: "attach_run",
-			attachRun: executionResult,
-			state: executionResult.started ? "running" : "failed",
-			lastSummary: executionResult.started
-				? "Attach-run execution started asynchronously; terminal callback owned by OpenCode-side plugin"
-				: executionResult.stderr ||
-					executionResult.stdout ||
-					"Attach-run execution failed",
+			sessionId: activeSessionId,
+			executionLane: "session_api",
+			state: promptAsync.ok ? "running" : "failed",
+			lastSummary: promptAsync.ok
+				? (reuseSessionId
+					? "Existing session reused and prompt_async dispatched; terminal callback owned by OpenCode-side plugin"
+					: "Session created and prompt_async dispatched; terminal callback owned by OpenCode-side plugin")
+				: "prompt_async execution failed",
 			updatedAt: new Date().toISOString(),
 		})) || initial;
 
 	return {
-		ok: Boolean(executionResult.started),
+		ok: Boolean(promptAsync.ok),
 		runId: input.envelope.run_id,
 		taskId: input.envelope.task_id,
-		sessionId: sessionId || null,
+		sessionId: activeSessionId,
 		state: current.state,
-		attachRun: executionResult,
+		sessionMode: reuseSessionId ? "reused" : "created",
+		createdSession: reuseSessionId ? null : { id: activeSessionId },
+		promptAsync: promptAsync.response,
 	};
 }
 

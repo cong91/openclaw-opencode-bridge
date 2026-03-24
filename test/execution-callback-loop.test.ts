@@ -101,8 +101,8 @@ function setupHarness(configFile: any) {
 
 test("opencode_execute_task starts execution with plugin-owned callback authority", async () => {
 	const callbackRequests: any[] = [];
-	const createdSessionCount = 0;
-	const promptAsyncCount = 0;
+	let createdSessionCount = 0;
+	let promptAsyncCount = 0;
 	let eventReadCount = 0;
 
 	const originalFetch = globalThis.fetch;
@@ -115,18 +115,40 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 			res.end(JSON.stringify({ healthy: true, version: "test" }));
 			return;
 		}
-		if (req.method === "GET" && url === "/session") {
+		if (req.method === "POST" && url === "/session") {
+			createdSessionCount += 1;
+			assert.equal(req.headers["x-opencode-directory"], repoRoot);
 			res.setHeader("content-type", "application/json");
 			res.end(
-				JSON.stringify([
-					{
-						id: "sess-exec-1",
-						title:
-							"task-exec-1 runId=run-exec-1 taskId=task-exec-1 requested=creator resolved=creator callbackSession=session:origin:exec-1 callbackSessionId=origin-session-1 projectId=proj-exec-1 repoRoot=" +
-							repoRoot,
-					},
-				]),
+				JSON.stringify({
+					id: "sess-exec-1",
+					slug: "test-session",
+					version: "1.2.27",
+					projectID: "proj-exec-1",
+					directory: repoRoot,
+					title:
+						"New session - test",
+					time: { created: Date.now(), updated: Date.now() },
+				}),
 			);
+			return;
+		}
+		if (req.method === "POST" && url === "/session/sess-exec-1/prompt_async") {
+			promptAsyncCount += 1;
+			assert.equal(req.headers["x-opencode-directory"], repoRoot);
+			let body = "";
+			req.on("data", (chunk) => {
+				body += chunk.toString();
+			});
+			req.on("end", () => {
+				res.setHeader("content-type", "application/json");
+				res.end(JSON.stringify({ ok: true, accepted: true, body: JSON.parse(body) }));
+			});
+			return;
+		}
+		if (req.method === "GET" && url === "/session") {
+			res.setHeader("content-type", "application/json");
+			res.end(JSON.stringify([{ id: "sess-exec-1" }]));
 			return;
 		}
 		if (req.method === "GET" && (url === "/event" || url === "/global/event")) {
@@ -175,18 +197,9 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 	const repoRoot = join(harness.stateDir, "repo-exec-1");
 	mkdirSync(repoRoot, { recursive: true });
 
-	const fakeBinDir = join(harness.stateDir, "fake-bin");
-	mkdirSync(fakeBinDir, { recursive: true });
-	writeFileSync(
-		join(fakeBinDir, "opencode"),
-		`#!/bin/sh\nif [ "$1" = "serve" ]; then\n  exec python3 -m http.server ${new URL(mock.baseUrl).port} --bind 127.0.0.1 >/dev/null 2>&1\nfi\nif [ "$1" = "run" ]; then\n  exit 0\nfi\nexit 1\n`,
-		{ encoding: "utf8", mode: 0o755 },
-	);
-	process.env.PATH = `${fakeBinDir}:${originalPath || ""}`;
 	process.on("uncaughtException", swallowSpawnEnoent);
 
 	let spawnedBaseUrl: string | null = null;
-	const sessionListReads = 0;
 	globalThis.fetch = async (input: any, init?: any) => {
 		const url = typeof input === "string" ? input : input?.url;
 		if (typeof url === "string") {
@@ -253,18 +266,17 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 		assert.equal(existsSync(runPath), true);
 		const runStatus = JSON.parse(readFileSync(runPath, "utf8"));
 		assert.equal(runStatus.state, "running");
-		assert.equal(runStatus.executionLane, "attach_run");
+		assert.equal(runStatus.executionLane, "session_api");
 		assert.equal(runStatus.continuation.workflowId, "wf-exec-1");
 		assert.equal(runStatus.continuation.stepId, "step-exec-1");
 		assert.equal(runStatus.continuation.callbackEventKind, "opencode.callback");
 		assert.equal(runStatus.continuation.nextOnSuccess.action, "notify");
 		assert.equal(runStatus.continuation.nextOnFailure.action, "launch_run");
-		assert.equal(runStatus.attachRun.started, true);
-		assert.equal(typeof runStatus.attachRun.pid, "number");
-		assert.equal(runStatus.attachRun.exitCode, null);
+		assert.equal(createdSessionCount, 1);
+		assert.equal(promptAsyncCount, 1);
 		assert.match(
 			runStatus.lastSummary,
-			/Attach-run execution started asynchronously/,
+			/Session created and prompt_async dispatched/,
 		);
 		assert.equal(runStatus.callbackOk, undefined);
 		assert.equal(runStatus.callbackSentAt, undefined);

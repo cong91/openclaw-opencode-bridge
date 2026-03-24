@@ -72,6 +72,7 @@ export type OpenCodeRunContinuation = {
 	nextOnSuccess?: OpenCodeRunContinuationStep;
 	nextOnFailure?: OpenCodeRunContinuationStep;
 	promptVariant?: "medium" | "high";
+	thinking?: boolean;
 };
 
 export type OpenCodeContinuationCallbackMetadata = {

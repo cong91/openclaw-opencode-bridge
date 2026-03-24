@@ -46,6 +46,8 @@ test("runAttachExecutionForEnvelope normalizes bare model ids to proxy/<model>",
     assert.ok(result.args.includes("--model"));
     assert.ok(result.args.includes("proxy/gpt-5.3-codex"));
     assert.equal(result.args.includes("gpt-5.3-codex"), false);
+    assert.ok(result.args.includes("--variant"));
+    assert.ok(result.args.includes("high"));
   } finally {
     process.env.PATH = originalPath;
     rmSync(tempRoot, { recursive: true, force: true });

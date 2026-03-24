@@ -975,6 +975,14 @@ export function resolveSessionForRun(input: {
 
 	const artifactSessionKey =
 		callbackTargetSessionKey || originSessionKey || executionSessionKey;
+	const artifactRepoRoot =
+		typeof artifactEnvelope?.repo_root === "string"
+			? artifactEnvelope.repo_root
+			: undefined;
+	const artifactProjectId =
+		typeof artifactEnvelope?.project_id === "string"
+			? artifactEnvelope.project_id
+			: undefined;
 
 	// When callback target key is available, avoid biasing scored fallback toward
 	// execution lane sessions via runId/taskId tokens.
@@ -982,6 +990,15 @@ export function resolveSessionForRun(input: {
 		callbackTargetSessionKey || originSessionKey,
 	);
 
+	const filteredSessionList = Array.isArray(input.sessionList)
+		? input.sessionList.filter((session: any) => {
+			if (artifactRepoRoot && JSON.stringify(session || {}).includes(artifactRepoRoot)) return true;
+			if (artifactProjectId && JSON.stringify(session || {}).includes(artifactProjectId)) return true;
+			if (artifactSessionId && asString(session?.id) === artifactSessionId) return true;
+			if (artifactSessionKey && JSON.stringify(session || {}).includes(artifactSessionKey)) return true;
+			return !artifactRepoRoot && !artifactProjectId;
+		})
+		: [];
 	const resolved = resolveSessionId({
 		explicitSessionId: input.sessionId,
 		runId: hasCallerSessionKey
@@ -990,7 +1007,9 @@ export function resolveSessionForRun(input: {
 		taskId: hasCallerSessionKey ? undefined : input.runStatus?.taskId,
 		sessionKey: artifactSessionKey,
 		artifactSessionId,
-		sessionList: input.sessionList,
+		repoRoot: artifactRepoRoot,
+		projectId: artifactProjectId,
+		sessionList: filteredSessionList,
 	});
 	return {
 		sessionId: resolved.sessionId,
@@ -1347,6 +1366,7 @@ export async function runAttachExecutionForEnvelope(input: {
 	prompt: string;
 	model?: string;
 	promptVariant?: "medium" | "high";
+	thinking?: boolean;
 }) {
 	const taggedTitle = buildTaggedSessionTitle({
 		runId: input.envelope.run_id,
@@ -1380,6 +1400,9 @@ export async function runAttachExecutionForEnvelope(input: {
 	}
 	if (input.promptVariant) {
 		args.push("--variant", input.promptVariant);
+	}
+	if (input.thinking) {
+		args.push("--thinking");
 	}
 	args.push(input.prompt);
 	const runtimeCfg = getRuntimeConfig(input.cfg);
@@ -1478,6 +1501,7 @@ export async function startExecutionRun(input: {
 		prompt: input.prompt,
 		model: input.model,
 		promptVariant,
+		thinking: true,
 	});
 	const nowIso = new Date().toISOString();
 	if (serveEntry) {

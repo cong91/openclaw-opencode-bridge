@@ -270,6 +270,8 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 		assert.ok(runStatus.attachRun?.args.includes(repoRoot));
 		assert.ok(runStatus.attachRun?.args.includes("--variant"));
 		assert.ok(runStatus.attachRun?.args.includes("medium"));
+		assert.ok(runStatus.attachRun?.args.includes("--thinking"));
+		assert.equal(runStatus.attachRun?.args.includes("--agent"), false);
 
 		const auditPath = join(
 			harness.stateDir,

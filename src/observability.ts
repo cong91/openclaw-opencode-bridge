@@ -128,9 +128,25 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim()))];
 }
 
+function hasExplicitPermissionPrompt(raw: any): boolean {
+  const root = asObject(raw) || {};
+  const type = asString(root.type)?.toLowerCase();
+  if (type === "question.asked") return true;
+
+  const properties = asObject(root.properties) || {};
+  const requestId = asString(properties.requestID) || asString(properties.requestId);
+  const questions = asArray(properties.questions);
+  if (requestId || questions.length > 0) return true;
+
+  const part = asObject(properties.part) || {};
+  if (asString(part.type)?.toLowerCase() === "question") return true;
+
+  return false;
+}
+
 function inferLifecycleState(raw: any): TypedEventV1["lifecycleState"] {
   const text = JSON.stringify(raw || {}).toLowerCase();
-  if (text.includes("permission") || text.includes("question.asked")) return "awaiting_permission";
+  if (hasExplicitPermissionPrompt(raw)) return "awaiting_permission";
   if (text.includes("blocked") || text.includes("missing config") || text.includes("missing token") || text.includes("missing api_key")) return "blocked";
   if (text.includes("error") || text.includes("failed")) return "failed";
   if (text.includes("stalled")) return "stalled";
@@ -184,7 +200,7 @@ function extractBlockers(raw: any): string[] {
   const blockers: string[] = [];
   if (text.includes("no module named pytest")) blockers.push("pytest_missing");
   if (text.includes("missing token") || text.includes("missing api_key") || text.includes("pow service not configured")) blockers.push("runtime_config_missing");
-  if (text.includes("permission") || text.includes("question.asked")) blockers.push("awaiting_permission");
+  if (hasExplicitPermissionPrompt(raw)) blockers.push("awaiting_permission");
   return uniqueStrings(blockers);
 }
 
@@ -208,7 +224,7 @@ export function normalizeOpenCodeEvent(raw: any): {
   let kind: OpenCodeEventKind | null = null;
   let summary: string | undefined;
 
-  if (text.includes("permission") || text.includes("question.asked")) {
+  if (hasExplicitPermissionPrompt(raw)) {
     kind = "permission.requested";
     summary = "OpenCode đang chờ permission/user input";
   } else if (text.includes("error") || text.includes("failed")) {
@@ -270,16 +286,20 @@ function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function scoreSessionCandidate(candidate: any, ctx: { runId?: string; taskId?: string; sessionKey?: string; artifactSessionId?: string; recencyRank: number }): number {
+function scoreSessionCandidate(candidate: any, ctx: { runId?: string; taskId?: string; sessionKey?: string; artifactSessionId?: string; repoRoot?: string; projectId?: string; recencyRank: number }): number {
   const id = asString(candidate?.id) || "";
   const candidateText = JSON.stringify(candidate || {}).toLowerCase();
   const runId = ctx.runId?.toLowerCase();
   const taskId = ctx.taskId?.toLowerCase();
   const sessionKey = ctx.sessionKey?.toLowerCase();
   const artifactSessionId = ctx.artifactSessionId;
+  const repoRoot = ctx.repoRoot?.toLowerCase();
+  const projectId = ctx.projectId?.toLowerCase();
 
   let score = 0;
   if (artifactSessionId && id === artifactSessionId) score += 1000;
+  if (repoRoot && candidateText.includes(repoRoot)) score += 300;
+  if (projectId && candidateText.includes(projectId)) score += 180;
   if (runId && candidateText.includes(runId)) score += 120;
   if (taskId && candidateText.includes(taskId)) score += 70;
   if (sessionKey && candidateText.includes(sessionKey)) score += 60;
@@ -335,6 +355,8 @@ export function resolveSessionId(input: {
   taskId?: string;
   sessionKey?: string;
   artifactSessionId?: string;
+  repoRoot?: string;
+  projectId?: string;
   sessionList?: any[];
 }): {
   sessionId?: string;
@@ -370,6 +392,8 @@ export function resolveSessionId(input: {
       taskId: input.taskId,
       sessionKey: input.sessionKey,
       artifactSessionId: input.artifactSessionId,
+      repoRoot: input.repoRoot,
+      projectId: input.projectId,
       recencyRank: candidate.rank,
     });
     if (score > best.score) best = { id, score };

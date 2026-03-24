@@ -66,6 +66,49 @@ Canonical file-driven flow:
 6. OpenCode/OpenCodeKit executes from artifacts as source of truth
 7. outer agent verifies evidence via `verification-before-completion`, then syncs/closes Jira
 
+## Execution Lane Selection (MANDATORY)
+
+When `opencode_execute_task` already knows the intended execution lane, it must pass that lane explicitly via `--agent`.
+Do not let OpenCode silently fall back to whatever default agent/runtime would pick.
+
+### Current global OpenCode lanes observed
+
+- `build` — coding/implementation lane; current global model maps to `proxy/gpt-5.3-codex`
+- `plan` — planning/decomposition lane; current global model maps to `proxy/gpt-5.4`
+- `review` — review/assessment lane; current global model maps to `proxy/gpt-5.4`
+- `general` — broad/general-purpose lane; current global model maps to `proxy/gemini-3.1-pro-preview`
+- `explore` — exploration/discovery lane; current global model maps to `proxy/gpt-5.1-codex-max`
+- `scout` — research/scouting lane
+- `vision` — vision/media understanding lane
+- `compaction` — lightweight summarization/compaction lane
+- `painter` — image generation lane
+
+### Lane selection rules
+
+- Planning / decomposition / design shaping -> use `--agent plan`
+- Coding / implementation / patch / fix -> use `--agent build` by default unless a repo/project-specific lane is explicitly approved
+- Review / validation-only work -> use `--agent review`
+- Broad exploration / discovery -> use `--agent explore` or `--agent scout` as appropriate
+- If the requested lane is not known to the current OpenCode config, do not invent it silently; fall back deliberately and note the fallback
+
+### Shared-serve observability rule
+
+In one-serve-many-project topology, observability must resolve sessions in this order:
+1. explicit session id
+2. callback/origin target session id from run artifact
+3. callback/origin target session key
+4. project/repo scoped filtering (`repo_root`, `project_id`, `directory`)
+5. only then recency/token-based scoring
+
+Never let recency alone override a project-matching session when multiple projects share the same serve.
+
+### Critical invariant
+
+- `--agent` = execution lane selection
+- `--variant` = reasoning effort (`medium`/`high`; normalize `hard` to `high`)
+- `--thinking` = thinking visibility only
+- observability on shared-serve topology must resolve sessions project-aware first (`repo_root` / `project_id` / callback target), recency-aware second
+
 ## Pattern 3: Session/Server Mode
 
 ### Session roles
@@ -616,6 +659,8 @@ Use as the standard serve/plugin-mode execution entrypoint:
 - primary execution lane = `opencode run --attach <serve> --dir <repoRoot>`
 - attach-run must carry tagged title metadata via `buildTaggedSessionTitle(...)`
 - always send an execution variant on attach-run; default `medium`, escalate to `high` for difficult/high-priority work or when explicitly requested (`hard` should normalize to `high`)
+- always pass lane intent explicitly with `--agent` when orchestration already knows the intended execution lane
+- valid execution lanes currently available in global OpenCode config include: `build`, `plan`, `fullstack`, `creator`, `general`, `review`, `explore`, `scout`, `vision`, `compaction`, `painter`
 - rely on the OpenCode-side plugin for terminal callback authority back to `/hooks/agent`
 - persist run artifact and callback continuity metadata locally for observability
 - session API is no longer the primary execution lane; keep it for observability/inspect/fallback research only

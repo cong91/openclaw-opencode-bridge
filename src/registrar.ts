@@ -1067,19 +1067,45 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					asString(params.priority)?.toLowerCase() === "high"
 						? "high"
 						: "medium";
+				const allowedExecutionAgents = new Set([
+					"build",
+					"plan",
+					"fullstack",
+					"creator",
+					"general",
+					"review",
+					"explore",
+					"scout",
+					"vision",
+					"compaction",
+					"painter",
+				]);
+				const requestedExecutionAgent = asString(params.executionAgentId)?.trim();
+				const normalizedExecutionAgent = requestedExecutionAgent && allowedExecutionAgents.has(requestedExecutionAgent)
+					? requestedExecutionAgent
+					: undefined;
 				const continuation = continuationEnabled
 					? {
 							...(workflowId ? { workflowId } : {}),
 							...(stepId ? { stepId } : {}),
 							callbackEventKind: "opencode.callback" as const,
 							promptVariant,
+							thinking: true,
 							...(nextOnSuccess ? { nextOnSuccess } : {}),
 							...(nextOnFailure ? { nextOnFailure } : {}),
 						}
-					: { promptVariant };
+					: { promptVariant, thinking: true };
+				const executionEnvelope = normalizedExecutionAgent
+					? {
+						...envelope,
+						agent_id: normalizedExecutionAgent,
+						resolved_agent_id: normalizedExecutionAgent,
+						execution_agent_explicit: true,
+					  }
+					: envelope;
 				const execution = await startExecutionRun({
 					cfg,
-					envelope,
+					envelope: executionEnvelope,
 					prompt,
 					model: asString(params.model),
 					continuation,
@@ -1099,7 +1125,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 									ok: true,
 									opportunisticCleanup,
 									spawned,
-									envelope,
+									envelope: executionEnvelope,
 									prompt,
 									execution: {
 										ok: execution.ok,
@@ -1107,6 +1133,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 										taskId: execution.taskId,
 										sessionId: execution.sessionId,
 										state: execution.state,
+										attachRun: (execution as any).attachRun,
 										callbackAuthority: "opencode_plugin",
 										continuationEnabled,
 									},

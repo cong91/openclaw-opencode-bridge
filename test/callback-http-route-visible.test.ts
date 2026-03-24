@@ -43,7 +43,7 @@ function createMockRes() {
 	} as any;
 }
 
-test("callback http route enqueues callback, wakes session, and sends visible telegram ack when deliver=true", async () => {
+test("callback http route enqueues control message, wakes session, and sends direct telegram ack when deliver=true", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: any[] = [];
 	const heartbeatCalls: any[] = [];
@@ -109,15 +109,14 @@ test("callback http route enqueues callback, wakes session, and sends visible te
 
 	assert.equal(handled, true);
 	assert.equal(res.statusCode, 200);
-	assert.equal(systemEvents.length, 2);
+	assert.equal(systemEvents.length, 1);
 	assert.match(systemEvents[0].text, /OpenCode callback control message/);
 	assert.match(systemEvents[0].text, /"messageKind":"callback_control"/);
 	assert.equal(systemEvents[0]?.opts?.sessionId, payload.sessionId);
-	assert.match(
-		systemEvents[1].text,
+	assert.doesNotMatch(
+		systemEvents[0].text,
 		/OpenCode callback received for run run-visible-1; code finished; agent is continuing\./,
 	);
-	assert.equal(systemEvents[1]?.opts?.sessionId, payload.sessionId);
 	assert.equal(heartbeatCalls.length, 1);
 	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
 	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);

@@ -463,20 +463,6 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			const callbackAckText = parsed.metadata
 				? `OpenCode callback received for run ${parsed.metadata.runId || "unknown-run"}; ${callbackLooksTerminal ? "code finished; " : ""}agent is continuing.`
 				: "OpenCode callback received; agent is continuing.";
-			if (callback.deliver === true) {
-				api.runtime.system.enqueueSystemEvent(callbackAckText, {
-					...callbackTarget,
-					...(dedupeKey ? { contextKey: `${dedupeKey}:visible-ack` } : {}),
-				});
-				appendCallbackDebugAudit({
-					phase: "visible_ack_enqueued",
-					sessionKey: callback.sessionKey,
-					sessionId: preferredSessionId || null,
-					dedupeKey,
-					runId: parsed.metadata?.runId || null,
-					ackText: callbackAckText,
-				});
-			}
 			const telegramDirectMatch = callback.sessionKey.match(
 				/^agent:[^:]+:telegram:direct:(.+)$/,
 			);

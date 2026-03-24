@@ -108,6 +108,7 @@ Never let recency alone override a project-matching session when multiple projec
 - `--variant` = reasoning effort (`medium`/`high`; normalize `hard` to `high`)
 - `--thinking` = thinking visibility only
 - observability on shared-serve topology must resolve sessions project-aware first (`repo_root` / `project_id` / callback target), recency-aware second
+- every attach-run should persist `sessionId`/`opencodeSessionId` into the local run artifact as soon as the OpenCode session can be resolved
 
 ## Pattern 3: Session/Server Mode
 

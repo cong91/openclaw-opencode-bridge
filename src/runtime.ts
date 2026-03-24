@@ -1360,6 +1360,46 @@ export async function verifyPromptAsyncMaterialized(input: {
 	return { ok: false, hasMessage: false, titleTagged: false };
 }
 
+export async function resolveAttachRunSession(input: {
+	envelope: RoutingEnvelope;
+	runId: string;
+	attempts?: number;
+	delayMs?: number;
+}) {
+	const serverUrl = input.envelope.opencode_server_url.replace(/\/$/, "");
+	const attempts = input.attempts ?? 8;
+	const delayMs = input.delayMs ?? 1000;
+	for (let attempt = 0; attempt < attempts; attempt += 1) {
+		const sessionRes = await fetchJsonSafe(`${serverUrl}/session`);
+		const sessionList = Array.isArray(sessionRes.data) ? sessionRes.data : [];
+		const match = sessionList.find((session: any) => {
+			const text = JSON.stringify(session || {});
+			return (
+				text.includes(`runId=${input.runId}`) &&
+				text.includes(input.envelope.repo_root)
+			);
+		});
+		const matchedId = asString(match?.id);
+		if (matchedId) {
+			return {
+				ok: true,
+				sessionId: matchedId,
+				sessionResolvedAt: new Date().toISOString(),
+				sessionResolutionStrategy: "title_match",
+				attempt: attempt + 1,
+			};
+		}
+		if (attempt < attempts - 1) {
+			await new Promise((resolve) => setTimeout(resolve, delayMs));
+		}
+	}
+	return {
+		ok: false,
+		sessionResolutionPending: true,
+		sessionResolutionStrategy: "title_match_pending",
+	};
+}
+
 export async function runAttachExecutionForEnvelope(input: {
 	cfg: any;
 	envelope: RoutingEnvelope;
@@ -1503,6 +1543,10 @@ export async function startExecutionRun(input: {
 		promptVariant,
 		thinking: true,
 	});
+	const sessionResolution = await resolveAttachRunSession({
+		envelope: input.envelope,
+		runId: input.envelope.run_id,
+	});
 	const nowIso = new Date().toISOString();
 	if (serveEntry) {
 		upsertServeRegistry({
@@ -1514,7 +1558,11 @@ export async function startExecutionRun(input: {
 	const current =
 		patchRunStatus(input.envelope.run_id, (status) => ({
 			...status,
-			sessionId: status.sessionId,
+			sessionId: sessionResolution.ok ? sessionResolution.sessionId : status.sessionId,
+			opencodeSessionId: sessionResolution.ok ? sessionResolution.sessionId : status.opencodeSessionId,
+			sessionResolvedAt: sessionResolution.ok ? sessionResolution.sessionResolvedAt : status.sessionResolvedAt,
+			sessionResolutionStrategy: sessionResolution.sessionResolutionStrategy,
+			sessionResolutionPending: sessionResolution.ok ? false : true,
 			executionLane: "attach_run",
 			state: attachRun.started ? "running" : "failed",
 			attachRun,

@@ -100,6 +100,10 @@ export type BridgeRunStatus = {
 	updatedAt: string;
 	envelope: RoutingEnvelope;
 	sessionId?: string;
+	opencodeSessionId?: string;
+	sessionResolvedAt?: string;
+	sessionResolutionStrategy?: string;
+	sessionResolutionPending?: boolean;
 	callbackSentAt?: string;
 	callbackStatus?: number;
 	callbackOk?: boolean;
@@ -116,6 +120,10 @@ export type BridgeRunStatus = {
 		signal?: string | null;
 		pid?: number;
 		started?: boolean;
+		cleaned?: boolean;
+		cleanedAt?: string;
+		killSignal?: string;
+		killResult?: string;
 	};
 	continuation?: OpenCodeRunContinuation;
 };

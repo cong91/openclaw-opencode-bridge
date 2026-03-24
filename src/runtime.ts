@@ -479,10 +479,6 @@ export function readServeRegistry(): ServeRegistryFile {
 	if (existsSync(path)) {
 		return JSON.parse(readFileSync(path, "utf8")) as ServeRegistryFile;
 	}
-	const legacyPath = join(getBridgeStateDir(), "registry.json");
-	if (existsSync(legacyPath)) {
-		return JSON.parse(readFileSync(legacyPath, "utf8")) as ServeRegistryFile;
-	}
 	return { entries: [] };
 }
 

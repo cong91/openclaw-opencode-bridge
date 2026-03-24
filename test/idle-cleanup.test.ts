@@ -7,7 +7,7 @@ import * as runtime from "../src/runtime";
 
 const tmpDir = "/tmp/opencode-bridge-idle-cleanup-test";
 const stateDir = join(tmpDir, ".openclaw", "opencode-bridge");
-const registryPath = join(stateDir, "registry.json");
+const registryPath = join(stateDir, "serves.json");
 
 test("cleanupExpiredServes stops only idle entries and preserves busy runtime sessions", async () => {
   rmSync(tmpDir, { recursive: true, force: true });

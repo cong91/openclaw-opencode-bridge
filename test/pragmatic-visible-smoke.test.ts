@@ -106,6 +106,8 @@ test("pragmatic smoke: callback arrives, session wakes, and visible telegram con
   assert.equal(res.statusCode, 200);
   assert.equal(systemEvents.length, 2);
   assert.equal(systemEvents[0]?.opts?.sessionKey, payload.sessionKey);
+  assert.match(systemEvents[0]?.text, /OpenCode callback control message/);
+  assert.match(systemEvents[0]?.text, /"messageKind":"callback_control"/);
   assert.match(systemEvents[1]?.text, /OpenCode callback received for run run-pragmatic-1/);
   assert.equal(heartbeats.length, 1);
   assert.equal(telegramSends.length, 1);

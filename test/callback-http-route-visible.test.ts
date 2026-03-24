@@ -107,7 +107,8 @@ test("callback http route enqueues callback, wakes session, and sends visible te
   assert.equal(handled, true);
   assert.equal(res.statusCode, 200);
   assert.equal(systemEvents.length, 2);
-  assert.match(systemEvents[0].text, /"kind":"opencode.callback"/);
+  assert.match(systemEvents[0].text, /OpenCode callback control message/);
+  assert.match(systemEvents[0].text, /"messageKind":"callback_control"/);
   assert.equal(systemEvents[0]?.opts?.sessionId, payload.sessionId);
   assert.match(systemEvents[1].text, /OpenCode callback received for run run-visible-1/);
   assert.equal(systemEvents[1]?.opts?.sessionId, payload.sessionId);

@@ -1,6 +1,6 @@
 import { appendFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { join } from "node:path";
 import type { EventScope } from "./observability";
 import { summarizeLifecycle } from "./observability";
 import {
@@ -8,6 +8,7 @@ import {
 	asString,
 	buildEnvelope,
 	buildHookPolicyChecklist,
+	cleanupExpiredServes,
 	collectSseEvents,
 	DEFAULT_EVENT_LIMIT,
 	DEFAULT_OBS_TIMEOUT_MS,
@@ -27,6 +28,7 @@ import {
 	normalizeRegistry,
 	normalizeServeRegistry,
 	normalizeSessionRegistry,
+	patchRunStatus,
 	readRunStatus,
 	readServeRegistry,
 	readSessionRegistry,
@@ -37,14 +39,13 @@ import {
 	spawnServeForProject,
 	startExecutionRun,
 	upsertServeRegistry,
-	cleanupExpiredServes,
 	writeServeRegistryFile,
 	writeSessionRegistryFile,
 } from "./runtime";
 import { OPENCODE_CALLBACK_HTTP_PATH } from "./shared-contracts";
-import type { OpenCodeContinuationCallbackMetadata } from "./types";
 import type {
 	BridgeRunStatus,
+	OpenCodeContinuationCallbackMetadata,
 	OpenCodeRunContinuation,
 	RunEventsResponse,
 	RunStatusResponse,
@@ -104,7 +105,9 @@ function appendCallbackDebugAudit(record: Record<string, unknown>) {
 function parseJsonObject(raw: string): Record<string, unknown> | null {
 	try {
 		const parsed = JSON.parse(raw);
-		return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+		return parsed && typeof parsed === "object"
+			? (parsed as Record<string, unknown>)
+			: null;
 	} catch {
 		return null;
 	}
@@ -126,8 +129,10 @@ function buildContinuationCommandPayload(input: {
 		resolvedAgentId: input.runStatus.envelope.resolved_agent_id,
 		originSessionKey: input.runStatus.envelope.origin_session_key,
 		originSessionId: input.runStatus.envelope.origin_session_id,
-		callbackTargetSessionKey: input.runStatus.envelope.callback_target_session_key,
-		callbackTargetSessionId: input.runStatus.envelope.callback_target_session_id,
+		callbackTargetSessionKey:
+			input.runStatus.envelope.callback_target_session_key,
+		callbackTargetSessionId:
+			input.runStatus.envelope.callback_target_session_id,
 		workflowId: input.runStatus.continuation?.workflowId,
 		stepId: input.runStatus.continuation?.stepId,
 		next: input.step,
@@ -138,7 +143,8 @@ function registerContinuationCommand(api: any, cfg: any) {
 	if (typeof api?.registerCommand !== "function") return;
 	api.registerCommand({
 		name: "opencode-continue",
-		description: "Continue a bridge-managed workflow step after OpenCode callback",
+		description:
+			"Continue a bridge-managed workflow step after OpenCode callback",
 		acceptsArgs: true,
 		requireAuth: false,
 		handler: async ({ args }: { args?: string }) => {
@@ -147,14 +153,18 @@ function registerContinuationCommand(api: any, cfg: any) {
 				return { text: "❌ Invalid /opencode-continue payload." };
 			}
 			const next = payload.next as Record<string, unknown> | undefined;
-			const taskId = asString(next?.taskId) || asString(payload.sourceTaskId) || "opencode-continue";
+			const taskId =
+				asString(next?.taskId) ||
+				asString(payload.sourceTaskId) ||
+				"opencode-continue";
 			const runId = `${taskId}-${Date.now()}`;
 			const requestedAgentId = asString(payload.requestedAgentId) || "creator";
 			const resolvedAgentId =
 				asString(payload.resolvedAgentId) || requestedAgentId || "creator";
 			const projectId = asString(payload.projectId) || "unknown-project";
 			const repoRoot = asString(payload.repoRoot) || ".";
-			const originSessionKey = asString(payload.originSessionKey) || "session:unknown";
+			const originSessionKey =
+				asString(payload.originSessionKey) || "session:unknown";
 			const serverUrl =
 				findRegistryEntry({
 					cfg,
@@ -175,10 +185,10 @@ function registerContinuationCommand(api: any, cfg: any) {
 			});
 			const continuation = asString(payload.workflowId)
 				? {
-					workflowId: asString(payload.workflowId),
-					stepId: asString(next?.taskId) || asString(payload.stepId),
-					callbackEventKind: "opencode.callback" as const,
-				}
+						workflowId: asString(payload.workflowId),
+						stepId: asString(next?.taskId) || asString(payload.stepId),
+						callbackEventKind: "opencode.callback" as const,
+					}
 				: undefined;
 			await startExecutionRun({
 				cfg,
@@ -200,24 +210,26 @@ function registerContinuationCommand(api: any, cfg: any) {
 	});
 }
 
-function parseOpencodeCallbackPayload(raw: string): {
-	ok: true;
-	body: {
-		message: string;
-		name?: string;
-		agentId?: string;
-		sessionKey: string;
-		sessionId?: string;
-		wakeMode?: "now" | "next-heartbeat";
-		deliver?: boolean;
-		channel?: string;
-		to?: string;
-	};
-	metadata: OpenCodeContinuationCallbackMetadata | null;
-} | {
-	ok: false;
-	error: string;
-} {
+function parseOpencodeCallbackPayload(raw: string):
+	| {
+			ok: true;
+			body: {
+				message: string;
+				name?: string;
+				agentId?: string;
+				sessionKey: string;
+				sessionId?: string;
+				wakeMode?: "now" | "next-heartbeat";
+				deliver?: boolean;
+				channel?: string;
+				to?: string;
+			};
+			metadata: OpenCodeContinuationCallbackMetadata | null;
+	  }
+	| {
+			ok: false;
+			error: string;
+	  } {
 	let parsed: any;
 	try {
 		parsed = JSON.parse(raw || "{}");
@@ -225,13 +237,18 @@ function parseOpencodeCallbackPayload(raw: string): {
 		return { ok: false, error: "invalid JSON body" };
 	}
 	const sessionKey = asString(parsed?.sessionKey);
-	const message = typeof parsed?.message === "string" ? parsed.message : undefined;
+	const message =
+		typeof parsed?.message === "string" ? parsed.message : undefined;
 	if (!sessionKey) return { ok: false, error: "sessionKey required" };
 	if (!message) return { ok: false, error: "message required" };
 	let metadata: OpenCodeContinuationCallbackMetadata | null = null;
 	try {
 		const typed = JSON.parse(message);
-		if (typed && typeof typed === "object" && typed.kind === "opencode.callback") {
+		if (
+			typed &&
+			typeof typed === "object" &&
+			typed.kind === "opencode.callback"
+		) {
 			metadata = typed as OpenCodeContinuationCallbackMetadata;
 		}
 	} catch {}
@@ -240,17 +257,58 @@ function parseOpencodeCallbackPayload(raw: string): {
 		body: {
 			message,
 			...(asString(parsed?.name) ? { name: asString(parsed?.name) } : {}),
-			...(asString(parsed?.agentId) ? { agentId: asString(parsed?.agentId) } : {}),
+			...(asString(parsed?.agentId)
+				? { agentId: asString(parsed?.agentId) }
+				: {}),
 			sessionKey,
-			...(asString(parsed?.sessionId) ? { sessionId: asString(parsed?.sessionId) } : {}),
+			...(asString(parsed?.sessionId)
+				? { sessionId: asString(parsed?.sessionId) }
+				: {}),
 			wakeMode:
 				parsed?.wakeMode === "next-heartbeat" ? "next-heartbeat" : "now",
 			deliver: parsed?.deliver === true,
-			...(asString(parsed?.channel) ? { channel: asString(parsed?.channel) } : {}),
+			...(asString(parsed?.channel)
+				? { channel: asString(parsed?.channel) }
+				: {}),
 			...(asString(parsed?.to) ? { to: asString(parsed?.to) } : {}),
 		},
 		metadata,
 	};
+}
+
+function mapCallbackEventToArtifactState(eventType?: string): {
+	state: BridgeRunStatus["state"];
+	lastEvent: BridgeRunStatus["lastEvent"];
+	terminal: boolean;
+} | null {
+	if (!eventType) return null;
+	switch (eventType) {
+		case "task.started":
+			return { state: "planning", lastEvent: "task.started", terminal: false };
+		case "task.progress":
+			return { state: "running", lastEvent: "task.progress", terminal: false };
+		case "permission.requested":
+			return {
+				state: "awaiting_permission",
+				lastEvent: "permission.requested",
+				terminal: false,
+			};
+		case "task.stalled":
+			return { state: "stalled", lastEvent: "task.stalled", terminal: true };
+		case "task.failed":
+		case "session.error":
+			return { state: "failed", lastEvent: "task.failed", terminal: true };
+		case "task.completed":
+		case "session.idle":
+		case "message.updated":
+			return {
+				state: "completed",
+				lastEvent: "task.completed",
+				terminal: true,
+			};
+		default:
+			return null;
+	}
 }
 
 function registerCallbackIngressRoute(api: any, cfg: any) {
@@ -272,17 +330,20 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				return true;
 			}
 			const runtimeCfg = getRuntimeConfig(cfg);
-			const expectedToken = asString(cfg?.hookToken) || asString(runtimeCfg.hookToken);
+			const expectedToken =
+				asString(cfg?.hookToken) || asString(runtimeCfg.hookToken);
 			const authz = req.headers.authorization;
-			const bearer = typeof authz === "string" && authz.startsWith("Bearer ")
-				? authz.slice("Bearer ".length).trim()
-				: undefined;
-			const legacyTokenHeader = req.headers["x-openclaw-token"];
-			const legacyToken = typeof legacyTokenHeader === "string"
-				? legacyTokenHeader.trim()
-				: Array.isArray(legacyTokenHeader)
-					? asString(legacyTokenHeader[0])
+			const bearer =
+				typeof authz === "string" && authz.startsWith("Bearer ")
+					? authz.slice("Bearer ".length).trim()
 					: undefined;
+			const legacyTokenHeader = req.headers["x-openclaw-token"];
+			const legacyToken =
+				typeof legacyTokenHeader === "string"
+					? legacyTokenHeader.trim()
+					: Array.isArray(legacyTokenHeader)
+						? asString(legacyTokenHeader[0])
+						: undefined;
 			const providedToken = bearer || legacyToken;
 			if (!expectedToken || !providedToken || providedToken !== expectedToken) {
 				sendJson(res, 401, { ok: false, error: "unauthorized" });
@@ -295,10 +356,54 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				return true;
 			}
 			const callback = parsed.body;
-			const dedupeKey = parsed.metadata?.runId && parsed.metadata?.eventType
-				? `opencode:${parsed.metadata.runId}:${parsed.metadata.eventType}`
-				: undefined;
-			const runStatus = parsed.metadata?.runId ? readRunStatus(parsed.metadata.runId) : null;
+			const dedupeKey =
+				parsed.metadata?.runId && parsed.metadata?.eventType
+					? `opencode:${parsed.metadata.runId}:${parsed.metadata.eventType}`
+					: undefined;
+			const runStatus = parsed.metadata?.runId
+				? readRunStatus(parsed.metadata.runId)
+				: null;
+			const callbackAt = new Date().toISOString();
+			const callbackPersistence = mapCallbackEventToArtifactState(
+				parsed.metadata?.eventType,
+			);
+			if (parsed.metadata?.runId) {
+				patchRunStatus(parsed.metadata.runId, (current) => {
+					const summary = parsed.metadata?.eventType
+						? callbackPersistence?.terminal
+							? `Terminal callback materialized (${parsed.metadata.eventType})`
+							: `Callback materialized (${parsed.metadata.eventType})`
+						: "Callback materialized";
+					const callbackBody = JSON.stringify(
+						{
+							ok: true,
+							routed: {
+								sessionKey: callback.sessionKey,
+								eventType: parsed.metadata?.eventType || null,
+								runId: parsed.metadata?.runId || null,
+							},
+						},
+						null,
+						0,
+					);
+					return {
+						...current,
+						...(callbackPersistence
+							? {
+									state: callbackPersistence.state,
+									lastEvent: callbackPersistence.lastEvent,
+								}
+							: {}),
+						lastSummary: summary,
+						callbackSentAt: callbackAt,
+						callbackStatus: 200,
+						callbackOk: true,
+						callbackBody,
+						callbackError: undefined,
+						updatedAt: callbackAt,
+					};
+				});
+			}
 			const preferredSessionId =
 				parsed.metadata?.callbackTargetSessionId || callback.sessionId;
 			const callbackTarget = {
@@ -307,7 +412,28 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			};
 			const sessionIdMatched = Boolean(preferredSessionId);
 			const fallbackToSessionKey = !preferredSessionId;
-			api.runtime.system.enqueueSystemEvent(callback.message, {
+			const callbackControlEnvelope = parsed.metadata
+				? {
+						messageKind: "callback_control",
+						callbackHandling: "continue_workflow",
+						humanActionRequired: false,
+						callback: parsed.metadata,
+					}
+				: {
+						messageKind: "callback_control",
+						callbackHandling: "continue_workflow",
+						humanActionRequired: false,
+						callback: callback.message,
+					};
+			const callbackMessageText = [
+				"OpenCode callback control message. Do not treat this as a normal user query.",
+				"Use the callback metadata below to continue the workflow in this session.",
+				"",
+				"<opencode_callback_json>",
+				JSON.stringify(callbackControlEnvelope),
+				"</opencode_callback_json>",
+			].join("\n");
+			api.runtime.system.enqueueSystemEvent(callbackMessageText, {
 				...callbackTarget,
 				...(dedupeKey ? { contextKey: dedupeKey } : {}),
 			});
@@ -319,11 +445,23 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					...callbackTarget,
 					...(dedupeKey ? { contextKey: `${dedupeKey}:visible-ack` } : {}),
 				});
-				const telegramDirectMatch = callback.sessionKey.match(/^agent:[^:]+:telegram:direct:(.+)$/);
-				const telegramDirectTo = asString(callback.to) || telegramDirectMatch?.[1];
+				appendCallbackDebugAudit({
+					phase: "visible_ack_enqueued",
+					sessionKey: callback.sessionKey,
+					sessionId: preferredSessionId || null,
+					dedupeKey,
+					runId: parsed.metadata?.runId || null,
+					ackText,
+				});
+				const telegramDirectMatch = callback.sessionKey.match(
+					/^agent:[^:]+:telegram:direct:(.+)$/,
+				);
+				const telegramDirectTo =
+					asString(callback.to) || telegramDirectMatch?.[1];
 				if (
 					(callback.channel === "telegram" || telegramDirectTo) &&
-					typeof api?.runtime?.channel?.telegram?.sendMessageTelegram === "function" &&
+					typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
+						"function" &&
 					telegramDirectTo
 				) {
 					try {
@@ -331,7 +469,9 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 							telegramDirectTo,
 							ackText,
 							{
-								...(dedupeKey ? { contextKey: `${dedupeKey}:visible-ack:telegram` } : {}),
+								...(dedupeKey
+									? { contextKey: `${dedupeKey}:visible-ack:telegram` }
+									: {}),
 								silent: false,
 							},
 						);
@@ -355,13 +495,6 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						});
 					}
 				}
-				appendCallbackDebugAudit({
-					phase: "visible_ack_enqueued",
-					sessionKey: callback.sessionKey,
-					dedupeKey,
-					runId: parsed.metadata?.runId || null,
-					ackText,
-				});
 			}
 			if ((callback.wakeMode || "now") === "now") {
 				api.runtime.system.requestHeartbeatNow({
@@ -382,9 +515,11 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				continuation: runStatus?.continuation || null,
 			});
 			if (runStatus?.continuation) {
-				const step = (parsed.metadata?.eventType === "task.failed" || parsed.metadata?.eventType === "task.stalled")
-					? runStatus.continuation.nextOnFailure
-					: runStatus.continuation.nextOnSuccess;
+				const step =
+					parsed.metadata?.eventType === "task.failed" ||
+					parsed.metadata?.eventType === "task.stalled"
+						? runStatus.continuation.nextOnFailure
+						: runStatus.continuation.nextOnSuccess;
 				appendCallbackDebugAudit({
 					phase: "continuation_evaluated",
 					sessionKey: callback.sessionKey,
@@ -402,7 +537,9 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					const command = `/opencode-continue ${JSON.stringify(commandPayload)}`;
 					api.runtime.system.enqueueSystemEvent(command, {
 						...callbackTarget,
-						...(dedupeKey ? { contextKey: `${dedupeKey}:continuation-command` } : {}),
+						...(dedupeKey
+							? { contextKey: `${dedupeKey}:continuation-command` }
+							: {}),
 					});
 					appendCallbackDebugAudit({
 						phase: "continuation_command_enqueued",
@@ -414,11 +551,15 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				} else if (step?.action === "notify") {
 					const notifyMessage = [
 						`OpenCode callback received for run ${parsed.metadata?.runId || "unknown-run"}.`,
-						step.objective || step.prompt || "Next step requires operator notice.",
+						step.objective ||
+							step.prompt ||
+							"Next step requires operator notice.",
 					].join("\n");
 					api.runtime.system.enqueueSystemEvent(notifyMessage, {
 						...callbackTarget,
-						...(dedupeKey ? { contextKey: `${dedupeKey}:continuation-notify` } : {}),
+						...(dedupeKey
+							? { contextKey: `${dedupeKey}:continuation-notify` }
+							: {}),
 					});
 					appendCallbackDebugAudit({
 						phase: "continuation_notify_enqueued",
@@ -917,7 +1058,9 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 						],
 					};
 				}
-				const requestedPromptVariant = asString(params.promptVariant)?.toLowerCase();
+				const requestedPromptVariant = asString(
+					params.promptVariant,
+				)?.toLowerCase();
 				const promptVariant: "medium" | "high" =
 					requestedPromptVariant === "high" ||
 					requestedPromptVariant === "hard" ||
@@ -1400,7 +1543,11 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					content: [
 						{
 							type: "text",
-							text: JSON.stringify({ ok: true, opportunisticCleanup, ...result }, null, 2),
+							text: JSON.stringify(
+								{ ok: true, opportunisticCleanup, ...result },
+								null,
+								2,
+							),
 						},
 					],
 				};
@@ -1544,7 +1691,10 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				"Đánh dấu stopped và gửi SIGTERM cho serve theo serve_id hoặc server URL nếu registry có pid.",
 			parameters: {
 				type: "object",
-				properties: { project_id: { type: "string" }, serve_id: { type: "string" } },
+				properties: {
+					project_id: { type: "string" },
+					serve_id: { type: "string" },
+				},
 				required: [],
 			},
 			async execute(_id: string, params: any) {

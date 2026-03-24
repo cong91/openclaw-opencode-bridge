@@ -551,11 +551,20 @@ export function normalizeSessionRegistry(
 	return { entries };
 }
 
+function compactServeRegistryLiveOnly(data: ServeRegistryFile): ServeRegistryFile {
+	const normalized = normalizeServeRegistry(data);
+	return {
+		entries: normalized.entries.filter(
+			(entry) => asString(entry.status) !== "stopped",
+		),
+	};
+}
+
 export function writeServeRegistryFile(data: ServeRegistryFile) {
 	const path = getServeRegistryPath();
 	writeFileSync(
 		path,
-		JSON.stringify(normalizeServeRegistry(data), null, 2),
+		JSON.stringify(compactServeRegistryLiveOnly(data), null, 2),
 		"utf8",
 	);
 	return path;
@@ -578,8 +587,13 @@ export function upsertServeRegistry(entry: ServeRegistryEntry) {
 	);
 	if (idx >= 0) registry.entries[idx] = entry;
 	else registry.entries.push(entry);
+	if (entry.status === "running" || entry.status === "unknown") {
+		registry.entries = registry.entries.filter(
+			(x) => x.serve_id === entry.serve_id || x.opencode_server_url === entry.opencode_server_url,
+		);
+	}
 	const path = writeServeRegistryFile(registry);
-	return { path, registry };
+	return { path, registry: compactServeRegistryLiveOnly(registry) };
 }
 
 export function upsertSessionRegistry(entry: SessionRegistryEntry) {
@@ -1194,6 +1208,13 @@ function resolvePromptAsyncModel(model?: string) {
 	return { providerID: "proxy", modelID: raw };
 }
 
+function normalizeAttachRunModel(model?: string): string | undefined {
+	const raw = asString(model);
+	if (!raw) return undefined;
+	if (raw.includes("/")) return raw;
+	return `proxy/${raw}`;
+}
+
 function normalizePromptVariant(value: unknown): "medium" | "high" | undefined {
 	const raw = asString(value)?.toLowerCase();
 	if (raw === "high" || raw === "hard") return "high";
@@ -1353,8 +1374,9 @@ export async function runAttachExecutionForEnvelope(input: {
 	) {
 		args.push("--agent", input.envelope.resolved_agent_id);
 	}
-	if (input.model) {
-		args.push("--model", input.model);
+	const attachRunModel = normalizeAttachRunModel(input.model);
+	if (attachRunModel) {
+		args.push("--model", attachRunModel);
 	}
 	if (input.promptVariant) {
 		args.push("--variant", input.promptVariant);

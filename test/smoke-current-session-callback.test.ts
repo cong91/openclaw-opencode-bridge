@@ -207,7 +207,9 @@ test("smoke: terminal plugin callback wakes current session and enqueues continu
     assert.equal(heartbeatCalls.length, 1);
     assert.equal(systemEvents.length, 2);
     assert.equal(systemEvents[0]?.opts?.sessionKey, "session:origin:smoke-1");
-    assert.match(systemEvents[0]?.text, /"kind":"opencode.callback"/);
+    assert.match(systemEvents[0]?.text, /OpenCode callback control message/);
+    assert.match(systemEvents[0]?.text, /"messageKind":"callback_control"/);
+    assert.match(systemEvents[0]?.text, /"runId":"run-smoke-1"/);
     assert.equal(systemEvents[1]?.opts?.sessionKey, "session:origin:smoke-1");
     assert.match(systemEvents[1]?.text, /Verify current session resumed after callback/);
   } finally {

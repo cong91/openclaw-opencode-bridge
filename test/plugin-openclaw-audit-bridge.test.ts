@@ -43,7 +43,7 @@ test("OpenCode-side plugin mirrors callback outcome into OpenClaw-side audit fil
         properties: {
           info: {
             id: "sess-audit",
-            title: "demo runId=run-audit taskId=task-audit requested=fullstack resolved=fullstack callbackSession=agent:fullstack:telegram:direct:5165741309 callbackSessionId=session-audit",
+            title: "demo runId=run-audit taskId=task-audit requested=fullstack resolved=fullstack callbackSession=agent:fullstack:telegram:direct:5165741309 callbackSessionId=session-audit projectId=proj-audit repoRoot=/tmp/repo-audit workflowId=wf-audit stepId=step-audit",
           },
         },
       },
@@ -65,6 +65,10 @@ test("OpenCode-side plugin mirrors callback outcome into OpenClaw-side audit fil
     assert.equal(target.runId, "run-audit");
     assert.equal(target.taskId, "task-audit");
     assert.equal(target.requestedAgentId, "fullstack");
+    assert.equal(target.projectId, "proj-audit");
+    assert.equal(target.repoRoot, "/tmp/repo-audit");
+    assert.equal(target.workflowId, "wf-audit");
+    assert.equal(target.stepId, "step-audit");
   } finally {
     globalThis.fetch = oldFetch;
     if (oldHookBase === undefined) delete process.env.OPENCLAW_HOOK_BASE_URL; else process.env.OPENCLAW_HOOK_BASE_URL = oldHookBase;

@@ -26,12 +26,28 @@ openclaw plugins install @mrc2204/openclaw-opencode-bridge
 npm run materialize:opencode-plugin:project
 ```
 
+Project mode sẽ materialize plugin theo namespace clean:
+- `.opencode/plugins/openclaw-bridge/openclaw-bridge-callback.js`
+- `.opencode/plugins/openclaw-bridge/config.json`
+
+và auto patch plugin entry trong `.opencode/opencode.json` thành:
+```json
+{ "plugin": ["./plugins/openclaw-bridge/openclaw-bridge-callback.js"] }
+```
+
 ### 3) OpenCode side — cài global
 ```bash
 npm run materialize:opencode-plugin:global
 ```
 
-Global mode sẽ tự patch `~/.config/opencode/opencode.json` khi file này tồn tại.
+Global mode sẽ materialize plugin theo namespace clean:
+- `~/.config/opencode/plugins/openclaw-bridge/openclaw-bridge-callback.js`
+- `~/.config/opencode/plugins/openclaw-bridge/config.json`
+
+và auto patch `~/.config/opencode/opencode.json` khi file này tồn tại thành plugin entry dạng:
+```json
+{ "plugin": ["./plugins/openclaw-bridge/openclaw-bridge-callback.js"] }
+```
 
 ### 4) Một lệnh cài
 Project mode:

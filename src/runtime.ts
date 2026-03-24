@@ -1,27 +1,35 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
-import { spawn, spawnSync } from "node:child_process";
-import { createServer } from "node:net";
+import { spawn } from "node:child_process";
 import {
-  type EventScope,
-  type OpenCodeEventKind,
-  parseSseFramesFromBuffer,
-  normalizeTypedEventV1,
-  resolveSessionId,
-  summarizeLifecycle,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
+import { createServer } from "node:net";
+import { join } from "node:path";
+import {
+	type EventScope,
+	normalizeTypedEventV1,
+	type OpenCodeEventKind,
+	parseSseFramesFromBuffer,
+	resolveSessionId,
+	summarizeLifecycle,
 } from "./observability";
-import { buildTaggedSessionTitle } from "./shared-contracts";
+import { buildTaggedSessionTitle, OPENCODE_CALLBACK_HTTP_PATH } from "./shared-contracts";
 import type {
-  BridgeConfigFile,
-  BridgeLifecycleState,
-  CallbackAuditRecord,
-  HooksAgentCallbackPayload,
-  BridgeRunStatus,
-  ProjectRegistryEntry,
-  RoutingEnvelope,
-  RunEventRecord,
-  ServeRegistryEntry,
-  ServeRegistryFile,
+	BridgeConfigFile,
+	BridgeLifecycleState,
+	BridgeRunStatus,
+	CallbackAuditRecord,
+	HooksAgentCallbackPayload,
+	OpenCodeContinuationCallbackMetadata,
+	OpenCodeRunContinuation,
+	ProjectRegistryEntry,
+	RoutingEnvelope,
+	RunEventRecord,
+	ServeRegistryEntry,
+	ServeRegistryFile,
 } from "./types";
 
 export const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
@@ -33,1270 +41,1228 @@ export const DEFAULT_EVENT_LIMIT = 10;
 export const HOOK_PREFIX = "hook:opencode:";
 
 export function asArray(value: unknown): any[] {
-  return Array.isArray(value) ? value : [];
+	return Array.isArray(value) ? value : [];
 }
 
 export function asString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 export function asNumber(value: unknown): number | undefined {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : undefined;
+	const n = Number(value);
+	return Number.isFinite(n) ? n : undefined;
 }
 
 export function buildSessionKey(agentId: string, taskId: string): string {
-  return `${HOOK_PREFIX}${agentId}:${taskId}`;
+	return `${HOOK_PREFIX}${agentId}:${taskId}`;
 }
 
 export function getBridgeStateDir(): string {
-  const stateDir = process.env.OPENCLAW_STATE_DIR || `${process.env.HOME}/.openclaw`;
-  return join(stateDir, "opencode-bridge");
+	const stateDir =
+		process.env.OPENCLAW_STATE_DIR || `${process.env.HOME}/.openclaw`;
+	return join(stateDir, "opencode-bridge");
 }
 
 export function getBridgeConfigPath(): string {
-  return join(getBridgeStateDir(), "config.json");
+	return join(getBridgeStateDir(), "config.json");
 }
 
 export function ensureBridgeConfigFile(): BridgeConfigFile {
-  const dir = getBridgeStateDir();
-  mkdirSync(dir, { recursive: true });
-  const path = getBridgeConfigPath();
-  if (!existsSync(path)) {
-    const initial: BridgeConfigFile = {
-      opencodeServerUrl: "http://127.0.0.1:4096",
-      projectRegistry: [],
-    };
-    writeFileSync(path, JSON.stringify(initial, null, 2), "utf8");
-    return initial;
-  }
-  return JSON.parse(readFileSync(path, "utf8")) as BridgeConfigFile;
+	const dir = getBridgeStateDir();
+	mkdirSync(dir, { recursive: true });
+	const path = getBridgeConfigPath();
+	if (!existsSync(path)) {
+		const initial: BridgeConfigFile = {
+			opencodeServerUrl: "http://127.0.0.1:4096",
+			projectRegistry: [],
+		};
+		writeFileSync(path, JSON.stringify(initial, null, 2), "utf8");
+		return initial;
+	}
+	return JSON.parse(readFileSync(path, "utf8")) as BridgeConfigFile;
 }
 
 export function writeBridgeConfigFile(data: BridgeConfigFile) {
-  const path = getBridgeConfigPath();
-  mkdirSync(getBridgeStateDir(), { recursive: true });
-  writeFileSync(path, JSON.stringify(data, null, 2), "utf8");
-  return path;
+	const path = getBridgeConfigPath();
+	mkdirSync(getBridgeStateDir(), { recursive: true });
+	writeFileSync(path, JSON.stringify(data, null, 2), "utf8");
+	return path;
 }
 
 export function getRuntimeConfig(cfg: any): BridgeConfigFile {
-  const fileCfg = ensureBridgeConfigFile();
-  return {
-    opencodeServerUrl: fileCfg.opencodeServerUrl || cfg?.opencodeServerUrl,
-    projectRegistry: fileCfg.projectRegistry || cfg?.projectRegistry || [],
-    executionAgentMappings: fileCfg.executionAgentMappings || cfg?.executionAgentMappings || [],
-    hookBaseUrl: fileCfg.hookBaseUrl || cfg?.hookBaseUrl,
-    hookToken: fileCfg.hookToken || cfg?.hookToken,
-  };
+	const fileCfg = ensureBridgeConfigFile();
+	return {
+		opencodeServerUrl: fileCfg.opencodeServerUrl || cfg?.opencodeServerUrl,
+		projectRegistry: fileCfg.projectRegistry || cfg?.projectRegistry || [],
+		executionAgentMappings:
+			fileCfg.executionAgentMappings || cfg?.executionAgentMappings || [],
+		hookBaseUrl: fileCfg.hookBaseUrl || cfg?.hookBaseUrl,
+		hookToken: fileCfg.hookToken || cfg?.hookToken,
+	};
 }
 
 export function normalizeRegistry(raw: unknown): ProjectRegistryEntry[] {
-  return asArray(raw)
-    .map((item) => {
-      const obj = item && typeof item === "object" ? (item as Record<string, unknown>) : {};
-      const projectId = asString(obj.projectId);
-      const repoRoot = asString(obj.repoRoot);
-      const serverUrl = asString(obj.serverUrl);
-      const idleTimeoutMs = Number(obj.idleTimeoutMs || DEFAULT_IDLE_TIMEOUT_MS);
-      if (!projectId || !repoRoot || !serverUrl) return null;
-      return {
-        projectId,
-        repoRoot,
-        serverUrl,
-        idleTimeoutMs: Number.isFinite(idleTimeoutMs) ? idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS,
-      };
-    })
-    .filter(Boolean) as ProjectRegistryEntry[];
+	return asArray(raw)
+		.map((item) => {
+			const obj =
+				item && typeof item === "object"
+					? (item as Record<string, unknown>)
+					: {};
+			const projectId = asString(obj.projectId);
+			const repoRoot = asString(obj.repoRoot);
+			const serverUrl = asString(obj.serverUrl);
+			const idleTimeoutMs = Number(
+				obj.idleTimeoutMs || DEFAULT_IDLE_TIMEOUT_MS,
+			);
+			if (!projectId || !repoRoot || !serverUrl) return null;
+			return {
+				projectId,
+				repoRoot,
+				serverUrl,
+				idleTimeoutMs: Number.isFinite(idleTimeoutMs)
+					? idleTimeoutMs
+					: DEFAULT_IDLE_TIMEOUT_MS,
+			};
+		})
+		.filter(Boolean) as ProjectRegistryEntry[];
 }
 
-export function findRegistryEntry(cfg: any, projectId?: string, repoRoot?: string): ProjectRegistryEntry | undefined {
-  const runtimeCfg = getRuntimeConfig(cfg);
-  const dynamicRegistry = normalizeServeRegistry(readServeRegistry()).entries.map((x) => ({
-    projectId: x.project_id,
-    repoRoot: x.repo_root,
-    serverUrl: x.opencode_server_url,
-    idleTimeoutMs: x.idle_timeout_ms,
-  }));
-  const registry = [...dynamicRegistry, ...normalizeRegistry(runtimeCfg.projectRegistry)].filter(Boolean) as ProjectRegistryEntry[];
-  if (projectId) {
-    const byProject = registry.find((x) => x.projectId === projectId);
-    if (byProject) return byProject;
-  }
-  if (repoRoot) {
-    const byRoot = registry.find((x) => x.repoRoot === repoRoot);
-    if (byRoot) return byRoot;
-  }
-  return undefined;
+export function findRegistryEntry(
+	cfg: any,
+	projectId?: string,
+	repoRoot?: string,
+): ProjectRegistryEntry | undefined {
+	const runtimeCfg = getRuntimeConfig(cfg);
+	const dynamicRegistry = normalizeServeRegistry(
+		readServeRegistry(),
+	).entries.map((x) => ({
+		projectId: x.project_id,
+		repoRoot: x.repo_root,
+		serverUrl: x.opencode_server_url,
+		idleTimeoutMs: x.idle_timeout_ms,
+	}));
+	const registry = [
+		...dynamicRegistry,
+		...normalizeRegistry(runtimeCfg.projectRegistry),
+	].filter(Boolean) as ProjectRegistryEntry[];
+	if (projectId) {
+		const byProject = registry.find((x) => x.projectId === projectId);
+		if (byProject) return byProject;
+	}
+	if (repoRoot) {
+		const byRoot = registry.find((x) => x.repoRoot === repoRoot);
+		if (byRoot) return byRoot;
+	}
+	return undefined;
 }
 
 export function resolveExecutionAgent(input: {
-  cfg: any;
-  requestedAgentId: string;
-  explicitExecutionAgentId?: string;
+	cfg: any;
+	requestedAgentId: string;
+	explicitExecutionAgentId?: string;
 }):
-  | { ok: true; requestedAgentId: string; resolvedAgentId: string; strategy: "explicit_param" | "config_mapping" | "identity" }
-  | { ok: false; requestedAgentId: string; error: string; mappingConfigured: boolean } {
-  const requestedAgentId = asString(input.requestedAgentId);
-  if (!requestedAgentId) {
-    return {
-      ok: false,
-      requestedAgentId: "",
-      mappingConfigured: false,
-      error: "requestedAgentId is required",
-    };
-  }
+	| {
+			ok: true;
+			requestedAgentId: string;
+			resolvedAgentId: string;
+			strategy: "explicit_param" | "config_mapping" | "identity";
+			executionAgentExplicit?: boolean;
+	  }
+	| {
+			ok: false;
+			requestedAgentId: string;
+			error: string;
+			mappingConfigured: boolean;
+	  } {
+	const requestedAgentId = asString(input.requestedAgentId);
+	if (!requestedAgentId) {
+		return {
+			ok: false,
+			requestedAgentId: "",
+			mappingConfigured: false,
+			error: "requestedAgentId is required",
+		};
+	}
 
-  const explicitExecutionAgentId = asString(input.explicitExecutionAgentId);
-  if (explicitExecutionAgentId) {
-    return {
-      ok: true,
-      requestedAgentId,
-      resolvedAgentId: explicitExecutionAgentId,
-      strategy: "explicit_param",
-    };
-  }
+	const explicitExecutionAgentId = asString(input.explicitExecutionAgentId);
+	if (explicitExecutionAgentId) {
+		return {
+			ok: true,
+			requestedAgentId,
+			resolvedAgentId: explicitExecutionAgentId,
+			strategy: "explicit_param",
+		};
+	}
 
-  const runtimeCfg = getRuntimeConfig(input.cfg);
-  const mappings = asArray(runtimeCfg.executionAgentMappings)
-    .map((x) => (x && typeof x === "object" ? (x as Record<string, unknown>) : {}))
-    .map((x) => ({
-      requestedAgentId: asString(x.requestedAgentId),
-      executionAgentId: asString(x.executionAgentId),
-    }))
-    .filter((x) => x.requestedAgentId && x.executionAgentId) as { requestedAgentId: string; executionAgentId: string }[];
+	const runtimeCfg = getRuntimeConfig(input.cfg);
+	const mappings = asArray(runtimeCfg.executionAgentMappings)
+		.map((x) =>
+			x && typeof x === "object" ? (x as Record<string, unknown>) : {},
+		)
+		.map((x) => ({
+			requestedAgentId: asString(x.requestedAgentId),
+			executionAgentId: asString(x.executionAgentId),
+		}))
+		.filter((x) => x.requestedAgentId && x.executionAgentId) as {
+		requestedAgentId: string;
+		executionAgentId: string;
+	}[];
 
-  if (mappings.length > 0) {
-    const matched = mappings.find((x) => x.requestedAgentId === requestedAgentId);
-    if (!matched) {
-      return {
-        ok: false,
-        requestedAgentId,
-        mappingConfigured: true,
-        error: `Execution agent mapping is configured but no mapping matched requestedAgentId=${requestedAgentId}`,
-      };
-    }
-    return {
-      ok: true,
-      requestedAgentId,
-      resolvedAgentId: matched.executionAgentId,
-      strategy: "config_mapping",
-    };
-  }
+	if (mappings.length > 0) {
+		const matched = mappings.find(
+			(x) => x.requestedAgentId === requestedAgentId,
+		);
+		if (!matched) {
+			return {
+				ok: false,
+				requestedAgentId,
+				mappingConfigured: true,
+				error: `Execution agent mapping is configured but no mapping matched requestedAgentId=${requestedAgentId}`,
+			};
+		}
+		return {
+			ok: true,
+			requestedAgentId,
+			resolvedAgentId: matched.executionAgentId,
+			strategy: "config_mapping",
+		};
+	}
 
-  return {
-    ok: true,
-    requestedAgentId,
-    resolvedAgentId: requestedAgentId,
-    strategy: "identity",
-    executionAgentExplicit: false,
-  };
+	return {
+		ok: true,
+		requestedAgentId,
+		resolvedAgentId: requestedAgentId,
+		strategy: "identity",
+		executionAgentExplicit: false,
+	};
 }
 
 export function buildEnvelope(input: {
-  taskId: string;
-  runId: string;
-  requestedAgentId: string;
-  resolvedAgentId: string;
-  originSessionKey: string;
-  originSessionId?: string;
-  projectId: string;
-  repoRoot: string;
-  serverUrl: string;
-  channel?: string;
-  to?: string;
-  deliver?: boolean;
-  priority?: string;
+	taskId: string;
+	runId: string;
+	requestedAgentId: string;
+	resolvedAgentId: string;
+	executionAgentExplicit?: boolean;
+	originSessionKey: string;
+	originSessionId?: string;
+	projectId: string;
+	repoRoot: string;
+	serverUrl: string;
+	channel?: string;
+	to?: string;
+	deliver?: boolean;
+	priority?: string;
 }): RoutingEnvelope {
-  return {
-    task_id: input.taskId,
-    run_id: input.runId,
-    agent_id: input.resolvedAgentId,
-    requested_agent_id: input.requestedAgentId,
-    resolved_agent_id: input.resolvedAgentId,
-    ...(input.executionAgentExplicit !== undefined ? { execution_agent_explicit: input.executionAgentExplicit } : {}),
-    session_key: buildSessionKey(input.resolvedAgentId, input.taskId),
-    origin_session_key: input.originSessionKey,
-    ...(input.originSessionId ? { origin_session_id: input.originSessionId } : {}),
-    callback_target_session_key: input.originSessionKey,
-    ...(input.originSessionId ? { callback_target_session_id: input.originSessionId } : {}),
-    project_id: input.projectId,
-    repo_root: input.repoRoot,
-    opencode_server_url: input.serverUrl,
-    ...(input.channel ? { channel: input.channel } : {}),
-    ...(input.to ? { to: input.to } : {}),
-    ...(input.deliver !== undefined ? { deliver: input.deliver } : {}),
-    ...(input.priority ? { priority: input.priority } : {}),
-  };
+	return {
+		task_id: input.taskId,
+		run_id: input.runId,
+		agent_id: input.resolvedAgentId,
+		requested_agent_id: input.requestedAgentId,
+		resolved_agent_id: input.resolvedAgentId,
+		...(input.executionAgentExplicit !== undefined
+			? { execution_agent_explicit: input.executionAgentExplicit }
+			: {}),
+		session_key: buildSessionKey(input.resolvedAgentId, input.taskId),
+		origin_session_key: input.originSessionKey,
+		...(input.originSessionId
+			? { origin_session_id: input.originSessionId }
+			: {}),
+		callback_target_session_key: input.originSessionKey,
+		...(input.originSessionId
+			? { callback_target_session_id: input.originSessionId }
+			: {}),
+		project_id: input.projectId,
+		repo_root: input.repoRoot,
+		opencode_server_url: input.serverUrl,
+		...(input.channel ? { channel: input.channel } : {}),
+		...(input.to ? { to: input.to } : {}),
+		...(input.deliver !== undefined ? { deliver: input.deliver } : {}),
+		...(input.priority ? { priority: input.priority } : {}),
+	};
 }
 
-export function mapEventToState(event: OpenCodeEventKind): BridgeLifecycleState {
-  switch (event) {
-    case "task.started":
-      return "planning";
-    case "task.progress":
-      return "running";
-    case "permission.requested":
-      return "awaiting_permission";
-    case "task.stalled":
-      return "stalled";
-    case "task.failed":
-      return "failed";
-    case "task.completed":
-      return "completed";
-    default:
-      return "running";
-  }
+export function mapEventToState(
+	event: OpenCodeEventKind,
+): BridgeLifecycleState {
+	switch (event) {
+		case "task.started":
+			return "planning";
+		case "task.progress":
+			return "running";
+		case "permission.requested":
+			return "awaiting_permission";
+		case "task.stalled":
+			return "stalled";
+		case "task.failed":
+			return "failed";
+		case "task.completed":
+			return "completed";
+		default:
+			return "running";
+	}
 }
 
-export function assertCallbackTargetSessionKey(envelope: RoutingEnvelope): string {
-  const callbackTargetSessionKey = asString((envelope as any)?.callback_target_session_key);
-  if (!callbackTargetSessionKey) {
-    throw new Error("Invalid routing envelope: missing callback_target_session_key (required for current-session callback integrity)");
-  }
-  return callbackTargetSessionKey;
+export function assertCallbackTargetSessionKey(
+	envelope: RoutingEnvelope,
+): string {
+	const callbackTargetSessionKey = asString(
+		(envelope as any)?.callback_target_session_key,
+	);
+	if (!callbackTargetSessionKey) {
+		throw new Error(
+			"Invalid routing envelope: missing callback_target_session_key (required for current-session callback integrity)",
+		);
+	}
+	return callbackTargetSessionKey;
 }
 
 export function buildHooksAgentCallback(input: {
-  event: OpenCodeEventKind;
-  envelope: RoutingEnvelope;
-  summary?: string;
+	event: OpenCodeEventKind;
+	envelope: RoutingEnvelope;
+	summary?: string;
 }): HooksAgentCallbackPayload {
-  const state = mapEventToState(input.event);
-  const message =
-    input.summary ||
-    `OpenCode event=${input.event} state=${state} task=${input.envelope.task_id} run=${input.envelope.run_id} project=${input.envelope.project_id} requestedAgent=${input.envelope.requested_agent_id} resolvedAgent=${input.envelope.resolved_agent_id}`;
+	const state = mapEventToState(input.event);
+	const message =
+		input.summary ||
+		`OpenCode event=${input.event} state=${state} task=${input.envelope.task_id} run=${input.envelope.run_id} project=${input.envelope.project_id} requestedAgent=${input.envelope.requested_agent_id} resolvedAgent=${input.envelope.resolved_agent_id}`;
 
-  const callbackTargetSessionKey = assertCallbackTargetSessionKey(input.envelope);
+	const callbackTargetSessionKey = assertCallbackTargetSessionKey(
+		input.envelope,
+	);
 
-  return {
-    message,
-    name: "OpenCode",
-    // callback should wake requester/origin lane, not execution lane
-    agentId: input.envelope.requested_agent_id,
-    sessionKey: callbackTargetSessionKey,
-    ...(input.envelope.callback_target_session_id ? { sessionId: input.envelope.callback_target_session_id } : {}),
-    wakeMode: "now",
-    deliver: false,
-    ...(input.envelope.channel ? { channel: input.envelope.channel } : {}),
-    ...(input.envelope.to ? { to: input.envelope.to } : {}),
-  };
+	return {
+		message,
+		name: "OpenCode",
+		// callback should wake requester/origin lane, not execution lane
+		agentId: input.envelope.requested_agent_id,
+		sessionKey: callbackTargetSessionKey,
+		...(input.envelope.callback_target_session_id
+			? { sessionId: input.envelope.callback_target_session_id }
+			: {}),
+		wakeMode: "now",
+		deliver: false,
+		...(input.envelope.channel ? { channel: input.envelope.channel } : {}),
+		...(input.envelope.to ? { to: input.envelope.to } : {}),
+	};
 }
 
 export function evaluateLifecycle(input: {
-  lastEventKind?: OpenCodeEventKind | null;
-  lastEventAtMs?: number;
-  nowMs?: number;
-  softStallMs?: number;
-  hardStallMs?: number;
+	lastEventKind?: OpenCodeEventKind | null;
+	lastEventAtMs?: number;
+	nowMs?: number;
+	softStallMs?: number;
+	hardStallMs?: number;
 }) {
-  const nowMs = input.nowMs ?? Date.now();
-  const softStallMs = input.softStallMs ?? DEFAULT_SOFT_STALL_MS;
-  const hardStallMs = input.hardStallMs ?? DEFAULT_HARD_STALL_MS;
-  if (input.lastEventKind) {
-    const state = mapEventToState(input.lastEventKind);
-    return {
-      state,
-      escalateToMain: state === "failed" || state === "completed",
-      needsPermissionHandling: state === "awaiting_permission",
-      stallSeverity: null,
-    };
-  }
-  if (!input.lastEventAtMs) {
-    return {
-      state: "queued" as BridgeLifecycleState,
-      escalateToMain: false,
-      needsPermissionHandling: false,
-      stallSeverity: null,
-    };
-  }
-  const age = nowMs - input.lastEventAtMs;
-  if (age >= hardStallMs) {
-    return { state: "stalled" as BridgeLifecycleState, escalateToMain: true, needsPermissionHandling: false, stallSeverity: "hard" };
-  }
-  if (age >= softStallMs) {
-    return { state: "stalled" as BridgeLifecycleState, escalateToMain: false, needsPermissionHandling: false, stallSeverity: "soft" };
-  }
-  return { state: "running" as BridgeLifecycleState, escalateToMain: false, needsPermissionHandling: false, stallSeverity: null };
+	const nowMs = input.nowMs ?? Date.now();
+	const softStallMs = input.softStallMs ?? DEFAULT_SOFT_STALL_MS;
+	const hardStallMs = input.hardStallMs ?? DEFAULT_HARD_STALL_MS;
+	if (input.lastEventKind) {
+		const state = mapEventToState(input.lastEventKind);
+		return {
+			state,
+			escalateToMain: state === "failed" || state === "completed",
+			needsPermissionHandling: state === "awaiting_permission",
+			stallSeverity: null,
+		};
+	}
+	if (!input.lastEventAtMs) {
+		return {
+			state: "queued" as BridgeLifecycleState,
+			escalateToMain: false,
+			needsPermissionHandling: false,
+			stallSeverity: null,
+		};
+	}
+	const age = nowMs - input.lastEventAtMs;
+	if (age >= hardStallMs) {
+		return {
+			state: "stalled" as BridgeLifecycleState,
+			escalateToMain: true,
+			needsPermissionHandling: false,
+			stallSeverity: "hard",
+		};
+	}
+	if (age >= softStallMs) {
+		return {
+			state: "stalled" as BridgeLifecycleState,
+			escalateToMain: false,
+			needsPermissionHandling: false,
+			stallSeverity: "soft",
+		};
+	}
+	return {
+		state: "running" as BridgeLifecycleState,
+		escalateToMain: false,
+		needsPermissionHandling: false,
+		stallSeverity: null,
+	};
 }
 
 export function getRunStateDir(): string {
-  return join(getBridgeStateDir(), "runs");
+	return join(getBridgeStateDir(), "runs");
 }
 
 export function writeRunStatus(status: BridgeRunStatus) {
-  const dir = getRunStateDir();
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${status.runId}.json`);
-  writeFileSync(path, JSON.stringify(status, null, 2), "utf8");
-  return path;
+	const dir = getRunStateDir();
+	mkdirSync(dir, { recursive: true });
+	const path = join(dir, `${status.runId}.json`);
+	writeFileSync(path, JSON.stringify(status, null, 2), "utf8");
+	return path;
 }
 
 export function readRunStatus(runId: string): BridgeRunStatus | null {
-  const path = join(getRunStateDir(), `${runId}.json`);
-  if (!existsSync(path)) return null;
-  return JSON.parse(readFileSync(path, "utf8")) as BridgeRunStatus;
+	const path = join(getRunStateDir(), `${runId}.json`);
+	if (!existsSync(path)) return null;
+	return JSON.parse(readFileSync(path, "utf8")) as BridgeRunStatus;
 }
 
-export function patchRunStatus(runId: string, patch: Partial<BridgeRunStatus> | ((current: BridgeRunStatus) => BridgeRunStatus)) {
-  const current = readRunStatus(runId);
-  if (!current) return null;
-  const next = typeof patch === "function" ? patch(current) : ({ ...current, ...patch } as BridgeRunStatus);
-  writeRunStatus(next);
-  return next;
+export function patchRunStatus(
+	runId: string,
+	patch:
+		| Partial<BridgeRunStatus>
+		| ((current: BridgeRunStatus) => BridgeRunStatus),
+) {
+	const current = readRunStatus(runId);
+	if (!current) return null;
+	const next =
+		typeof patch === "function"
+			? patch(current)
+			: ({ ...current, ...patch } as BridgeRunStatus);
+	writeRunStatus(next);
+	return next;
 }
 
 export function listRunStatuses(): BridgeRunStatus[] {
-  const dir = getRunStateDir();
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((name) => name.endsWith(".json"))
-    .map((name) => {
-      try {
-        return JSON.parse(readFileSync(join(dir, name), "utf8")) as BridgeRunStatus;
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean) as BridgeRunStatus[];
+	const dir = getRunStateDir();
+	if (!existsSync(dir)) return [];
+	return readdirSync(dir)
+		.filter((name) => name.endsWith(".json"))
+		.map((name) => {
+			try {
+				return JSON.parse(
+					readFileSync(join(dir, name), "utf8"),
+				) as BridgeRunStatus;
+			} catch {
+				return null;
+			}
+		})
+		.filter(Boolean) as BridgeRunStatus[];
 }
 
 export function getAuditDir(): string {
-  return join(getBridgeStateDir(), "audit");
+	return join(getBridgeStateDir(), "audit");
 }
 
 export function appendAudit(record: CallbackAuditRecord) {
-  const dir = getAuditDir();
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, "callbacks.jsonl");
-  writeFileSync(path, JSON.stringify(record) + "\n", { encoding: "utf8", flag: "a" });
-  return path;
+	const dir = getAuditDir();
+	mkdirSync(dir, { recursive: true });
+	const path = join(dir, "callbacks.jsonl");
+	writeFileSync(path, JSON.stringify(record) + "\n", {
+		encoding: "utf8",
+		flag: "a",
+	});
+	return path;
 }
 
 export function getServeRegistryPath(): string {
-  return join(getBridgeStateDir(), "registry.json");
+	return join(getBridgeStateDir(), "registry.json");
 }
 
 export function readServeRegistry(): ServeRegistryFile {
-  const path = getServeRegistryPath();
-  if (!existsSync(path)) return { entries: [] };
-  return JSON.parse(readFileSync(path, "utf8")) as ServeRegistryFile;
+	const path = getServeRegistryPath();
+	if (!existsSync(path)) return { entries: [] };
+	return JSON.parse(readFileSync(path, "utf8")) as ServeRegistryFile;
 }
 
-export function normalizeServeRegistry(registry: ServeRegistryFile): ServeRegistryFile {
-  const entries = asArray(registry.entries)
-    .map((entry) => {
-      const e = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
-      const project_id = asString(e.project_id);
-      const repo_root = asString(e.repo_root);
-      const opencode_server_url = asString(e.opencode_server_url);
-      if (!project_id || !repo_root || !opencode_server_url) return null;
-      return {
-        project_id,
-        repo_root,
-        opencode_server_url,
-        ...(asNumber(e.pid) !== undefined ? { pid: asNumber(e.pid) } : {}),
-        ...(asString(e.status) ? { status: asString(e.status) as ServeRegistryEntry["status"] } : {}),
-        ...(asString(e.last_event_at) ? { last_event_at: asString(e.last_event_at) } : {}),
-        idle_timeout_ms: asNumber(e.idle_timeout_ms) ?? DEFAULT_IDLE_TIMEOUT_MS,
-        updated_at: asString(e.updated_at) || new Date().toISOString(),
-      } as ServeRegistryEntry;
-    })
-    .filter(Boolean) as ServeRegistryEntry[];
-  return { entries };
+export function normalizeServeRegistry(
+	registry: ServeRegistryFile,
+): ServeRegistryFile {
+	const entries = asArray(registry.entries)
+		.map((entry) => {
+			const e =
+				entry && typeof entry === "object"
+					? (entry as Record<string, unknown>)
+					: {};
+			const project_id = asString(e.project_id);
+			const repo_root = asString(e.repo_root);
+			const opencode_server_url = asString(e.opencode_server_url);
+			if (!project_id || !repo_root || !opencode_server_url) return null;
+			return {
+				project_id,
+				repo_root,
+				opencode_server_url,
+				...(asNumber(e.pid) !== undefined ? { pid: asNumber(e.pid) } : {}),
+				...(asString(e.status)
+					? { status: asString(e.status) as ServeRegistryEntry["status"] }
+					: {}),
+				...(asString(e.last_event_at)
+					? { last_event_at: asString(e.last_event_at) }
+					: {}),
+				idle_timeout_ms: asNumber(e.idle_timeout_ms) ?? DEFAULT_IDLE_TIMEOUT_MS,
+				updated_at: asString(e.updated_at) || new Date().toISOString(),
+			} as ServeRegistryEntry;
+		})
+		.filter(Boolean) as ServeRegistryEntry[];
+	return { entries };
 }
 
 export function writeServeRegistryFile(data: ServeRegistryFile) {
-  const path = getServeRegistryPath();
-  writeFileSync(path, JSON.stringify(normalizeServeRegistry(data), null, 2), "utf8");
-  return path;
+	const path = getServeRegistryPath();
+	writeFileSync(
+		path,
+		JSON.stringify(normalizeServeRegistry(data), null, 2),
+		"utf8",
+	);
+	return path;
 }
 
 export function upsertServeRegistry(entry: ServeRegistryEntry) {
-  const registry = normalizeServeRegistry(readServeRegistry());
-  const idx = registry.entries.findIndex((x) => x.project_id === entry.project_id || x.repo_root === entry.repo_root);
-  if (idx >= 0) registry.entries[idx] = entry;
-  else registry.entries.push(entry);
-  const path = writeServeRegistryFile(registry);
-  return { path, registry };
+	const registry = normalizeServeRegistry(readServeRegistry());
+	const idx = registry.entries.findIndex(
+		(x) => x.project_id === entry.project_id || x.repo_root === entry.repo_root,
+	);
+	if (idx >= 0) registry.entries[idx] = entry;
+	else registry.entries.push(entry);
+	const path = writeServeRegistryFile(registry);
+	return { path, registry };
 }
 
 export function evaluateServeIdle(entry: ServeRegistryEntry, nowMs?: number) {
-  const now = nowMs ?? Date.now();
-  const last = entry.last_event_at ? Date.parse(entry.last_event_at) : NaN;
-  const idleTimeoutMs = entry.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS;
-  if (!Number.isFinite(last)) {
-    return { shouldShutdown: false, idleMs: null, reason: "missing_last_event_at" };
-  }
-  const idleMs = now - last;
-  return {
-    shouldShutdown: idleMs >= idleTimeoutMs,
-    idleMs,
-    idleTimeoutMs,
-    reason: idleMs >= idleTimeoutMs ? "idle_timeout_exceeded" : "within_idle_window",
-  };
+	const now = nowMs ?? Date.now();
+	const last = entry.last_event_at ? Date.parse(entry.last_event_at) : NaN;
+	const idleTimeoutMs = entry.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS;
+	if (!Number.isFinite(last)) {
+		return {
+			shouldShutdown: false,
+			idleMs: null,
+			reason: "missing_last_event_at",
+		};
+	}
+	const idleMs = now - last;
+	return {
+		shouldShutdown: idleMs >= idleTimeoutMs,
+		idleMs,
+		idleTimeoutMs,
+		reason:
+			idleMs >= idleTimeoutMs ? "idle_timeout_exceeded" : "within_idle_window",
+	};
 }
 
 export async function allocatePort(): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const server = createServer();
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      const port = typeof address === "object" && address ? address.port : 0;
-      server.close(() => resolve(port));
-    });
-    server.on("error", reject);
-  });
+	return await new Promise((resolve, reject) => {
+		const server = createServer();
+		server.listen(0, "127.0.0.1", () => {
+			const address = server.address();
+			const port = typeof address === "object" && address ? address.port : 0;
+			server.close(() => resolve(port));
+		});
+		server.on("error", reject);
+	});
 }
 
 export async function waitForHealth(serverUrl: string, timeoutMs = 10000) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    try {
-      const r = await fetch(`${serverUrl}/global/health`);
-      if (r.ok) return true;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  return false;
+	const started = Date.now();
+	while (Date.now() - started < timeoutMs) {
+		try {
+			const r = await fetch(`${serverUrl}/global/health`);
+			if (r.ok) return true;
+		} catch {}
+		await new Promise((r) => setTimeout(r, 500));
+	}
+	return false;
 }
 
-export async function fetchServeProjectBinding(serverUrl: string): Promise<{ ok: boolean; directory?: string; project?: any; path?: any; error?: string }> {
-  const normalizedUrl = serverUrl.replace(/\/$/, "");
-  const [projectRes, pathRes] = await Promise.all([
-    fetchJsonSafe(`${normalizedUrl}/project/current`),
-    fetchJsonSafe(`${normalizedUrl}/path`),
-  ]);
+export async function fetchServeProjectBinding(serverUrl: string): Promise<{
+	ok: boolean;
+	directory?: string;
+	project?: any;
+	path?: any;
+	error?: string;
+}> {
+	const normalizedUrl = serverUrl.replace(/\/$/, "");
+	const [projectRes, pathRes] = await Promise.all([
+		fetchJsonSafe(`${normalizedUrl}/project/current`),
+		fetchJsonSafe(`${normalizedUrl}/path`),
+	]);
 
-  const project = projectRes.ok ? projectRes.data : undefined;
-  const path = pathRes.ok ? pathRes.data : undefined;
-  const directory =
-    asString(project?.directory) ||
-    asString(project?.path) ||
-    asString(path?.directory) ||
-    asString(path?.cwd) ||
-    asString(path?.path);
+	const project = projectRes.ok ? projectRes.data : undefined;
+	const path = pathRes.ok ? pathRes.data : undefined;
+	const directory =
+		asString(project?.directory) ||
+		asString(project?.path) ||
+		asString(path?.directory) ||
+		asString(path?.cwd) ||
+		asString(path?.path);
 
-  if (directory) {
-    return { ok: true, directory, project, path };
-  }
+	if (directory) {
+		return { ok: true, directory, project, path };
+	}
 
-  return {
-    ok: false,
-    project,
-    path,
-    error: projectRes.error || pathRes.error || "Could not determine serve project binding",
-  };
+	return {
+		ok: false,
+		project,
+		path,
+		error:
+			projectRes.error ||
+			pathRes.error ||
+			"Could not determine serve project binding",
+	};
 }
 
-export async function isServeBoundToRepo(serverUrl: string, repoRoot: string): Promise<boolean> {
-  const binding = await fetchServeProjectBinding(serverUrl);
-  return binding.ok && binding.directory === repoRoot;
+export async function isServeBoundToRepo(
+	serverUrl: string,
+	repoRoot: string,
+): Promise<boolean> {
+	const binding = await fetchServeProjectBinding(serverUrl);
+	return binding.ok && binding.directory === repoRoot;
 }
 
 export async function spawnServeForProject(input: {
-  project_id: string;
-  repo_root: string;
-  idle_timeout_ms?: number;
+	project_id: string;
+	repo_root: string;
+	idle_timeout_ms?: number;
 }) {
-  const existing = normalizeServeRegistry(readServeRegistry()).entries.find((x) => x.project_id === input.project_id || x.repo_root === input.repo_root);
-  if (existing && existing.status === "running") {
-    const healthy = await waitForHealth(existing.opencode_server_url, 2000);
-    if (healthy) {
-      const boundToRepo = await isServeBoundToRepo(existing.opencode_server_url, input.repo_root);
-      if (boundToRepo) {
-        return { reused: true, entry: existing, registryPath: getServeRegistryPath() };
-      }
-    }
-  }
-  const port = await allocatePort();
-  const child = spawn("opencode", ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
-    cwd: input.repo_root,
-    detached: true,
-    stdio: "ignore",
-  });
-  child.unref();
-  const serverUrl = `http://127.0.0.1:${port}`;
-  const healthy = await waitForHealth(serverUrl, 10000);
-  const entry: ServeRegistryEntry = {
-    project_id: input.project_id,
-    repo_root: input.repo_root,
-    opencode_server_url: serverUrl,
-    pid: child.pid,
-    status: healthy ? "running" : "unknown",
-    last_event_at: new Date().toISOString(),
-    idle_timeout_ms: input.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS,
-    updated_at: new Date().toISOString(),
-  };
-  const result = upsertServeRegistry(entry);
-  return { reused: false, entry, healthy, registryPath: result.path };
+	const existing = normalizeServeRegistry(readServeRegistry()).entries.find(
+		(x) => x.project_id === input.project_id || x.repo_root === input.repo_root,
+	);
+	if (existing && existing.status === "running") {
+		const healthy = await waitForHealth(existing.opencode_server_url, 2000);
+		if (healthy) {
+			const boundToRepo = await isServeBoundToRepo(
+				existing.opencode_server_url,
+				input.repo_root,
+			);
+			if (boundToRepo) {
+				return {
+					reused: true,
+					entry: existing,
+					registryPath: getServeRegistryPath(),
+				};
+			}
+		}
+	}
+	const port = await allocatePort();
+	const runtimeCfg = getRuntimeConfig({});
+	const child = spawn(
+		"opencode",
+		["serve", "--hostname", "127.0.0.1", "--port", String(port)],
+		{
+			cwd: input.repo_root,
+			detached: true,
+			stdio: "ignore",
+			env: {
+				...process.env,
+				...(runtimeCfg.hookBaseUrl
+					? { OPENCLAW_HOOK_BASE_URL: runtimeCfg.hookBaseUrl }
+					: {}),
+				...(runtimeCfg.hookToken
+					? { OPENCLAW_HOOK_TOKEN: runtimeCfg.hookToken }
+					: {}),
+			},
+		},
+	);
+	child.unref();
+	const serverUrl = `http://127.0.0.1:${port}`;
+	const healthy = await waitForHealth(serverUrl, 10000);
+	const entry: ServeRegistryEntry = {
+		project_id: input.project_id,
+		repo_root: input.repo_root,
+		opencode_server_url: serverUrl,
+		pid: child.pid,
+		status: healthy ? "running" : "unknown",
+		last_event_at: new Date().toISOString(),
+		idle_timeout_ms: input.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS,
+		updated_at: new Date().toISOString(),
+	};
+	const result = upsertServeRegistry(entry);
+	return { reused: false, entry, healthy, registryPath: result.path };
 }
 
 export function markServeStopped(projectId: string) {
-  const registry = normalizeServeRegistry(readServeRegistry());
-  const entry = registry.entries.find((x) => x.project_id === projectId);
-  if (!entry) return { ok: false, error: "Project entry not found" };
-  entry.status = "stopped";
-  entry.updated_at = new Date().toISOString();
-  const path = writeServeRegistryFile(registry);
-  return { ok: true, path, entry, registry };
+	const registry = normalizeServeRegistry(readServeRegistry());
+	const entry = registry.entries.find((x) => x.project_id === projectId);
+	if (!entry) return { ok: false, error: "Project entry not found" };
+	entry.status = "stopped";
+	entry.updated_at = new Date().toISOString();
+	const path = writeServeRegistryFile(registry);
+	return { ok: true, path, entry, registry };
 }
 
 export function shutdownServe(entry: ServeRegistryEntry) {
-  if (entry.pid) {
-    try {
-      process.kill(entry.pid, "SIGTERM");
-    } catch {}
-  }
-  return markServeStopped(entry.project_id);
+	if (entry.pid) {
+		try {
+			process.kill(entry.pid, "SIGTERM");
+		} catch {}
+	}
+	return markServeStopped(entry.project_id);
 }
 
-export async function fetchSseEvents(serverUrl: string, options?: { maxEvents?: number; timeoutMs?: number }) {
-  const maxEvents = options?.maxEvents ?? 1;
-  const timeoutMs = options?.timeoutMs ?? 3000;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`${serverUrl.replace(/\/$/, "")}/global/event`, {
-      headers: { Accept: "text/event-stream" },
-      signal: controller.signal,
-    });
-    if (!response.ok || !response.body) {
-      throw new Error(`SSE request failed with status ${response.status}`);
-    }
+export function cleanupExpiredServes(nowMs?: number) {
+	const registry = normalizeServeRegistry(readServeRegistry());
+	const results: Array<{
+		project_id: string;
+		status: string;
+		reason: string;
+		idleMs?: number | null;
+		idleTimeoutMs?: number;
+	}> = [];
+	for (const entry of registry.entries) {
+		if (entry.status !== "running") continue;
+		const evaluation = evaluateServeIdle(entry, nowMs);
+		if (evaluation.shouldShutdown) {
+			shutdownServe(entry);
+			results.push({
+				project_id: entry.project_id,
+				status: "stopped",
+				reason: evaluation.reason,
+				idleMs: evaluation.idleMs,
+				idleTimeoutMs: evaluation.idleTimeoutMs,
+			});
+		} else {
+			results.push({
+				project_id: entry.project_id,
+				status: entry.status,
+				reason: evaluation.reason,
+				idleMs: evaluation.idleMs,
+				idleTimeoutMs: evaluation.idleTimeoutMs,
+			});
+		}
+	}
+	return {
+		ok: true,
+		checked: results.length,
+		stopped: results.filter((x) => x.status === "stopped").length,
+		results,
+		registryPath: getServeRegistryPath(),
+	};
+}
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    const lines: string[] = [];
-    while (lines.length < maxEvents) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split("\n");
-      buffer = parts.pop() || "";
-      for (const line of parts) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        lines.push(trimmed);
-        if (lines.length >= maxEvents) break;
-      }
-    }
-    try {
-      controller.abort();
-    } catch {}
-    try {
-      await reader.cancel();
-    } catch {}
-    return lines;
-  } catch (error: any) {
-    if (error?.name === "AbortError") {
-      return [];
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
+export async function fetchSseEvents(
+	serverUrl: string,
+	options?: { maxEvents?: number; timeoutMs?: number },
+) {
+	const maxEvents = options?.maxEvents ?? 1;
+	const timeoutMs = options?.timeoutMs ?? 3000;
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const response = await fetch(
+			`${serverUrl.replace(/\/$/, "")}/global/event`,
+			{
+				headers: { Accept: "text/event-stream" },
+				signal: controller.signal,
+			},
+		);
+		if (!response.ok || !response.body) {
+			throw new Error(`SSE request failed with status ${response.status}`);
+		}
+
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		const lines: string[] = [];
+		while (lines.length < maxEvents) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			const parts = buffer.split("\n");
+			buffer = parts.pop() || "";
+			for (const line of parts) {
+				const trimmed = line.trim();
+				if (!trimmed) continue;
+				lines.push(trimmed);
+				if (lines.length >= maxEvents) break;
+			}
+		}
+		try {
+			controller.abort();
+		} catch {}
+		try {
+			await reader.cancel();
+		} catch {}
+		return lines;
+	} catch (error: any) {
+		if (error?.name === "AbortError") {
+			return [];
+		}
+		throw error;
+	} finally {
+		clearTimeout(timeout);
+	}
 }
 
 export function resolveServerUrl(cfg: any, params?: any): string {
-  return asString(params?.opencodeServerUrl) || asString(params?.serverUrl) || getRuntimeConfig(cfg).opencodeServerUrl || "http://127.0.0.1:4096";
+	return (
+		asString(params?.opencodeServerUrl) ||
+		asString(params?.serverUrl) ||
+		getRuntimeConfig(cfg).opencodeServerUrl ||
+		"http://127.0.0.1:4096"
+	);
 }
 
-export async function fetchJsonSafe(url: string): Promise<{ ok: boolean; status?: number; data?: any; error?: string }> {
-  try {
-    const response = await fetch(url);
-    const text = await response.text();
-    let data: any = undefined;
-    try {
-      data = text ? JSON.parse(text) : undefined;
-    } catch {
-      data = text;
-    }
-    return { ok: response.ok, status: response.status, data };
-  } catch (error: any) {
-    return { ok: false, error: error?.message || String(error) };
-  }
+export async function fetchJsonSafe(
+	url: string,
+): Promise<{ ok: boolean; status?: number; data?: any; error?: string }> {
+	try {
+		const response = await fetch(url);
+		const text = await response.text();
+		let data: any;
+		try {
+			data = text ? JSON.parse(text) : undefined;
+		} catch {
+			data = text;
+		}
+		return { ok: response.ok, status: response.status, data };
+	} catch (error: any) {
+		return { ok: false, error: error?.message || String(error) };
+	}
 }
 
 export function resolveSessionForRun(input: {
-  sessionId?: string;
-  runStatus?: BridgeRunStatus | null;
-  sessionList?: any[];
-  runId?: string;
+	sessionId?: string;
+	runStatus?: BridgeRunStatus | null;
+	sessionList?: any[];
+	runId?: string;
 }): { sessionId?: string; strategy: string; score?: number } {
-  const artifactEnvelope = input.runStatus?.envelope as any;
+	const artifactEnvelope = input.runStatus?.envelope as any;
 
-  // Prefer callback/origin correlation over execution lane keys to preserve
-  // "current caller session" integrity when resolving observability surfaces.
-  const callbackTargetSessionId =
-    typeof artifactEnvelope?.callback_target_session_id === "string" ? artifactEnvelope.callback_target_session_id : undefined;
-  const originSessionId = typeof artifactEnvelope?.origin_session_id === "string" ? artifactEnvelope.origin_session_id : undefined;
+	// Prefer callback/origin correlation over execution lane keys to preserve
+	// "current caller session" integrity when resolving observability surfaces.
+	const callbackTargetSessionId =
+		typeof artifactEnvelope?.callback_target_session_id === "string"
+			? artifactEnvelope.callback_target_session_id
+			: undefined;
+	const originSessionId =
+		typeof artifactEnvelope?.origin_session_id === "string"
+			? artifactEnvelope.origin_session_id
+			: undefined;
 
-  const callbackTargetSessionKey =
-    typeof artifactEnvelope?.callback_target_session_key === "string" ? artifactEnvelope.callback_target_session_key : undefined;
-  const originSessionKey = typeof artifactEnvelope?.origin_session_key === "string" ? artifactEnvelope.origin_session_key : undefined;
-  const executionSessionKey = typeof artifactEnvelope?.session_key === "string" ? artifactEnvelope.session_key : undefined;
+	const callbackTargetSessionKey =
+		typeof artifactEnvelope?.callback_target_session_key === "string"
+			? artifactEnvelope.callback_target_session_key
+			: undefined;
+	const originSessionKey =
+		typeof artifactEnvelope?.origin_session_key === "string"
+			? artifactEnvelope.origin_session_key
+			: undefined;
+	const executionSessionKey =
+		typeof artifactEnvelope?.session_key === "string"
+			? artifactEnvelope.session_key
+			: undefined;
 
-  const artifactSessionId =
-    callbackTargetSessionId ||
-    originSessionId ||
-    (typeof artifactEnvelope?.session_id === "string" ? artifactEnvelope.session_id : undefined) ||
-    (typeof artifactEnvelope?.sessionId === "string" ? artifactEnvelope.sessionId : undefined);
+	const artifactSessionId =
+		callbackTargetSessionId ||
+		originSessionId ||
+		(typeof artifactEnvelope?.session_id === "string"
+			? artifactEnvelope.session_id
+			: undefined) ||
+		(typeof artifactEnvelope?.sessionId === "string"
+			? artifactEnvelope.sessionId
+			: undefined);
 
-  const artifactSessionKey = callbackTargetSessionKey || originSessionKey || executionSessionKey;
+	const artifactSessionKey =
+		callbackTargetSessionKey || originSessionKey || executionSessionKey;
 
-  // When callback target key is available, avoid biasing scored fallback toward
-  // execution lane sessions via runId/taskId tokens.
-  const hasCallerSessionKey = Boolean(callbackTargetSessionKey || originSessionKey);
+	// When callback target key is available, avoid biasing scored fallback toward
+	// execution lane sessions via runId/taskId tokens.
+	const hasCallerSessionKey = Boolean(
+		callbackTargetSessionKey || originSessionKey,
+	);
 
-  const resolved = resolveSessionId({
-    explicitSessionId: input.sessionId,
-    runId: hasCallerSessionKey ? undefined : input.runId || input.runStatus?.runId,
-    taskId: hasCallerSessionKey ? undefined : input.runStatus?.taskId,
-    sessionKey: artifactSessionKey,
-    artifactSessionId,
-    sessionList: input.sessionList,
-  });
-  return { sessionId: resolved.sessionId, strategy: resolved.strategy, ...(resolved.score !== undefined ? { score: resolved.score } : {}) };
+	const resolved = resolveSessionId({
+		explicitSessionId: input.sessionId,
+		runId: hasCallerSessionKey
+			? undefined
+			: input.runId || input.runStatus?.runId,
+		taskId: hasCallerSessionKey ? undefined : input.runStatus?.taskId,
+		sessionKey: artifactSessionKey,
+		artifactSessionId,
+		sessionList: input.sessionList,
+	});
+	return {
+		sessionId: resolved.sessionId,
+		strategy: resolved.strategy,
+		...(resolved.score !== undefined ? { score: resolved.score } : {}),
+	};
 }
 
 export async function collectSseEvents(
-  serverUrl: string,
-  scope: EventScope,
-  options?: { limit?: number; timeoutMs?: number; runIdHint?: string; taskIdHint?: string; sessionIdHint?: string }
+	serverUrl: string,
+	scope: EventScope,
+	options?: {
+		limit?: number;
+		timeoutMs?: number;
+		runIdHint?: string;
+		taskIdHint?: string;
+		sessionIdHint?: string;
+	},
 ): Promise<RunEventRecord[]> {
-  const eventPath = scope === "session" ? "/event" : "/global/event";
-  const limit = Math.max(1, asNumber(options?.limit) || DEFAULT_EVENT_LIMIT);
-  const timeoutMs = Math.max(200, asNumber(options?.timeoutMs) || DEFAULT_OBS_TIMEOUT_MS);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  const events: RunEventRecord[] = [];
-  try {
-    const response = await fetch(`${serverUrl.replace(/\/$/, "")}${eventPath}`, {
-      headers: { Accept: "text/event-stream" },
-      signal: controller.signal,
-    });
-    if (!response.ok || !response.body) return events;
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
+	const eventPath = scope === "session" ? "/event" : "/global/event";
+	const limit = Math.max(1, asNumber(options?.limit) || DEFAULT_EVENT_LIMIT);
+	const timeoutMs = Math.max(
+		200,
+		asNumber(options?.timeoutMs) || DEFAULT_OBS_TIMEOUT_MS,
+	);
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
+	const events: RunEventRecord[] = [];
+	try {
+		const response = await fetch(
+			`${serverUrl.replace(/\/$/, "")}${eventPath}`,
+			{
+				headers: { Accept: "text/event-stream" },
+				signal: controller.signal,
+			},
+		);
+		if (!response.ok || !response.body) return events;
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
 
-    while (events.length < limit) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      const parsed = parseSseFramesFromBuffer(buffer);
-      buffer = parsed.remainder;
+		while (events.length < limit) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			buffer += decoder.decode(chunk.value, { stream: true });
+			const parsed = parseSseFramesFromBuffer(buffer);
+			buffer = parsed.remainder;
 
-      for (const frame of parsed.frames) {
-        const typed = normalizeTypedEventV1(frame, scope);
-        events.push({
-          index: events.length,
-          scope,
-          rawLine: frame.raw,
-          data: typed.payload,
-          normalizedKind: typed.kind,
-          summary: typed.summary,
-          lifecycle_state: typed.lifecycleState,
-          files_changed: typed.filesChanged,
-          verify_summary: typed.verifySummary,
-          blockers: typed.blockers,
-          completion_summary: typed.completionSummary,
-          runId: typed.runId || options?.runIdHint,
-          taskId: typed.taskId || options?.taskIdHint,
-          sessionId: typed.sessionId || options?.sessionIdHint,
-          typedEvent: typed,
-          timestamp: new Date().toISOString(),
-        });
-        if (events.length >= limit) break;
-      }
-    }
+			for (const frame of parsed.frames) {
+				const typed = normalizeTypedEventV1(frame, scope);
+				events.push({
+					index: events.length,
+					scope,
+					rawLine: frame.raw,
+					data: typed.payload,
+					normalizedKind: typed.kind,
+					summary: typed.summary,
+					lifecycle_state: typed.lifecycleState,
+					files_changed: typed.filesChanged,
+					verify_summary: typed.verifySummary,
+					blockers: typed.blockers,
+					completion_summary: typed.completionSummary,
+					runId: typed.runId || options?.runIdHint,
+					taskId: typed.taskId || options?.taskIdHint,
+					sessionId: typed.sessionId || options?.sessionIdHint,
+					typedEvent: typed,
+					timestamp: new Date().toISOString(),
+				});
+				if (events.length >= limit) break;
+			}
+		}
 
-    if (events.length < limit && buffer.trim()) {
-      const tail = parseSseFramesFromBuffer(`${buffer}\n\n`);
-      for (const frame of tail.frames) {
-        const typed = normalizeTypedEventV1(frame, scope);
-        events.push({
-          index: events.length,
-          scope,
-          rawLine: frame.raw,
-          data: typed.payload,
-          normalizedKind: typed.kind,
-          summary: typed.summary,
-          lifecycle_state: typed.lifecycleState,
-          files_changed: typed.filesChanged,
-          verify_summary: typed.verifySummary,
-          blockers: typed.blockers,
-          completion_summary: typed.completionSummary,
-          runId: typed.runId || options?.runIdHint,
-          taskId: typed.taskId || options?.taskIdHint,
-          sessionId: typed.sessionId || options?.sessionIdHint,
-          typedEvent: typed,
-          timestamp: new Date().toISOString(),
-        });
-        if (events.length >= limit) break;
-      }
-    }
+		if (events.length < limit && buffer.trim()) {
+			const tail = parseSseFramesFromBuffer(`${buffer}\n\n`);
+			for (const frame of tail.frames) {
+				const typed = normalizeTypedEventV1(frame, scope);
+				events.push({
+					index: events.length,
+					scope,
+					rawLine: frame.raw,
+					data: typed.payload,
+					normalizedKind: typed.kind,
+					summary: typed.summary,
+					lifecycle_state: typed.lifecycleState,
+					files_changed: typed.filesChanged,
+					verify_summary: typed.verifySummary,
+					blockers: typed.blockers,
+					completion_summary: typed.completionSummary,
+					runId: typed.runId || options?.runIdHint,
+					taskId: typed.taskId || options?.taskIdHint,
+					sessionId: typed.sessionId || options?.sessionIdHint,
+					typedEvent: typed,
+					timestamp: new Date().toISOString(),
+				});
+				if (events.length >= limit) break;
+			}
+		}
 
-    try {
-      controller.abort();
-    } catch {}
-    try {
-      await reader.cancel();
-    } catch {}
-    return events;
-  } catch {
-    return events;
-  } finally {
-    clearTimeout(timeout);
-  }
+		try {
+			controller.abort();
+		} catch {}
+		try {
+			await reader.cancel();
+		} catch {}
+		return events;
+	} catch {
+		return events;
+	} finally {
+		clearTimeout(timeout);
+	}
 }
 
-export async function executeHooksAgentCallback(hookBaseUrl: string, hookToken: string, callback: HooksAgentCallbackPayload) {
-  const response = await fetch(`${hookBaseUrl.replace(/\/$/, "")}/hooks/agent`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${hookToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(callback),
-  });
-  const text = await response.text();
-  return {
-    ok: response.ok,
-    status: response.status,
-    body: text,
-  };
+export async function executeHooksAgentCallback(
+	hookBaseUrl: string,
+	hookToken: string,
+	callback: HooksAgentCallbackPayload,
+) {
+	const response = await fetch(
+		`${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CALLBACK_HTTP_PATH}`,
+		{
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${hookToken}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify(callback),
+		},
+	);
+	const text = await response.text();
+	return {
+		ok: response.ok,
+		status: response.status,
+		body: text,
+	};
 }
 
-function coerceLifecycleState(value: string | undefined | null): BridgeLifecycleState {
-  if (!value) return "running";
-  if (
-    value === "queued" ||
-    value === "server_ready" ||
-    value === "session_created" ||
-    value === "prompt_sent" ||
-    value === "planning" ||
-    value === "coding" ||
-    value === "verifying" ||
-    value === "blocked" ||
-    value === "running" ||
-    value === "awaiting_permission" ||
-    value === "stalled" ||
-    value === "failed_retryable" ||
-    value === "failed" ||
-    value === "completed"
-  ) {
-    return value;
-  }
-  return "running";
+function coerceLifecycleState(
+	value: string | undefined | null,
+): BridgeLifecycleState {
+	if (!value) return "running";
+	if (
+		value === "queued" ||
+		value === "server_ready" ||
+		value === "session_created" ||
+		value === "prompt_sent" ||
+		value === "planning" ||
+		value === "coding" ||
+		value === "verifying" ||
+		value === "blocked" ||
+		value === "running" ||
+		value === "awaiting_permission" ||
+		value === "stalled" ||
+		value === "failed" ||
+		value === "completed"
+	) {
+		return value;
+	}
+	return "running";
 }
 
-function isTerminalLifecycleState(state: BridgeLifecycleState): boolean {
-  return state === "completed" || state === "failed";
+
+export async function createSessionForEnvelope(
+	envelope: RoutingEnvelope,
+): Promise<{ sessionId: string; created: any }> {
+	const serverUrl = envelope.opencode_server_url.replace(/\/$/, "");
+	const taggedTitle = buildTaggedSessionTitle({
+		runId: envelope.run_id,
+		taskId: envelope.task_id,
+		requested: envelope.requested_agent_id,
+		resolved: envelope.resolved_agent_id,
+		callbackSession: envelope.callback_target_session_key,
+		callbackSessionId: envelope.callback_target_session_id,
+		projectId: envelope.project_id,
+		repoRoot: envelope.repo_root,
+	});
+	const createdRes = await fetch(`${serverUrl}/session`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ title: taggedTitle }),
+	});
+	const createdText = await createdRes.text();
+	let created: any;
+	try {
+		created = createdText ? JSON.parse(createdText) : null;
+	} catch {
+		created = { raw: createdText };
+	}
+	if (!createdRes.ok) {
+		throw new Error(
+			`session create failed: ${createdRes.status} ${createdText}`,
+		);
+	}
+	const sessionId = asString(created?.id);
+	if (!sessionId) {
+		throw new Error("session create failed: missing session id");
+	}
+	return { sessionId, created };
 }
 
-function buildTerminalEventFromState(state: BridgeLifecycleState, fallback?: OpenCodeEventKind | null): OpenCodeEventKind {
-  if (state === "completed") return "task.completed";
-  if (state === "failed") return "task.failed";
-  return fallback || "task.progress";
-}
-
-function shouldAutoRetryRun(status: BridgeRunStatus): { retry: boolean; reason: string } {
-  if (status.state === "failed_retryable") {
-    return { retry: true, reason: status.callbackError || status.lastSummary || "failed_retryable" };
-  }
-  if (status.attachRun?.signal === "SIGTERM") {
-    return { retry: true, reason: "attach_run_sigterm" };
-  }
-  if ((status.attachRun?.exitCode ?? 0) !== 0 && status.state !== "failed") {
-    return { retry: true, reason: `attach_run_exit_${status.attachRun?.exitCode}` };
-  }
-  return { retry: false, reason: "not_retryable" };
-}
-
-export async function createSessionForEnvelope(envelope: RoutingEnvelope): Promise<{ sessionId: string; created: any }> {
-  const serverUrl = envelope.opencode_server_url.replace(/\/$/, "");
-  const taggedTitle = buildTaggedSessionTitle({
-    runId: envelope.run_id,
-    taskId: envelope.task_id,
-    requested: envelope.requested_agent_id,
-    resolved: envelope.resolved_agent_id,
-    callbackSession: envelope.callback_target_session_key,
-    callbackSessionId: envelope.callback_target_session_id,
-    projectId: envelope.project_id,
-    repoRoot: envelope.repo_root,
-  });
-  const createdRes = await fetch(`${serverUrl}/session`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title: taggedTitle }),
-  });
-  const createdText = await createdRes.text();
-  let created: any;
-  try {
-    created = createdText ? JSON.parse(createdText) : null;
-  } catch {
-    created = { raw: createdText };
-  }
-  if (!createdRes.ok) {
-    throw new Error(`session create failed: ${createdRes.status} ${createdText}`);
-  }
-  const sessionId = asString(created?.id);
-  if (!sessionId) {
-    throw new Error("session create failed: missing session id");
-  }
-  return { sessionId, created };
-}
-
-export async function runAttachExecutionForEnvelope(input: { envelope: RoutingEnvelope; prompt: string; model?: string }) {
-  const taggedTitle = buildTaggedSessionTitle({
-    runId: input.envelope.run_id,
-    taskId: input.envelope.task_id,
-    requested: input.envelope.requested_agent_id,
-    resolved: input.envelope.resolved_agent_id,
-    callbackSession: input.envelope.callback_target_session_key,
-    callbackSessionId: input.envelope.callback_target_session_id,
-    projectId: input.envelope.project_id,
-    repoRoot: input.envelope.repo_root,
-  });
-  const args = [
-    "run",
-    "--attach", input.envelope.opencode_server_url,
-    "--dir", input.envelope.repo_root,
-    "--title", taggedTitle,
-  ];
-  if (input.envelope.execution_agent_explicit && input.envelope.resolved_agent_id) {
-    args.push("--agent", input.envelope.resolved_agent_id);
-  }
-  if (input.model) {
-    args.push("--model", input.model);
-  }
-  args.push(input.prompt);
-  const result = spawnSync("opencode", args, {
-    cwd: input.envelope.repo_root,
-    encoding: "utf8",
-    maxBuffer: 10 * 1024 * 1024,
-  });
-  return {
-    command: "opencode",
-    args,
-    stdout: result.stdout || "",
-    stderr: result.stderr || "",
-    exitCode: typeof result.status === "number" ? result.status : null,
-    signal: result.signal || null,
-  };
-}
-
-export async function maybeSendTerminalCallback(input: {
-  cfg: any;
-  runStatus: BridgeRunStatus;
-  event: OpenCodeEventKind;
-  summary?: string;
+export async function runAttachExecutionForEnvelope(input: {
+	cfg: any;
+	envelope: RoutingEnvelope;
+	prompt: string;
+	model?: string;
 }) {
-  const runtimeCfg = getRuntimeConfig(input.cfg);
-  if (!runtimeCfg.hookBaseUrl || !runtimeCfg.hookToken) {
-    const updated = patchRunStatus(input.runStatus.runId, (current) => ({
-      ...current,
-      callbackError: "hook config missing",
-      callbackAttempts: (current.callbackAttempts || 0) + 1,
-      updatedAt: new Date().toISOString(),
-    }));
-    return { ok: false, skipped: true, reason: "hook_config_missing", runStatus: updated || input.runStatus };
-  }
-
-  if (input.runStatus.callbackSentAt) {
-    return { ok: true, skipped: true, reason: "already_sent", runStatus: input.runStatus };
-  }
-
-  const callback = buildHooksAgentCallback({
-    event: input.event,
-    envelope: input.runStatus.envelope,
-    summary: input.summary || input.runStatus.lastSummary,
-  });
-
-  const attempts = (input.runStatus.callbackAttempts || 0) + 1;
-  try {
-    const result = await executeHooksAgentCallback(runtimeCfg.hookBaseUrl, runtimeCfg.hookToken, callback);
-    const createdAt = new Date().toISOString();
-    appendAudit({
-      taskId: input.runStatus.taskId,
-      runId: input.runStatus.runId,
-      agentId: callback.agentId,
-      requestedAgentId: input.runStatus.envelope.requested_agent_id,
-      resolvedAgentId: input.runStatus.envelope.resolved_agent_id,
-      sessionKey: input.runStatus.envelope.session_key,
-      callbackTargetSessionKey: input.runStatus.envelope.callback_target_session_key,
-      callbackTargetSessionId: input.runStatus.envelope.callback_target_session_id,
-      event: input.event,
-      callbackStatus: result.status,
-      callbackOk: result.ok,
-      callbackBody: result.body,
-      createdAt,
-    });
-    const updated = patchRunStatus(input.runStatus.runId, (current) => ({
-      ...current,
-      callbackAttempts: attempts,
-      callbackSentAt: result.ok ? createdAt : current.callbackSentAt,
-      callbackStatus: result.status,
-      callbackOk: result.ok,
-      callbackBody: result.body,
-      callbackError: result.ok ? undefined : `hook returned status=${result.status}`,
-      updatedAt: createdAt,
-    }));
-    return { ok: result.ok, skipped: false, callback, result, runStatus: updated || input.runStatus };
-  } catch (error: any) {
-    const message = error?.message || String(error);
-    const updated = patchRunStatus(input.runStatus.runId, (current) => ({
-      ...current,
-      callbackAttempts: attempts,
-      callbackError: message,
-      updatedAt: new Date().toISOString(),
-    }));
-    return { ok: false, skipped: false, error: message, runStatus: updated || input.runStatus };
-  }
+	const taggedTitle = buildTaggedSessionTitle({
+		runId: input.envelope.run_id,
+		taskId: input.envelope.task_id,
+		requested: input.envelope.requested_agent_id,
+		resolved: input.envelope.resolved_agent_id,
+		callbackSession: input.envelope.callback_target_session_key,
+		callbackSessionId: input.envelope.callback_target_session_id,
+		callbackDeliver: input.envelope.deliver,
+		projectId: input.envelope.project_id,
+		repoRoot: input.envelope.repo_root,
+	});
+	const args = [
+		"run",
+		"--attach",
+		input.envelope.opencode_server_url,
+		"--dir",
+		input.envelope.repo_root,
+		"--title",
+		taggedTitle,
+	];
+	if (
+		input.envelope.execution_agent_explicit &&
+		input.envelope.resolved_agent_id
+	) {
+		args.push("--agent", input.envelope.resolved_agent_id);
+	}
+	if (input.model) {
+		args.push("--model", input.model);
+	}
+	args.push(input.prompt);
+	const runtimeCfg = getRuntimeConfig(input.cfg);
+	const child = spawn("opencode", args, {
+		cwd: input.envelope.repo_root,
+		detached: true,
+		stdio: "ignore",
+		env: {
+			...process.env,
+			...(runtimeCfg.hookBaseUrl
+				? { OPENCLAW_HOOK_BASE_URL: runtimeCfg.hookBaseUrl }
+				: {}),
+			...(runtimeCfg.hookToken
+				? { OPENCLAW_HOOK_TOKEN: runtimeCfg.hookToken }
+				: {}),
+		},
+	});
+	child.unref();
+	return {
+		command: "opencode",
+		args,
+		stdout: "",
+		stderr: "",
+		exitCode: null,
+		signal: null,
+		pid: child.pid,
+		started: true,
+	};
 }
 
-export async function watchRunToTerminal(input: { cfg: any; runId: string; pollIntervalMs?: number; maxWaitMs?: number }) {
-  const pollIntervalMs = Math.max(250, asNumber(input.pollIntervalMs) || 1000);
-  const maxWaitMs = Math.max(1000, asNumber(input.maxWaitMs) || 5 * 60 * 1000);
-  const runtimeCfg = getRuntimeConfig(input.cfg);
-  const maxAutoRetries = Math.max(0, asNumber((runtimeCfg as any).maxAutoRetries) || 1);
-  let attemptStartedAt = Date.now();
-
-  let current = patchRunStatus(input.runId, (status) => ({
-    ...status,
-    watcherStartedAt: status.watcherStartedAt || new Date().toISOString(),
-    watcherHeartbeatAt: new Date().toISOString(),
-    watcherState: "active",
-    updatedAt: new Date().toISOString(),
-  }));
-  if (!current) {
-    throw new Error(`Run status not found for runId=${input.runId}`);
-  }
-
-  while (Date.now() - attemptStartedAt <= maxWaitMs) {
-    current = readRunStatus(input.runId);
-    if (!current) throw new Error(`Run status disappeared for runId=${input.runId}`);
-
-    const sessionEvents = await collectSseEvents(current.envelope.opencode_server_url, "session", {
-      limit: DEFAULT_EVENT_LIMIT,
-      timeoutMs: Math.max(200, pollIntervalMs),
-      runIdHint: current.runId,
-      taskIdHint: current.taskId,
-      sessionIdHint: current.sessionId,
-    });
-    const globalEvents = sessionEvents.length > 0 ? [] : await collectSseEvents(current.envelope.opencode_server_url, "global", {
-      limit: DEFAULT_EVENT_LIMIT,
-      timeoutMs: Math.max(200, pollIntervalMs),
-      runIdHint: current.runId,
-      taskIdHint: current.taskId,
-      sessionIdHint: current.sessionId,
-    });
-    const events = sessionEvents.length > 0 ? sessionEvents : globalEvents;
-
-    if (events.length > 0) {
-      const summary = summarizeLifecycle(
-        events.map((event) => ({
-          kind: event.normalizedKind,
-          summary: event.summary,
-          lifecycleState: event.lifecycle_state as any,
-          filesChanged: event.files_changed,
-          verifySummary: event.verify_summary as any,
-          blockers: event.blockers,
-          completionSummary: event.completion_summary,
-          timestamp: event.timestamp,
-        }))
-      );
-      current = patchRunStatus(input.runId, (status) => ({
-        ...status,
-        state: coerceLifecycleState(summary.currentState as string | undefined),
-        lastEvent: summary.last_event_kind || status.lastEvent || null,
-        lastSummary: summary.completion_summary || events[events.length - 1]?.summary || status.lastSummary,
-        sessionId: status.sessionId || events.find((event) => event.sessionId)?.sessionId,
-        watcherHeartbeatAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      })) || current;
-    } else {
-      current = patchRunStatus(input.runId, (status) => ({
-        ...status,
-        watcherHeartbeatAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      })) || current;
-    }
-
-    if (current.state === "failed_retryable") {
-      const retryDecision = shouldAutoRetryRun(current);
-      const retryCount = current.retryCount || 0;
-      if (retryDecision.retry && retryCount < maxAutoRetries) {
-        const retriedExecution = await runAttachExecutionForEnvelope({
-          envelope: current.envelope,
-          prompt: current.lastSummary || "Retrying previous execution after retryable failure.",
-        });
-        current = patchRunStatus(input.runId, (status) => ({
-          ...status,
-          retryCount: retryCount + 1,
-          maxAutoRetries,
-          supervisorState: "retrying",
-          retryHistory: [
-            ...(status.retryHistory || []),
-            {
-              at: new Date().toISOString(),
-              reason: retryDecision.reason,
-              retryCount: retryCount + 1,
-              exitCode: retriedExecution.exitCode,
-              signal: retriedExecution.signal,
-            },
-          ],
-          attachRun: retriedExecution,
-          state: retriedExecution.exitCode === 0 ? "running" : "failed_retryable",
-          lastSummary: retriedExecution.exitCode === 0
-            ? `Auto-retry #${retryCount + 1} started after ${retryDecision.reason}`
-            : (retriedExecution.stderr || retriedExecution.stdout || `Auto-retry #${retryCount + 1} failed to start`),
-          watcherCompletedAt: undefined,
-          watcherHeartbeatAt: new Date().toISOString(),
-          watcherState: "active",
-          callbackError: retriedExecution.exitCode === 0 ? undefined : status.callbackError,
-          updatedAt: new Date().toISOString(),
-        })) || current;
-        attemptStartedAt = Date.now();
-        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-        continue;
-      }
-
-      current = patchRunStatus(input.runId, (status) => ({
-        ...status,
-        state: "failed",
-        supervisorState: "exhausted",
-        lastSummary: status.lastSummary || "Retry budget exhausted",
-        watcherCompletedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      })) || current;
-    }
-
-    if (isTerminalLifecycleState(current.state)) {
-      const callback = await maybeSendTerminalCallback({
-        cfg: input.cfg,
-        runStatus: current,
-        event: buildTerminalEventFromState(current.state, current.lastEvent),
-        summary: current.lastSummary,
-      });
-      current = patchRunStatus(input.runId, (status) => ({
-        ...status,
-        supervisorState: status.state === "completed" ? "completed" : (status.supervisorState || "idle"),
-        watcherCompletedAt: new Date().toISOString(),
-        watcherState: callback.ok ? "completed" : "failed",
-        updatedAt: new Date().toISOString(),
-      })) || current;
-      return { ok: callback.ok, terminal: true, runStatus: current, callback };
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-  }
-
-  const sessionTail = current.sessionId
-    ? await fetchJsonSafe(`${current.envelope.opencode_server_url.replace(/\/$/, "")}/session/${current.sessionId}/message`)
-    : { ok: false };
-  const sessionDiff = current.sessionId
-    ? await fetchJsonSafe(`${current.envelope.opencode_server_url.replace(/\/$/, "")}/session/${current.sessionId}/diff`)
-    : { ok: false };
-  const hasMessages = sessionTail.ok && Array.isArray(sessionTail.data) && sessionTail.data.length > 0;
-  const hasDiff = sessionDiff.ok && Array.isArray(sessionDiff.data) && sessionDiff.data.length > 0;
-  const materialized = hasMessages || hasDiff;
-
-  current = patchRunStatus(input.runId, (status) => ({
-    ...status,
-    state: materialized ? "verifying" : "failed_retryable",
-    lastSummary: materialized
-      ? (status.lastSummary || "Execution materialized output before clean terminal event; promoted to verifying")
-      : (status.lastSummary || "Attach-run made no observable progress before timeout; marked retryable"),
-    watcherCompletedAt: materialized ? new Date().toISOString() : undefined,
-    watcherState: materialized ? "completed" : "failed",
-    callbackError: materialized ? status.callbackError : (status.callbackError || "watcher_timeout"),
-    updatedAt: new Date().toISOString(),
-  })) || current;
-
-  if (!materialized) {
-    const retryDecision = shouldAutoRetryRun(current);
-    const retryCount = current.retryCount || 0;
-    if (retryDecision.retry && retryCount < maxAutoRetries) {
-      const retriedExecution = await runAttachExecutionForEnvelope({
-        envelope: current.envelope,
-        prompt: current.lastSummary || "Retrying previous execution after timeout.",
-      });
-      current = patchRunStatus(input.runId, (status) => ({
-        ...status,
-        retryCount: retryCount + 1,
-        maxAutoRetries,
-        supervisorState: "retrying",
-        retryHistory: [
-          ...(status.retryHistory || []),
-          {
-            at: new Date().toISOString(),
-            reason: retryDecision.reason,
-            retryCount: retryCount + 1,
-            exitCode: retriedExecution.exitCode,
-            signal: retriedExecution.signal,
-          },
-        ],
-        attachRun: retriedExecution,
-        state: retriedExecution.exitCode === 0 ? "running" : "failed_retryable",
-        lastSummary: retriedExecution.exitCode === 0
-          ? `Auto-retry #${retryCount + 1} started after ${retryDecision.reason}`
-          : (retriedExecution.stderr || retriedExecution.stdout || `Auto-retry #${retryCount + 1} failed to start`),
-        watcherCompletedAt: undefined,
-        watcherHeartbeatAt: new Date().toISOString(),
-        watcherState: "active",
-        updatedAt: new Date().toISOString(),
-      })) || current;
-      return watchRunToTerminal(input);
-    }
-
-    current = patchRunStatus(input.runId, (status) => ({
-      ...status,
-      state: "failed",
-      supervisorState: "exhausted",
-      watcherCompletedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    })) || current;
-  }
-
-  return { ok: false, terminal: false, timeout: true, materialized, runStatus: current };
+export function buildContinuationCallbackMetadata(input: {
+	runStatus: BridgeRunStatus;
+	eventType: string;
+}): OpenCodeContinuationCallbackMetadata {
+	const continuation = input.runStatus.continuation;
+	return {
+		kind: "opencode.callback",
+		eventType: input.eventType,
+		runId: input.runStatus.runId,
+		taskId: input.runStatus.taskId,
+		projectId: input.runStatus.envelope.project_id,
+		repoRoot: input.runStatus.envelope.repo_root,
+		requestedAgentId: input.runStatus.envelope.requested_agent_id,
+		resolvedAgentId: input.runStatus.envelope.resolved_agent_id,
+		callbackTargetSessionKey:
+			input.runStatus.envelope.callback_target_session_key,
+		callbackTargetSessionId:
+			input.runStatus.envelope.callback_target_session_id,
+		opencodeSessionId: input.runStatus.sessionId,
+		workflowId: continuation?.workflowId,
+		stepId: continuation?.stepId,
+	};
 }
 
 export async function startExecutionRun(input: {
-  cfg: any;
-  envelope: RoutingEnvelope;
-  prompt: string;
-  model?: string;
-  pollIntervalMs?: number;
-  maxWaitMs?: number;
+	cfg: any;
+	envelope: RoutingEnvelope;
+	prompt: string;
+	model?: string;
+	continuation?: OpenCodeRunContinuation;
+	pollIntervalMs?: number;
+	maxWaitMs?: number;
 }) {
-  const initial: BridgeRunStatus = {
-    taskId: input.envelope.task_id,
-    runId: input.envelope.run_id,
-    state: "queued",
-    lastEvent: null,
-    lastSummary: undefined,
-    updatedAt: new Date().toISOString(),
-    envelope: input.envelope,
-    watcherState: "pending",
-    retryCount: 0,
-    maxAutoRetries: Math.max(0, asNumber((getRuntimeConfig(input.cfg) as any).maxAutoRetries) || 1),
-    supervisorState: "idle",
-    retryHistory: [],
-  };
-  writeRunStatus(initial);
+	const initial: BridgeRunStatus = {
+		taskId: input.envelope.task_id,
+		runId: input.envelope.run_id,
+		state: "queued",
+		lastEvent: null,
+		lastSummary: undefined,
+		updatedAt: new Date().toISOString(),
+		envelope: input.envelope,
+		continuation: input.continuation,
+	};
+	writeRunStatus(initial);
 
-  const executionResult = await runAttachExecutionForEnvelope({
-    envelope: input.envelope,
-    prompt: input.prompt,
-    model: input.model,
-  });
+	const executionResult = await runAttachExecutionForEnvelope({
+		cfg: input.cfg,
+		envelope: input.envelope,
+		prompt: input.prompt,
+		model: input.model,
+	});
 
-  const sessionsRes = await fetchJsonSafe(`${input.envelope.opencode_server_url.replace(/\/$/, "")}/session`);
-  const sessionList = sessionsRes.ok && Array.isArray(sessionsRes.data) ? sessionsRes.data : [];
-  const taggedTitle = buildTaggedSessionTitle({
-    runId: input.envelope.run_id,
-    taskId: input.envelope.task_id,
-    requested: input.envelope.requested_agent_id,
-    resolved: input.envelope.resolved_agent_id,
-    callbackSession: input.envelope.callback_target_session_key,
-    callbackSessionId: input.envelope.callback_target_session_id,
-    projectId: input.envelope.project_id,
-    repoRoot: input.envelope.repo_root,
-  });
-  const matchingSessions = sessionList.filter((item: any) => asString(item?.title) === taggedTitle);
-  matchingSessions.sort((a: any, b: any) => Number(b?.time?.updated || 0) - Number(a?.time?.updated || 0));
-  const createdSession = matchingSessions[0];
-  const sessionId = asString(createdSession?.id);
+	const sessionsRes = await fetchJsonSafe(
+		`${input.envelope.opencode_server_url.replace(/\/$/, "")}/session`,
+	);
+	const sessionList =
+		sessionsRes.ok && Array.isArray(sessionsRes.data) ? sessionsRes.data : [];
+	const taggedTitle = buildTaggedSessionTitle({
+		runId: input.envelope.run_id,
+		taskId: input.envelope.task_id,
+		requested: input.envelope.requested_agent_id,
+		resolved: input.envelope.resolved_agent_id,
+		callbackSession: input.envelope.callback_target_session_key,
+		callbackSessionId: input.envelope.callback_target_session_id,
+		callbackDeliver: input.envelope.deliver,
+		projectId: input.envelope.project_id,
+		repoRoot: input.envelope.repo_root,
+	});
+	const matchingSessions = sessionList.filter(
+		(item: any) => asString(item?.title) === taggedTitle,
+	);
+	matchingSessions.sort(
+		(a: any, b: any) =>
+			Number(b?.time?.updated || 0) - Number(a?.time?.updated || 0),
+	);
+	const createdSession = matchingSessions[0];
+	const sessionId = asString(createdSession?.id);
 
-  let current = patchRunStatus(input.envelope.run_id, (status) => ({
-    ...status,
-    sessionId: sessionId || status.sessionId,
-    executionLane: "attach_run",
-    attachRun: executionResult,
-    state: executionResult.exitCode === 0 ? "running" : "failed_retryable",
-    lastSummary: executionResult.exitCode === 0 ? "Attach-run execution started" : (executionResult.stderr || executionResult.stdout || "Attach-run execution failed"),
-    updatedAt: new Date().toISOString(),
-  })) || initial;
+	const current =
+		patchRunStatus(input.envelope.run_id, (status) => ({
+			...status,
+			sessionId: sessionId || status.sessionId,
+			executionLane: "attach_run",
+			attachRun: executionResult,
+			state: executionResult.started ? "running" : "failed",
+			lastSummary: executionResult.started
+				? "Attach-run execution started asynchronously; terminal callback owned by OpenCode-side plugin"
+				: executionResult.stderr ||
+					executionResult.stdout ||
+					"Attach-run execution failed",
+			updatedAt: new Date().toISOString(),
+		})) || initial;
 
-  if (current.state === "failed_retryable" && (current.retryCount || 0) < (current.maxAutoRetries || 0)) {
-    const retryDecision = shouldAutoRetryRun(current);
-    const retriedExecution = await runAttachExecutionForEnvelope({
-      envelope: input.envelope,
-      prompt: current.lastSummary || input.prompt,
-      model: input.model,
-    });
-    current = patchRunStatus(input.envelope.run_id, (status) => ({
-      ...status,
-      retryCount: (status.retryCount || 0) + 1,
-      supervisorState: "retrying",
-      retryHistory: [
-        ...(status.retryHistory || []),
-        {
-          at: new Date().toISOString(),
-          reason: retryDecision.reason,
-          retryCount: (status.retryCount || 0) + 1,
-          exitCode: retriedExecution.exitCode,
-          signal: retriedExecution.signal,
-        },
-      ],
-      attachRun: retriedExecution,
-      state: retriedExecution.exitCode === 0 ? "running" : "failed_retryable",
-      lastSummary: retriedExecution.exitCode === 0
-        ? `Auto-retry #${(status.retryCount || 0) + 1} started after ${retryDecision.reason}`
-        : (retriedExecution.stderr || retriedExecution.stdout || `Auto-retry #${(status.retryCount || 0) + 1} failed to start`),
-      updatedAt: new Date().toISOString(),
-    })) || current;
-  }
-
-  void watchRunToTerminal({
-    cfg: input.cfg,
-    runId: input.envelope.run_id,
-    pollIntervalMs: input.pollIntervalMs,
-    maxWaitMs: input.maxWaitMs,
-  }).catch((error: any) => {
-    patchRunStatus(input.envelope.run_id, (status) => ({
-      ...status,
-      watcherCompletedAt: new Date().toISOString(),
-      watcherState: "failed",
-      callbackError: status.callbackError || error?.message || String(error),
-      updatedAt: new Date().toISOString(),
-    }));
-  });
-
-  return {
-    ok: executionResult.exitCode === 0,
-    runId: input.envelope.run_id,
-    taskId: input.envelope.task_id,
-    sessionId: sessionId || null,
-    state: current.state,
-    watcherStarted: true,
-    attachRun: executionResult,
-  };
+	return {
+		ok: Boolean(executionResult.started),
+		runId: input.envelope.run_id,
+		taskId: input.envelope.task_id,
+		sessionId: sessionId || null,
+		state: current.state,
+		attachRun: executionResult,
+	};
 }
 
 export function buildHookPolicyChecklist(agentId: string, sessionKey: string) {
-  return {
-    primaryCallbackPath: "/hooks/agent",
-    requirements: {
-      hooksEnabled: true,
-      allowRequestSessionKey: true,
-      allowedAgentIdsMustInclude: agentId,
-      allowedSessionKeyPrefixesMustInclude: HOOK_PREFIX,
-      deliverDefault: false,
-    },
-    sessionKey,
-    suggestedConfig: {
-      hooks: {
-        enabled: true,
-        allowRequestSessionKey: true,
-        allowedAgentIds: [agentId],
-        allowedSessionKeyPrefixes: [HOOK_PREFIX],
-      },
-    },
-  };
+	return {
+		primaryCallbackPath: OPENCODE_CALLBACK_HTTP_PATH,
+		requirements: {
+			hooksEnabled: true,
+			allowRequestSessionKey: true,
+			allowedAgentIdsMustInclude: agentId,
+			callbackTargetSessionKeyMustBeExplicit: true,
+			executionSessionKeyPrefix: HOOK_PREFIX,
+			deliverDefault: false,
+		},
+		sessionKey,
+		suggestedConfig: {
+			hooks: {
+				enabled: true,
+				allowRequestSessionKey: true,
+				allowedAgentIds: [agentId],
+			},
+		},
+		note: "callback target session keys are origin-session scoped and are not required to share the execution HOOK_PREFIX",
+	};
 }
-

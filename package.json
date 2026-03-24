@@ -1,6 +1,6 @@
 {
   "name": "@mrc2204/opencode-bridge",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "OpenClaw ↔ OpenCode bridge plugin for hybrid routing, callback orchestration, and multi-project-safe runtime control.",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -28,6 +28,8 @@
     "test": "tsx test/run-tests.ts",
     "materialize:opencode-plugin:project": "node ./scripts/materialize-opencode-plugin.mjs --mode project",
     "materialize:opencode-plugin:global": "node ./scripts/materialize-opencode-plugin.mjs --mode global",
+    "sync:opencode-plugin-config:project": "node ./scripts/sync-opencode-plugin-config.mjs --mode project",
+    "sync:opencode-plugin-config:global": "node ./scripts/sync-opencode-plugin-config.mjs --mode global",
     "install:bridge:project": "node ./scripts/install-bridge.mjs --mode project",
     "install:bridge:global": "node ./scripts/install-bridge.mjs --mode global",
     "prepublishOnly": "npm run build && npm run test"

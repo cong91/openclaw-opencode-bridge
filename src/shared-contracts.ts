@@ -5,9 +5,14 @@ export type BridgeSessionTagFields = {
   resolved: string;
   callbackSession: string;
   callbackSessionId?: string;
+  callbackDeliver?: boolean;
   projectId?: string;
   repoRoot?: string;
+  workflowId?: string;
+  stepId?: string;
 };
+
+export const OPENCODE_CALLBACK_HTTP_PATH = "/plugin/opencode-bridge/callback";
 
 export type OpenCodePluginCallbackAuditRecord = {
   phase?: string;
@@ -34,8 +39,11 @@ export function buildTaggedSessionTitle(fields: BridgeSessionTagFields): string 
     `resolved=${fields.resolved}`,
     `callbackSession=${fields.callbackSession}`,
     ...(fields.callbackSessionId ? [`callbackSessionId=${fields.callbackSessionId}`] : []),
+    ...(fields.callbackDeliver !== undefined ? [`callbackDeliver=${fields.callbackDeliver ? "true" : "false"}`] : []),
     ...(fields.projectId ? [`projectId=${fields.projectId}`] : []),
     ...(fields.repoRoot ? [`repoRoot=${fields.repoRoot}`] : []),
+    ...(fields.workflowId ? [`workflowId=${fields.workflowId}`] : []),
+    ...(fields.stepId ? [`stepId=${fields.stepId}`] : []),
   ].join(" ");
 }
 

@@ -311,6 +311,10 @@ function mapCallbackEventToArtifactState(eventType?: string): {
 	}
 }
 
+function isTerminalState(state?: BridgeRunStatus["state"] | null): boolean {
+	return state === "completed" || state === "failed" || state === "stalled";
+}
+
 function registerCallbackIngressRoute(api: any, cfg: any) {
 	if (
 		typeof api?.registerHttpRoute !== "function" ||
@@ -369,6 +373,9 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			);
 			if (parsed.metadata?.runId) {
 				patchRunStatus(parsed.metadata.runId, (current) => {
+					const preserveTerminal =
+						isTerminalState(current.state) &&
+						(!callbackPersistence || !callbackPersistence.terminal);
 					const summary = parsed.metadata?.eventType
 						? callbackPersistence?.terminal
 							? `Terminal callback materialized (${parsed.metadata.eventType})`
@@ -388,13 +395,15 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					);
 					return {
 						...current,
-						...(callbackPersistence
+						...(callbackPersistence && !preserveTerminal
 							? {
 									state: callbackPersistence.state,
 									lastEvent: callbackPersistence.lastEvent,
 								}
 							: {}),
-						lastSummary: summary,
+						lastSummary: preserveTerminal
+							? current.lastSummary || summary
+							: summary,
 						callbackSentAt: callbackAt,
 						callbackStatus: 200,
 						callbackOk: true,
@@ -514,6 +523,38 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				hasContinuation: Boolean(runStatus?.continuation),
 				continuation: runStatus?.continuation || null,
 			});
+			if (callbackPersistence?.terminal && parsed.metadata?.runId) {
+				const refreshedRun = readRunStatus(parsed.metadata.runId);
+				const attachPid = refreshedRun?.attachRun?.pid;
+				if (typeof attachPid === "number") {
+					let killResult = "not_attempted";
+					try {
+						process.kill(attachPid, "SIGTERM");
+						killResult = "sigterm_sent";
+					} catch (error) {
+						killResult = error instanceof Error ? error.message : String(error);
+					}
+					patchRunStatus(parsed.metadata.runId, (current) => ({
+						...current,
+						attachRun: {
+							...(current.attachRun || {}),
+							cleaned: killResult === "sigterm_sent",
+							cleanedAt: new Date().toISOString(),
+							killSignal: "SIGTERM",
+							killResult,
+						},
+						updatedAt: new Date().toISOString(),
+					}));
+					appendCallbackDebugAudit({
+						phase: "attach_run_pid_killed",
+						runId: parsed.metadata.runId,
+						sessionKey: callback.sessionKey,
+						pid: attachPid,
+						killSignal: "SIGTERM",
+						killResult,
+					});
+				}
+			}
 			if (runStatus?.continuation) {
 				const step =
 					parsed.metadata?.eventType === "task.failed" ||
@@ -1080,10 +1121,14 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					"compaction",
 					"painter",
 				]);
-				const requestedExecutionAgent = asString(params.executionAgentId)?.trim();
-				const normalizedExecutionAgent = requestedExecutionAgent && allowedExecutionAgents.has(requestedExecutionAgent)
-					? requestedExecutionAgent
-					: undefined;
+				const requestedExecutionAgent = asString(
+					params.executionAgentId,
+				)?.trim();
+				const normalizedExecutionAgent =
+					requestedExecutionAgent &&
+					allowedExecutionAgents.has(requestedExecutionAgent)
+						? requestedExecutionAgent
+						: undefined;
 				const continuation = continuationEnabled
 					? {
 							...(workflowId ? { workflowId } : {}),
@@ -1097,11 +1142,11 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					: { promptVariant, thinking: true };
 				const executionEnvelope = normalizedExecutionAgent
 					? {
-						...envelope,
-						agent_id: normalizedExecutionAgent,
-						resolved_agent_id: normalizedExecutionAgent,
-						execution_agent_explicit: true,
-					  }
+							...envelope,
+							agent_id: normalizedExecutionAgent,
+							resolved_agent_id: normalizedExecutionAgent,
+							execution_agent_explicit: true,
+						}
 					: envelope;
 				const execution = await startExecutionRun({
 					cfg,
@@ -1252,10 +1297,14 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 						timestamp: event.timestamp,
 					})),
 				);
-				const state =
-					(lifecycleSummary.currentState as any) ||
-					artifact?.state ||
-					(sessionId ? "running" : "queued");
+				const state = isTerminalState(artifact?.state)
+					? artifact!.state
+					: (lifecycleSummary.currentState as any) ||
+						artifact?.state ||
+						(sessionId ? "running" : "queued");
+				const currentState = isTerminalState(artifact?.state)
+					? artifact!.state
+					: (lifecycleSummary.currentState as any) || state;
 
 				const response: RunStatusResponse = {
 					ok: true,
@@ -1276,8 +1325,8 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 						},
 					},
 					state,
-					currentState: (lifecycleSummary.currentState as any) || state,
-					current_state: (lifecycleSummary.currentState as any) || state,
+					currentState,
+					current_state: currentState,
 					lastEvent: artifact?.lastEvent,
 					last_event_kind: artifact?.lastEvent,
 					lastSummary: artifact?.lastSummary,

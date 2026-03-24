@@ -7,5 +7,6 @@ import "./multi-project-contract-smoke.test";
 import "./plugin-callback-contract.test";
 import "./plugin-openclaw-audit-bridge.test";
 import "./callback-http-route-visible.test";
+import "./pragmatic-visible-smoke.test";
 import "./idle-cleanup.test";
 import "./execution-callback-loop.test";

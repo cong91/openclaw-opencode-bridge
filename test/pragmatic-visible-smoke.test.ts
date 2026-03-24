@@ -38,10 +38,10 @@ function createMockRes() {
   } as any;
 }
 
-test("callback http route enqueues callback, wakes session, and sends visible telegram ack when deliver=true", async () => {
+test("pragmatic smoke: callback arrives, session wakes, and visible telegram confirmation is sent", async () => {
   const routes: RegisteredRoute[] = [];
-  const systemEvents: any[] = [];
-  const heartbeatCalls: any[] = [];
+  const systemEvents: Array<{ text: string; opts: any }> = [];
+  const heartbeats: any[] = [];
   const telegramSends: any[] = [];
 
   registerOpenCodeBridgeTools(
@@ -57,7 +57,7 @@ test("callback http route enqueues callback, wakes session, and sends visible te
             return true;
           },
           requestHeartbeatNow(opts: any) {
-            heartbeatCalls.push(opts);
+            heartbeats.push(opts);
           },
         },
         channel: {
@@ -82,17 +82,19 @@ test("callback http route enqueues callback, wakes session, and sends visible te
     name: "OpenCode",
     agentId: "creator",
     sessionKey: "agent:creator:telegram:direct:5165741309",
-    sessionId: "sess-origin-1",
+    sessionId: "sess-pragmatic-1",
     wakeMode: "now",
     deliver: true,
+    channel: "telegram",
+    to: "5165741309",
     message: JSON.stringify({
       kind: "opencode.callback",
-      eventType: "message.updated",
-      runId: "run-visible-1",
-      taskId: "task-visible-1",
+      eventType: "task.completed",
+      runId: "run-pragmatic-1",
+      taskId: "task-pragmatic-1",
       callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
-      callbackTargetSessionId: "sess-origin-1",
-      opencodeSessionId: "oc-sess-1",
+      callbackTargetSessionId: "sess-pragmatic-1",
+      opencodeSessionId: "oc-sess-pragmatic-1",
     }),
   };
 
@@ -103,11 +105,11 @@ test("callback http route enqueues callback, wakes session, and sends visible te
   assert.equal(handled, true);
   assert.equal(res.statusCode, 200);
   assert.equal(systemEvents.length, 2);
-  assert.match(systemEvents[0].text, /"kind":"opencode.callback"/);
-  assert.match(systemEvents[1].text, /OpenCode callback received for run run-visible-1/);
-  assert.equal(heartbeatCalls.length, 1);
+  assert.equal(systemEvents[0]?.opts?.sessionKey, payload.sessionKey);
+  assert.match(systemEvents[1]?.text, /OpenCode callback received for run run-pragmatic-1/);
+  assert.equal(heartbeats.length, 1);
   assert.equal(telegramSends.length, 1);
   assert.equal(telegramSends[0]?.to, "5165741309");
-  assert.match(telegramSends[0]?.text, /OpenCode callback received for run run-visible-1/);
+  assert.match(telegramSends[0]?.text, /continuing processing in this session/);
   assert.equal(telegramSends[0]?.opts?.silent, false);
 });

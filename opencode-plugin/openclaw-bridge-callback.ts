@@ -230,7 +230,7 @@ async function postCallback(
 		});
 		return { ok: false, status: 0, reason: "missing_hook_env" };
 	}
-	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CALLBACK_HTTP_PATH}`;
+	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}/hooks/agent`;
 	appendAudit(directory, {
 		phase: "callback_attempt",
 		diagnostics: {
@@ -243,7 +243,7 @@ async function postCallback(
 	const response = await fetch(callbackUrl, {
 		method: "POST",
 		headers: {
-			Authorization: `Bearer ${hookToken}`,
+			"x-openclaw-token": hookToken,
 			"Content-Type": "application/json",
 		},
 		body: JSON.stringify(payload),

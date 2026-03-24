@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import * as childProcess from "node:child_process";
 
 import { registerOpenCodeBridgeTools } from "../src/registrar";
 
@@ -115,40 +116,19 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 			res.end(JSON.stringify({ healthy: true, version: "test" }));
 			return;
 		}
-		if (req.method === "POST" && url === "/session") {
-			createdSessionCount += 1;
-			assert.equal(req.headers["x-opencode-directory"], repoRoot);
-			res.setHeader("content-type", "application/json");
-			res.end(
-				JSON.stringify({
-					id: "sess-exec-1",
-					slug: "test-session",
-					version: "1.2.27",
-					projectID: "proj-exec-1",
-					directory: repoRoot,
-					title:
-						"New session - test",
-					time: { created: Date.now(), updated: Date.now() },
-				}),
-			);
-			return;
-		}
-		if (req.method === "POST" && url === "/session/sess-exec-1/prompt_async") {
-			promptAsyncCount += 1;
-			assert.equal(req.headers["x-opencode-directory"], repoRoot);
-			let body = "";
-			req.on("data", (chunk) => {
-				body += chunk.toString();
-			});
-			req.on("end", () => {
-				res.setHeader("content-type", "application/json");
-				res.end(JSON.stringify({ ok: true, accepted: true, body: JSON.parse(body) }));
-			});
-			return;
-		}
 		if (req.method === "GET" && url === "/session") {
 			res.setHeader("content-type", "application/json");
-			res.end(JSON.stringify([{ id: "sess-exec-1" }]));
+			res.end(JSON.stringify([{ id: "sess-exec-1", title: "task-exec-1 runId=run-exec-1 taskId=task-exec-1 requested=creator resolved=creator callbackSession=session:origin:exec-1 callbackSessionId=origin-session-1 callbackDeliver=false projectId=proj-exec-1 repoRoot=" + repoRoot } ]));
+			return;
+		}
+		if (req.method === "GET" && url === "/session/sess-exec-1") {
+			res.setHeader("content-type", "application/json");
+			res.end(JSON.stringify({ id: "sess-exec-1", title: "task-exec-1 runId=run-exec-1 taskId=task-exec-1 requested=creator resolved=creator callbackSession=session:origin:exec-1 callbackSessionId=origin-session-1 callbackDeliver=false projectId=proj-exec-1 repoRoot=" + repoRoot }));
+			return;
+		}
+		if (req.method === "GET" && url === "/session/sess-exec-1/message") {
+			res.setHeader("content-type", "application/json");
+			res.end(JSON.stringify([{ info: { id: "msg_run-exec-1" } }]));
 			return;
 		}
 		if (req.method === "GET" && (url === "/event" || url === "/global/event")) {
@@ -251,7 +231,7 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 		const payload = parseToolJson(result);
 
 		assert.equal(payload.ok, true);
-		assert.equal(payload.execution.sessionId, "sess-exec-1");
+		assert.equal(payload.execution.sessionId, undefined);
 		assert.equal(payload.execution.callbackAuthority, "opencode_plugin");
 		assert.equal(payload.execution.continuationEnabled, true);
 
@@ -266,23 +246,30 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 		assert.equal(existsSync(runPath), true);
 		const runStatus = JSON.parse(readFileSync(runPath, "utf8"));
 		assert.equal(runStatus.state, "running");
-		assert.equal(runStatus.executionLane, "session_api");
+		assert.equal(runStatus.executionLane, "attach_run");
 		assert.equal(runStatus.continuation.workflowId, "wf-exec-1");
 		assert.equal(runStatus.continuation.stepId, "step-exec-1");
 		assert.equal(runStatus.continuation.callbackEventKind, "opencode.callback");
 		assert.equal(runStatus.continuation.nextOnSuccess.action, "notify");
 		assert.equal(runStatus.continuation.nextOnFailure.action, "launch_run");
-		assert.equal(createdSessionCount, 1);
-		assert.equal(promptAsyncCount, 1);
+		assert.equal(createdSessionCount, 0);
+		assert.equal(promptAsyncCount, 0);
 		assert.match(
 			runStatus.lastSummary,
-			/Session created and prompt_async dispatched/,
+			/Attach-run dispatched/,
 		);
 		assert.equal(runStatus.callbackOk, undefined);
 		assert.equal(runStatus.callbackSentAt, undefined);
 		assert.equal(runStatus.callbackAttempts, undefined);
 
 		assert.equal(callbackRequests.length, 0);
+		assert.equal(runStatus.attachRun?.command, "opencode");
+		assert.ok(runStatus.attachRun?.args.includes("--attach"));
+		assert.ok((runStatus.attachRun?.args || []).some((arg: string) => /^http:\/\/127\.0\.0\.1:\d+$/.test(arg)));
+		assert.ok(runStatus.attachRun?.args.includes("--dir"));
+		assert.ok(runStatus.attachRun?.args.includes(repoRoot));
+		assert.ok(runStatus.attachRun?.args.includes("--variant"));
+		assert.ok(runStatus.attachRun?.args.includes("medium"));
 
 		const auditPath = join(
 			harness.stateDir,

@@ -1138,16 +1138,32 @@ function coerceLifecycleState(
 }
 
 
+export function buildTaggedTitleForEnvelope(envelope: RoutingEnvelope): string {
+	return buildTaggedSessionTitle({
+		runId: envelope.run_id,
+		taskId: envelope.task_id,
+		requested: envelope.requested_agent_id,
+		resolved: envelope.resolved_agent_id,
+		callbackSession: envelope.callback_target_session_key,
+		callbackSessionId: envelope.callback_target_session_id,
+		callbackDeliver: envelope.deliver,
+		projectId: envelope.project_id,
+		repoRoot: envelope.repo_root,
+	});
+}
+
 export async function createSessionForEnvelope(
 	envelope: RoutingEnvelope,
 ): Promise<{ sessionId: string; created: any }> {
 	const serverUrl = envelope.opencode_server_url.replace(/\/$/, "");
+	const taggedTitle = buildTaggedTitleForEnvelope(envelope);
 	const createdRes = await fetch(`${serverUrl}/session`, {
 		method: "POST",
 		headers: {
+			"Content-Type": "application/json",
 			"x-opencode-directory": envelope.repo_root,
 		},
-		body: null,
+		body: JSON.stringify({ title: taggedTitle }),
 	});
 	const createdText = await createdRes.text();
 	let created: any;
@@ -1178,11 +1194,45 @@ function resolvePromptAsyncModel(model?: string) {
 	return { providerID: "proxy", modelID: raw };
 }
 
+function normalizePromptVariant(value: unknown): "medium" | "high" | undefined {
+	const raw = asString(value)?.toLowerCase();
+	if (raw === "high" || raw === "hard") return "high";
+	if (raw === "medium") return "medium";
+	return undefined;
+}
+
+function selectPromptVariant(input: {
+	promptVariant?: unknown;
+	priority?: unknown;
+	objective?: unknown;
+	prompt?: unknown;
+	constraints?: unknown;
+	acceptanceCriteria?: unknown;
+}) {
+	const explicit = normalizePromptVariant(input.promptVariant);
+	if (explicit) return explicit;
+	const priority = asString(input.priority)?.toLowerCase();
+	if (priority === "high" || priority === "urgent" || priority === "critical") {
+		return "high";
+	}
+	const objective = asString(input.objective) || "";
+	const prompt = asString(input.prompt) || "";
+	const constraintCount = Array.isArray(input.constraints) ? input.constraints.length : 0;
+	const acceptanceCount = Array.isArray(input.acceptanceCriteria) ? input.acceptanceCriteria.length : 0;
+	const complexityScore =
+		objective.length +
+		prompt.length +
+		constraintCount * 120 +
+		acceptanceCount * 120;
+	return complexityScore >= 900 ? "high" : "medium";
+}
+
 export async function promptAsyncForSession(input: {
 	envelope: RoutingEnvelope;
 	sessionId: string;
 	prompt: string;
 	model?: string;
+	promptVariant?: "medium" | "high";
 }) {
 	const serverUrl = input.envelope.opencode_server_url.replace(/\/$/, "");
 	const payload = {
@@ -1190,6 +1240,7 @@ export async function promptAsyncForSession(input: {
 		...(resolvePromptAsyncModel(input.model)
 			? { model: resolvePromptAsyncModel(input.model) }
 			: {}),
+		...(input.promptVariant ? { reasoningEffort: input.promptVariant } : {}),
 		messageID: `msg_${input.envelope.run_id}`,
 		parts: [
 			{
@@ -1220,7 +1271,53 @@ export async function promptAsyncForSession(input: {
 	if (!response.ok) {
 		throw new Error(`prompt_async failed: ${response.status} ${text}`);
 	}
-	return { ok: true, payload, response: data };
+	return { ok: true, payload, response: data, status: response.status };
+}
+
+export async function verifyPromptAsyncMaterialized(input: {
+	envelope: RoutingEnvelope;
+	sessionId: string;
+	messageId: string;
+	attempts?: number;
+	delayMs?: number;
+}) {
+	const serverUrl = input.envelope.opencode_server_url.replace(/\/$/, "");
+	const attempts = input.attempts ?? 6;
+	const delayMs = input.delayMs ?? 1000;
+	for (let attempt = 0; attempt < attempts; attempt += 1) {
+		const [messageRes, sessionRes] = await Promise.all([
+			fetchJsonSafe(`${serverUrl}/session/${input.sessionId}/message`),
+			fetchJsonSafe(`${serverUrl}/session/${input.sessionId}`),
+		]);
+		const messages = messageRes.ok && Array.isArray(messageRes.data)
+			? messageRes.data
+			: [];
+		const hasMessage = messages.some((message: any) => {
+			const info = message?.info;
+			return (
+				asString(info?.id) === input.messageId ||
+				asString(message?.id) === input.messageId ||
+				asString(info?.parentID) === input.messageId
+			);
+		});
+		const sessionTitle = asString(sessionRes.data?.title);
+		const expectedTitle = buildTaggedTitleForEnvelope(input.envelope);
+		const titleTagged = sessionTitle === expectedTitle;
+		if (hasMessage || titleTagged) {
+			return {
+				ok: true,
+				hasMessage,
+				titleTagged,
+				attempt: attempt + 1,
+				messageCount: messages.length,
+				sessionTitle,
+			};
+		}
+		if (attempt < attempts - 1) {
+			await new Promise((resolve) => setTimeout(resolve, delayMs));
+		}
+	}
+	return { ok: false, hasMessage: false, titleTagged: false };
 }
 
 export async function runAttachExecutionForEnvelope(input: {
@@ -1228,6 +1325,7 @@ export async function runAttachExecutionForEnvelope(input: {
 	envelope: RoutingEnvelope;
 	prompt: string;
 	model?: string;
+	promptVariant?: "medium" | "high";
 }) {
 	const taggedTitle = buildTaggedSessionTitle({
 		runId: input.envelope.run_id,
@@ -1257,6 +1355,9 @@ export async function runAttachExecutionForEnvelope(input: {
 	}
 	if (input.model) {
 		args.push("--model", input.model);
+	}
+	if (input.promptVariant) {
+		args.push("--variant", input.promptVariant);
 	}
 	args.push(input.prompt);
 	const runtimeCfg = getRuntimeConfig(input.cfg);
@@ -1343,26 +1444,19 @@ export async function startExecutionRun(input: {
 			entry.directory === input.envelope.repo_root &&
 			entry.is_current_for_directory === true,
 	);
-	const reuseSessionId = sessionEntry?.session_id;
-	const activeSessionId = reuseSessionId
-		? reuseSessionId
-		: (await createSessionForEnvelope(input.envelope)).sessionId;
-	const promptAsync = await promptAsyncForSession({
+	const promptVariant = selectPromptVariant({
+		promptVariant: input.continuation?.promptVariant,
+		priority: input.envelope.priority,
+		objective: input.prompt,
+		prompt: input.prompt,
+	});
+	const attachRun = await runAttachExecutionForEnvelope({
+		cfg: input.cfg,
 		envelope: input.envelope,
-		sessionId: activeSessionId,
 		prompt: input.prompt,
 		model: input.model,
+		promptVariant,
 	});
-
-	const refreshedSessions = await fetchJsonSafe(
-		`${input.envelope.opencode_server_url.replace(/\/$/, "")}/session`,
-	);
-	const sessionList = refreshedSessions.ok && Array.isArray(refreshedSessions.data)
-		? refreshedSessions.data
-		: [];
-	const activeSession = sessionList.find(
-		(session: any) => asString(session?.id) === activeSessionId,
-	);
 	const nowIso = new Date().toISOString();
 	if (serveEntry) {
 		upsertServeRegistry({
@@ -1371,48 +1465,28 @@ export async function startExecutionRun(input: {
 			updated_at: nowIso,
 		});
 	}
-	const updatedSessionEntry: SessionRegistryEntry = {
-		session_id: activeSessionId,
-		serve_id: serveEntry?.serve_id || input.envelope.opencode_server_url,
-		opencode_server_url: input.envelope.opencode_server_url,
-		directory: input.envelope.repo_root,
-		project_id: input.envelope.project_id,
-		...(asString(activeSession?.title)
-			? { session_title: asString(activeSession?.title) }
-			: {}),
-		session_updated_at:
-			activeSession?.time?.updated
-				? new Date(Number(activeSession.time.updated)).toISOString()
-				: nowIso,
-		status: "active",
-		is_current_for_directory: true,
-		updated_at: nowIso,
-	};
-	upsertSessionRegistry(updatedSessionEntry);
-
 	const current =
 		patchRunStatus(input.envelope.run_id, (status) => ({
 			...status,
-			sessionId: activeSessionId,
-			executionLane: "session_api",
-			state: promptAsync.ok ? "running" : "failed",
-			lastSummary: promptAsync.ok
-				? (reuseSessionId
-					? "Existing session reused and prompt_async dispatched; terminal callback owned by OpenCode-side plugin"
-					: "Session created and prompt_async dispatched; terminal callback owned by OpenCode-side plugin")
-				: "prompt_async execution failed",
+			sessionId: status.sessionId,
+			executionLane: "attach_run",
+			state: attachRun.started ? "running" : "failed",
+			attachRun,
+			lastSummary: attachRun.started
+				? "Attach-run dispatched; terminal callback owned by OpenCode-side plugin"
+				: "attach-run execution failed",
 			updatedAt: new Date().toISOString(),
 		})) || initial;
 
 	return {
-		ok: Boolean(promptAsync.ok),
+		ok: Boolean(attachRun.started),
 		runId: input.envelope.run_id,
 		taskId: input.envelope.task_id,
-		sessionId: activeSessionId,
+		sessionId: undefined,
 		state: current.state,
-		sessionMode: reuseSessionId ? "reused" : "created",
-		createdSession: reuseSessionId ? null : { id: activeSessionId },
-		promptAsync: promptAsync.response,
+		sessionMode: "attach_run",
+		createdSession: null,
+		attachRun,
 	};
 }
 

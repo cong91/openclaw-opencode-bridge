@@ -493,10 +493,12 @@ The current bridge stack already proves these capabilities:
 - callback payload construction for `/hooks/agent`
 - callback execution into OpenClaw hook ingress
 - run-status artifact persistence
-- session-first execution bootstrap (`POST /session` + `prompt_async`)
+- attach-run execution bootstrap (`opencode run --attach <serve> --dir <repoRoot>`)
+- tagged attach-run title metadata via `buildTaggedSessionTitle(...)`
 - directory-scoped routing via `x-opencode-directory`
 - split runtime/session registry baseline (`serves.json` + `sessions.json`)
 - serve spawn / reuse / shutdown / idle-check baseline
+- fail-fast guard when `prompt_async` is accepted but does not materialize into session state
 
 ### What is **not** yet safe to assume
 
@@ -562,9 +564,21 @@ Operational rules:
    - `agent_id`
    - `session_key`
    - `origin_session_key`
+   - `origin_session_id`
+   - `callback_target_session_key`
+   - `callback_target_session_id`
    - `project_id`
    - `repo_root`
    - `opencode_server_url`
+
+5. **Attach-run is the default execution path**
+   - Do not treat `POST /session/{id}/prompt_async` as the primary execution mechanism for bridge-sensitive work.
+   - Use attach-run as the default execution path and reserve session API for observability, inspect, or controlled fallback research.
+
+6. **Suspect runtime / fresh-serve fallback policy**
+   - If a runtime shows hollow session behavior or continuity anomalies, do not keep trusting that runtime blindly.
+   - Treat the affected runtime/session lane as suspect for reuse decisions.
+   - If repeated failure suggests runtime viability issues, prefer spawning a fresh serve/runtime instead of reusing the suspect one.
 
 ### Bridge-aware checklist before handing work to OpenCode
 
@@ -598,12 +612,14 @@ Use when you are about to delegate a concrete task into OpenCode lane and need t
 
 #### `opencode_execute_task`
 Use as the standard serve/plugin-mode execution entrypoint:
-- resolve/reuse a healthy serve runtime
-- create or reuse the current session for the target `directory`
-- create new session via `POST /session` with `x-opencode-directory`
-- send work via `POST /session/{id}/prompt_async` with `x-opencode-directory`
-- persist run artifact plus current-session routing in `sessions.json`
-- do not assume `project -> serve`; execution now routes by `serve + directory + session`
+- resolve/reuse a healthy shared serve runtime
+- primary execution lane = `opencode run --attach <serve> --dir <repoRoot>`
+- attach-run must carry tagged title metadata via `buildTaggedSessionTitle(...)`
+- always send an execution variant on attach-run; default `medium`, escalate to `high` for difficult/high-priority work or when explicitly requested (`hard` should normalize to `high`)
+- rely on the OpenCode-side plugin for terminal callback authority back to `/hooks/agent`
+- persist run artifact and callback continuity metadata locally for observability
+- session API is no longer the primary execution lane; keep it for observability/inspect/fallback research only
+- do not assume `project -> serve`; execution still routes by shared `serve + dir`
 
 #### `opencode_run_status`
 Use to inspect run state and event-derived lifecycle summary.
@@ -664,16 +680,18 @@ When a task must enter OpenCode execution lane, use this order:
    - prefer explicit `--model` if needed
    - report no callback expectation unless a separate tracking path is in place
 4. If using **serve/plugin mode**:
-   - choose or reuse a healthy serve runtime first
+   - choose or reuse a healthy shared serve runtime first
    - choose the target repo by `directory`
-   - resolve the current session for `(serve, directory)` from `sessions.json`
-   - if absent, create a new session with `POST /session` + `x-opencode-directory`
-   - dispatch work with `POST /session/{id}/prompt_async` + `x-opencode-directory`
+   - execute primarily with `opencode run --attach <serve> --dir <repoRoot>`
+   - require tagged title metadata for callback correlation on the attach-run path
+   - always include an execution variant on attach-run: default `medium`, use `high` for difficult/high-priority tasks, and normalize explicit `hard` to `high`
+   - keep callback expectation explicit through `/hooks/agent`
+   - use session API only for observability, tailing, inspect, or fallback research — not as the default execution lane
+   - if a runtime/session becomes suspect, prefer fresh-serve fallback over blind reuse
    - query `GET /permission?directory=...` when permission-state observability is needed
    - resolve project/server via `opencode_resolve_project`
    - or spawn one via `opencode_serve_spawn`
    - build routing envelope via `opencode_build_envelope`
-   - keep callback expectation explicit through `/hooks/agent`
 5. For serve/plugin mode, inspect artifacts as needed:
    - `opencode_run_status`
    - `opencode_run_events`

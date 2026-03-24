@@ -243,6 +243,7 @@ async function postCallback(
 	const response = await fetch(callbackUrl, {
 		method: "POST",
 		headers: {
+			Authorization: `Bearer ${hookToken}`,
 			"x-openclaw-token": hookToken,
 			"Content-Type": "application/json",
 		},

@@ -71,6 +71,7 @@ export type OpenCodeRunContinuation = {
 	callbackEventKind?: "opencode.callback";
 	nextOnSuccess?: OpenCodeRunContinuationStep;
 	nextOnFailure?: OpenCodeRunContinuationStep;
+	promptVariant?: "medium" | "high";
 };
 
 export type OpenCodeContinuationCallbackMetadata = {

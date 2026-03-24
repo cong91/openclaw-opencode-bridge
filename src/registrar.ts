@@ -277,7 +277,14 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			const bearer = typeof authz === "string" && authz.startsWith("Bearer ")
 				? authz.slice("Bearer ".length).trim()
 				: undefined;
-			if (!expectedToken || !bearer || bearer !== expectedToken) {
+			const legacyTokenHeader = req.headers["x-openclaw-token"];
+			const legacyToken = typeof legacyTokenHeader === "string"
+				? legacyTokenHeader.trim()
+				: Array.isArray(legacyTokenHeader)
+					? asString(legacyTokenHeader[0])
+					: undefined;
+			const providedToken = bearer || legacyToken;
+			if (!expectedToken || !providedToken || providedToken !== expectedToken) {
 				sendJson(res, 401, { ok: false, error: "unauthorized" });
 				return true;
 			}
@@ -292,8 +299,16 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				? `opencode:${parsed.metadata.runId}:${parsed.metadata.eventType}`
 				: undefined;
 			const runStatus = parsed.metadata?.runId ? readRunStatus(parsed.metadata.runId) : null;
-			api.runtime.system.enqueueSystemEvent(callback.message, {
+			const preferredSessionId =
+				parsed.metadata?.callbackTargetSessionId || callback.sessionId;
+			const callbackTarget = {
 				sessionKey: callback.sessionKey,
+				...(preferredSessionId ? { sessionId: preferredSessionId } : {}),
+			};
+			const sessionIdMatched = Boolean(preferredSessionId);
+			const fallbackToSessionKey = !preferredSessionId;
+			api.runtime.system.enqueueSystemEvent(callback.message, {
+				...callbackTarget,
 				...(dedupeKey ? { contextKey: dedupeKey } : {}),
 			});
 			if (callback.deliver === true) {
@@ -301,7 +316,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					? `OpenCode callback received for run ${parsed.metadata.runId || "unknown-run"}; continuing processing in this session.`
 					: "OpenCode callback received; continuing processing in this session.";
 				api.runtime.system.enqueueSystemEvent(ackText, {
-					sessionKey: callback.sessionKey,
+					...callbackTarget,
 					...(dedupeKey ? { contextKey: `${dedupeKey}:visible-ack` } : {}),
 				});
 				const telegramDirectMatch = callback.sessionKey.match(/^agent:[^:]+:telegram:direct:(.+)$/);
@@ -356,6 +371,9 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			appendCallbackDebugAudit({
 				phase: "callback_enqueued",
 				sessionKey: callback.sessionKey,
+				sessionId: preferredSessionId || null,
+				sessionIdMatched,
+				fallbackToSessionKey,
 				dedupeKey,
 				runId: parsed.metadata?.runId || null,
 				eventType: parsed.metadata?.eventType || null,
@@ -383,7 +401,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					});
 					const command = `/opencode-continue ${JSON.stringify(commandPayload)}`;
 					api.runtime.system.enqueueSystemEvent(command, {
-						sessionKey: callback.sessionKey,
+						...callbackTarget,
 						...(dedupeKey ? { contextKey: `${dedupeKey}:continuation-command` } : {}),
 					});
 					appendCallbackDebugAudit({
@@ -399,7 +417,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						step.objective || step.prompt || "Next step requires operator notice.",
 					].join("\n");
 					api.runtime.system.enqueueSystemEvent(notifyMessage, {
-						sessionKey: callback.sessionKey,
+						...callbackTarget,
 						...(dedupeKey ? { contextKey: `${dedupeKey}:continuation-notify` } : {}),
 					});
 					appendCallbackDebugAudit({
@@ -899,15 +917,23 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 						],
 					};
 				}
+				const requestedPromptVariant = asString(params.promptVariant)?.toLowerCase();
+				const promptVariant: "medium" | "high" =
+					requestedPromptVariant === "high" ||
+					requestedPromptVariant === "hard" ||
+					asString(params.priority)?.toLowerCase() === "high"
+						? "high"
+						: "medium";
 				const continuation = continuationEnabled
 					? {
 							...(workflowId ? { workflowId } : {}),
 							...(stepId ? { stepId } : {}),
 							callbackEventKind: "opencode.callback" as const,
+							promptVariant,
 							...(nextOnSuccess ? { nextOnSuccess } : {}),
 							...(nextOnFailure ? { nextOnFailure } : {}),
 						}
-					: undefined;
+					: { promptVariant };
 				const execution = await startExecutionRun({
 					cfg,
 					envelope,

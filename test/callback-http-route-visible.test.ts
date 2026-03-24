@@ -10,13 +10,17 @@ type RegisteredRoute = {
   handler: (req: any, res: any) => Promise<boolean>;
 };
 
-function createMockReq(body: string, token: string) {
+function createMockReq(
+  body: string,
+  token: string,
+  authMode: "bearer" | "legacy" = "bearer",
+) {
   const req = new EventEmitter() as any;
   req.method = "POST";
   req.url = "/plugin/opencode-bridge/callback";
-  req.headers = {
-    authorization: `Bearer ${token}`,
-  };
+  req.headers = authMode === "legacy"
+    ? { "x-openclaw-token": token }
+    : { authorization: `Bearer ${token}` };
   process.nextTick(() => {
     req.emit("data", Buffer.from(body, "utf8"));
     req.emit("end");
@@ -104,7 +108,9 @@ test("callback http route enqueues callback, wakes session, and sends visible te
   assert.equal(res.statusCode, 200);
   assert.equal(systemEvents.length, 2);
   assert.match(systemEvents[0].text, /"kind":"opencode.callback"/);
+  assert.equal(systemEvents[0]?.opts?.sessionId, payload.sessionId);
   assert.match(systemEvents[1].text, /OpenCode callback received for run run-visible-1/);
+  assert.equal(systemEvents[1]?.opts?.sessionId, payload.sessionId);
   assert.equal(heartbeatCalls.length, 1);
   assert.equal(telegramSends.length, 1);
   assert.equal(telegramSends[0]?.to, "5165741309");

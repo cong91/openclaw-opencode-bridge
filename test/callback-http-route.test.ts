@@ -10,13 +10,17 @@ type RegisteredRoute = {
   handler: (req: any, res: any) => Promise<boolean>;
 };
 
-function createMockReq(body: string, token: string) {
+function createMockReq(
+  body: string,
+  token: string,
+  authMode: "bearer" | "legacy" = "bearer",
+) {
   const req = new EventEmitter() as any;
   req.method = "POST";
   req.url = "/plugin/opencode-bridge/callback";
-  req.headers = {
-    authorization: `Bearer ${token}`,
-  };
+  req.headers = authMode === "legacy"
+    ? { "x-openclaw-token": token }
+    : { authorization: `Bearer ${token}` };
   process.nextTick(() => {
     req.emit("data", Buffer.from(body, "utf8"));
     req.emit("end");
@@ -96,6 +100,7 @@ test("callback http route enqueues callback message into target session and wake
   assert.equal(systemEvents.length, 1);
   assert.equal(systemEvents[0]?.text, payload.message);
   assert.equal(systemEvents[0]?.opts?.sessionKey, payload.sessionKey);
+  assert.equal(systemEvents[0]?.opts?.sessionId, payload.sessionId);
   assert.equal(systemEvents[0]?.opts?.contextKey, "opencode:run-1:session.idle");
   assert.equal(heartbeats.length, 1);
 });

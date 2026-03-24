@@ -121,6 +121,9 @@ test("callback http route enqueues callback message into target session and wake
 		"opencode:run-1:session.idle",
 	);
 	assert.equal(heartbeats.length, 1);
+	assert.equal(heartbeats[0]?.sessionKey, payload.sessionKey);
+	assert.equal(heartbeats[0]?.sessionId, payload.sessionId);
+	assert.equal(heartbeats[0]?.agentId, payload.agentId);
 });
 
 test("callback http route materializes terminal run artifact on message.updated callback", async () => {

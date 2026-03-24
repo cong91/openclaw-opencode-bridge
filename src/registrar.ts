@@ -315,6 +315,12 @@ function isTerminalState(state?: BridgeRunStatus["state"] | null): boolean {
 	return state === "completed" || state === "failed" || state === "stalled";
 }
 
+function deriveAgentIdFromSessionKey(sessionKey?: string): string | undefined {
+	if (!sessionKey) return undefined;
+	const matched = sessionKey.match(/^agent:([^:]+):/);
+	return matched?.[1];
+}
+
 function registerCallbackIngressRoute(api: any, cfg: any) {
 	if (
 		typeof api?.registerHttpRoute !== "function" ||
@@ -506,8 +512,12 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				}
 			}
 			if ((callback.wakeMode || "now") === "now") {
+				const wakeAgentId =
+					callback.agentId || deriveAgentIdFromSessionKey(callback.sessionKey);
 				api.runtime.system.requestHeartbeatNow({
 					reason: dedupeKey || "opencode-callback",
+					...callbackTarget,
+					...(wakeAgentId ? { agentId: wakeAgentId } : {}),
 				});
 			}
 			appendCallbackDebugAudit({

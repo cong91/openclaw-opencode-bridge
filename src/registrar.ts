@@ -454,11 +454,17 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				...callbackTarget,
 				...(dedupeKey ? { contextKey: dedupeKey } : {}),
 			});
+			const callbackEventType = parsed.metadata?.eventType;
+			const callbackLooksTerminal =
+				callbackEventType === "message.updated" ||
+				callbackEventType === "task.completed" ||
+				callbackEventType === "task.failed" ||
+				callbackEventType === "task.stalled";
+			const callbackAckText = parsed.metadata
+				? `OpenCode callback received for run ${parsed.metadata.runId || "unknown-run"}; ${callbackLooksTerminal ? "code finished; " : ""}agent is continuing.`
+				: "OpenCode callback received; agent is continuing.";
 			if (callback.deliver === true) {
-				const ackText = parsed.metadata
-					? `OpenCode callback received for run ${parsed.metadata.runId || "unknown-run"}; continuing processing in this session.`
-					: "OpenCode callback received; continuing processing in this session.";
-				api.runtime.system.enqueueSystemEvent(ackText, {
+				api.runtime.system.enqueueSystemEvent(callbackAckText, {
 					...callbackTarget,
 					...(dedupeKey ? { contextKey: `${dedupeKey}:visible-ack` } : {}),
 				});
@@ -468,49 +474,47 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					sessionId: preferredSessionId || null,
 					dedupeKey,
 					runId: parsed.metadata?.runId || null,
-					ackText,
+					ackText: callbackAckText,
 				});
-				const telegramDirectMatch = callback.sessionKey.match(
-					/^agent:[^:]+:telegram:direct:(.+)$/,
-				);
-				const telegramDirectTo =
-					asString(callback.to) || telegramDirectMatch?.[1];
-				if (
-					(callback.channel === "telegram" || telegramDirectTo) &&
-					typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
-						"function" &&
-					telegramDirectTo
-				) {
-					try {
-						await api.runtime.channel.telegram.sendMessageTelegram(
-							telegramDirectTo,
-							ackText,
-							{
-								...(dedupeKey
-									? { contextKey: `${dedupeKey}:visible-ack:telegram` }
-									: {}),
-								silent: false,
-							},
-						);
-						appendCallbackDebugAudit({
-							phase: "visible_ack_telegram_sent",
-							sessionKey: callback.sessionKey,
-							telegramTo: telegramDirectTo,
-							dedupeKey,
-							runId: parsed.metadata?.runId || null,
-							ackText,
-						});
-					} catch (error) {
-						appendCallbackDebugAudit({
-							phase: "visible_ack_telegram_failed",
-							sessionKey: callback.sessionKey,
-							telegramTo: telegramDirectTo,
-							dedupeKey,
-							runId: parsed.metadata?.runId || null,
-							ackText,
-							error: error instanceof Error ? error.message : String(error),
-						});
-					}
+			}
+			const telegramDirectMatch = callback.sessionKey.match(
+				/^agent:[^:]+:telegram:direct:(.+)$/,
+			);
+			const telegramDirectTo = telegramDirectMatch?.[1];
+			if (
+				typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
+					"function" &&
+				telegramDirectTo
+			) {
+				try {
+					await api.runtime.channel.telegram.sendMessageTelegram(
+						telegramDirectTo,
+						callbackAckText,
+						{
+							...(dedupeKey
+								? { contextKey: `${dedupeKey}:callback-telegram-ack` }
+								: {}),
+							silent: false,
+						},
+					);
+					appendCallbackDebugAudit({
+						phase: "callback_telegram_ack_sent",
+						sessionKey: callback.sessionKey,
+						telegramTo: telegramDirectTo,
+						dedupeKey,
+						runId: parsed.metadata?.runId || null,
+						ackText: callbackAckText,
+					});
+				} catch (error) {
+					appendCallbackDebugAudit({
+						phase: "callback_telegram_ack_failed",
+						sessionKey: callback.sessionKey,
+						telegramTo: telegramDirectTo,
+						dedupeKey,
+						runId: parsed.metadata?.runId || null,
+						ackText: callbackAckText,
+						error: error instanceof Error ? error.message : String(error),
+					});
 				}
 			}
 			if ((callback.wakeMode || "now") === "now") {

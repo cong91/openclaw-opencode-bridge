@@ -115,7 +115,7 @@ test("callback http route enqueues callback, wakes session, and sends visible te
 	assert.equal(systemEvents[0]?.opts?.sessionId, payload.sessionId);
 	assert.match(
 		systemEvents[1].text,
-		/OpenCode callback received for run run-visible-1/,
+		/OpenCode callback received for run run-visible-1; code finished; agent is continuing\./,
 	);
 	assert.equal(systemEvents[1]?.opts?.sessionId, payload.sessionId);
 	assert.equal(heartbeatCalls.length, 1);
@@ -126,7 +126,162 @@ test("callback http route enqueues callback, wakes session, and sends visible te
 	assert.equal(telegramSends[0]?.to, "5165741309");
 	assert.match(
 		telegramSends[0]?.text,
-		/OpenCode callback received for run run-visible-1/,
+		/OpenCode callback received for run run-visible-1; code finished; agent is continuing\./,
 	);
 	assert.equal(telegramSends[0]?.opts?.silent, false);
+});
+
+test("callback http route sends direct telegram ack even when deliver=false", async () => {
+	const routes: RegisteredRoute[] = [];
+	const systemEvents: any[] = [];
+	const heartbeatCalls: any[] = [];
+	const telegramSends: any[] = [];
+
+	registerOpenCodeBridgeTools(
+		{
+			registerTool() {},
+			registerHttpRoute(route: RegisteredRoute) {
+				routes.push(route);
+			},
+			runtime: {
+				system: {
+					enqueueSystemEvent(text: string, opts: any) {
+						systemEvents.push({ text, opts });
+						return true;
+					},
+					requestHeartbeatNow(opts: any) {
+						heartbeatCalls.push(opts);
+					},
+				},
+				channel: {
+					telegram: {
+						async sendMessageTelegram(to: string, text: string, opts: any) {
+							telegramSends.push({ to, text, opts });
+							return { ok: true, channel: "telegram", to };
+						},
+					},
+				},
+			},
+		},
+		{
+			hookToken: "test-token",
+		},
+	);
+
+	const route = routes.find(
+		(x) => x.path === "/plugin/opencode-bridge/callback",
+	);
+	assert.ok(route, "callback route should be registered");
+
+	const payload = {
+		name: "OpenCode",
+		agentId: "creator",
+		sessionKey: "agent:creator:telegram:direct:5165741309",
+		sessionId: "sess-origin-2",
+		wakeMode: "now",
+		deliver: false,
+		message: JSON.stringify({
+			kind: "opencode.callback",
+			eventType: "message.updated",
+			runId: "run-visible-2",
+			taskId: "task-visible-2",
+			callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackTargetSessionId: "sess-origin-2",
+			opencodeSessionId: "oc-sess-2",
+		}),
+	};
+
+	const req = createMockReq(JSON.stringify(payload), "test-token");
+	const res = createMockRes();
+	const handled = await route!.handler(req, res);
+
+	assert.equal(handled, true);
+	assert.equal(res.statusCode, 200);
+	assert.equal(systemEvents.length, 1);
+	assert.match(systemEvents[0].text, /OpenCode callback control message/);
+	assert.equal(heartbeatCalls.length, 1);
+	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
+	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);
+	assert.equal(heartbeatCalls[0]?.agentId, payload.agentId);
+	assert.equal(telegramSends.length, 1);
+	assert.equal(telegramSends[0]?.to, "5165741309");
+	assert.match(
+		telegramSends[0]?.text,
+		/OpenCode callback received for run run-visible-2; code finished; agent is continuing\./,
+	);
+	assert.equal(telegramSends[0]?.opts?.silent, false);
+});
+
+test("callback http route does not send telegram ack for telegram group session", async () => {
+	const routes: RegisteredRoute[] = [];
+	const systemEvents: any[] = [];
+	const heartbeatCalls: any[] = [];
+	const telegramSends: any[] = [];
+
+	registerOpenCodeBridgeTools(
+		{
+			registerTool() {},
+			registerHttpRoute(route: RegisteredRoute) {
+				routes.push(route);
+			},
+			runtime: {
+				system: {
+					enqueueSystemEvent(text: string, opts: any) {
+						systemEvents.push({ text, opts });
+						return true;
+					},
+					requestHeartbeatNow(opts: any) {
+						heartbeatCalls.push(opts);
+					},
+				},
+				channel: {
+					telegram: {
+						async sendMessageTelegram(to: string, text: string, opts: any) {
+							telegramSends.push({ to, text, opts });
+							return { ok: true, channel: "telegram", to };
+						},
+					},
+				},
+			},
+		},
+		{
+			hookToken: "test-token",
+		},
+	);
+
+	const route = routes.find(
+		(x) => x.path === "/plugin/opencode-bridge/callback",
+	);
+	assert.ok(route, "callback route should be registered");
+
+	const payload = {
+		name: "OpenCode",
+		agentId: "creator",
+		sessionKey: "agent:creator:telegram:group:-10011223344",
+		sessionId: "sess-group-1",
+		wakeMode: "now",
+		deliver: false,
+		message: JSON.stringify({
+			kind: "opencode.callback",
+			eventType: "message.updated",
+			runId: "run-group-1",
+			taskId: "task-group-1",
+			callbackTargetSessionKey: "agent:creator:telegram:group:-10011223344",
+			callbackTargetSessionId: "sess-group-1",
+			opencodeSessionId: "oc-sess-group-1",
+		}),
+	};
+
+	const req = createMockReq(JSON.stringify(payload), "test-token");
+	const res = createMockRes();
+	const handled = await route!.handler(req, res);
+
+	assert.equal(handled, true);
+	assert.equal(res.statusCode, 200);
+	assert.equal(systemEvents.length, 1);
+	assert.match(systemEvents[0].text, /OpenCode callback control message/);
+	assert.equal(heartbeatCalls.length, 1);
+	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
+	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);
+	assert.equal(telegramSends.length, 0);
 });

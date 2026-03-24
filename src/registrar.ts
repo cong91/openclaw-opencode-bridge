@@ -1,4 +1,5 @@
 import { appendFileSync, mkdirSync } from "node:fs";
+import { execSync } from "node:child_process";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import type { EventScope } from "./observability";
@@ -25,6 +26,7 @@ import {
 	getServeRegistryPath,
 	getSessionRegistryPath,
 	listRunStatuses,
+	listLiveOpencodeServeProcesses,
 	normalizeRegistry,
 	normalizeServeRegistry,
 	normalizeSessionRegistry,
@@ -1808,6 +1810,121 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				return {
 					content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
 					...(result.ok ? {} : { isError: true }),
+				};
+			},
+		},
+		{ optional: true },
+	);
+
+	api.registerTool(
+		{
+			name: "opencode_process_audit",
+			label: "OpenCode Process Audit",
+			description:
+				"Classify OpenCode processes into active/orphan/stale buckets for shared-serve runtime hygiene.",
+			parameters: { type: "object", properties: {} },
+			async execute() {
+				const registry = normalizeServeRegistry(readServeRegistry());
+				const activeServePids = new Set(
+					registry.entries
+						.filter((entry) => entry.status === "running" && typeof entry.pid === "number")
+						.map((entry) => entry.pid as number),
+				);
+				const runStatuses = listRunStatuses();
+				const activeAttachPids = new Map<number, BridgeRunStatus>();
+				for (const run of runStatuses) {
+					const pid = run.attachRun?.pid;
+					if (typeof pid === "number") activeAttachPids.set(pid, run);
+				}
+				const processes = listLiveOpencodeServeProcesses();
+				const serveProcesses = processes.map((item: { pid: number; serverUrl: string }) => ({
+					pid: item.pid,
+					serverUrl: item.serverUrl,
+					class: activeServePids.has(item.pid) ? "active_serve" : "orphan_serve",
+				}));
+				return {
+					content: [{
+						type: "text",
+						text: JSON.stringify({
+							ok: true,
+							activeServeRegistry: registry.entries,
+							serveProcesses,
+							attachRunArtifacts: runStatuses.map((run) => ({
+								runId: run.runId,
+								state: run.state,
+								pid: run.attachRun?.pid,
+								repoRoot: run.envelope.repo_root,
+								serverUrl: run.envelope.opencode_server_url,
+								classification: typeof run.attachRun?.pid === "number"
+									? (run.state === "running" || run.state === "queued" || run.state === "planning" || run.state === "awaiting_permission" || run.state === "stalled"
+										? "active_attach_run"
+										: "stale_attach_run")
+									: "no_pid",
+							})),
+						}, null, 2),
+					}],
+				};
+			},
+		},
+		{ optional: true },
+	);
+
+	api.registerTool(
+		{
+			name: "opencode_process_cleanup",
+			label: "OpenCode Process Cleanup",
+			description:
+				"Dry-run/apply cleanup for orphan serves and stale/orphan attach-run processes.",
+			parameters: {
+				type: "object",
+				properties: {
+					apply: { type: "boolean" },
+				},
+			},
+			async execute(_id: string, params: any) {
+				const apply = params?.apply === true;
+				const registry = normalizeServeRegistry(readServeRegistry());
+				const activeServePids = new Set(
+					registry.entries
+						.filter((entry) => entry.status === "running" && typeof entry.pid === "number")
+						.map((entry) => entry.pid as number),
+				);
+				const runStatuses = listRunStatuses();
+				const keepAttachPids = new Set<number>();
+				for (const run of runStatuses) {
+					const pid = run.attachRun?.pid;
+					if (typeof pid === "number" && (run.state === "running" || run.state === "queued" || run.state === "planning" || run.state === "awaiting_permission" || run.state === "stalled")) {
+						keepAttachPids.add(pid);
+					}
+				}
+				const ps = execSync("ps -axo pid,command", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+				const actions: any[] = [];
+				const selfPid = process.pid;
+				const parentPid = process.ppid;
+				for (const line of ps.split("\n")) {
+					const match = line.trim().match(/^(\d+)\s+(.*)$/);
+					if (!match) continue;
+					const pid = Number(match[1]);
+					const cmd = match[2];
+					if (pid === selfPid || pid === parentPid) continue;
+					if (cmd.startsWith("opencode serve --hostname 127.0.0.1 --port")) {
+						if (!activeServePids.has(pid)) {
+							actions.push({ pid, kind: "orphan_serve", action: apply ? "killed" : "would_kill" });
+							if (apply) {
+								try { process.kill(pid, "SIGTERM"); } catch {}
+							}
+						}
+					} else if (cmd.startsWith("opencode run --attach")) {
+						if (!keepAttachPids.has(pid)) {
+							actions.push({ pid, kind: "orphan_or_stale_attach_run", action: apply ? "killed" : "would_kill" });
+							if (apply) {
+								try { process.kill(pid, "SIGTERM"); } catch {}
+							}
+						}
+					}
+				}
+				return {
+					content: [{ type: "text", text: JSON.stringify({ ok: true, apply, actions }, null, 2) }],
 				};
 			},
 		},

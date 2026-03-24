@@ -1,9 +1,12 @@
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
+	openSync,
+	closeSync,
 	readdirSync,
 	readFileSync,
+	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
@@ -709,56 +712,122 @@ export async function isServeBoundToRepo(
 	return binding.ok && binding.directory === repoRoot;
 }
 
+export function getServeSpawnLockPath() {
+	return join(getBridgeStateDir(), "serve-spawn.lock");
+}
+
+export function listLiveOpencodeServeProcesses(): Array<{ pid: number; serverUrl: string }> {
+	try {
+		const out = execSync("ps -axo pid,command | rg 'opencode serve --hostname 127.0.0.1 --port'", {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return out
+			.split("\n")
+			.map((line: string) => line.trim())
+			.filter(Boolean)
+			.map((line: string) => {
+				const match = line.match(/^(\d+)\s+.*--port\s+(\d+)/);
+				if (!match) return null;
+				const pid = Number(match[1]);
+				const port = Number(match[2]);
+				if (!Number.isFinite(pid) || !Number.isFinite(port)) return null;
+				return { pid, serverUrl: `http://127.0.0.1:${port}` };
+			})
+			.filter(Boolean) as Array<{ pid: number; serverUrl: string }>;
+	} catch {
+		return [];
+	}
+}
+
+async function withServeSpawnLock<T>(fn: () => Promise<T>): Promise<T> {
+	const lockPath = getServeSpawnLockPath();
+	let fd: number | undefined;
+	for (let attempt = 0; attempt < 40; attempt += 1) {
+		try {
+			fd = openSync(lockPath, "wx");
+			break;
+		} catch {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	}
+	if (fd === undefined) throw new Error("serve spawn lock timeout");
+	try {
+		return await fn();
+	} finally {
+		try { closeSync(fd); } catch {}
+		try { unlinkSync(lockPath); } catch {}
+	}
+}
+
 export async function spawnServeForProject(input: {
 	project_id: string;
 	repo_root: string;
 	idle_timeout_ms?: number;
 }) {
-	const registry = normalizeServeRegistry(readServeRegistry());
-	for (const existing of registry.entries) {
-		if (existing.status !== "running") continue;
-		const healthy = await waitForHealth(existing.opencode_server_url, 2000);
-		if (!healthy) continue;
-		return {
-			reused: true,
-			entry: existing,
-			registryPath: getServeRegistryPath(),
-		};
-	}
-	const port = await allocatePort();
-	const runtimeCfg = getRuntimeConfig({});
-	const child = spawn(
-		"opencode",
-		["serve", "--hostname", "127.0.0.1", "--port", String(port)],
-		{
-			cwd: input.repo_root,
-			detached: true,
-			stdio: "ignore",
-			env: {
-				...process.env,
-				...(runtimeCfg.hookBaseUrl
-					? { OPENCLAW_HOOK_BASE_URL: runtimeCfg.hookBaseUrl }
-					: {}),
-				...(runtimeCfg.hookToken
-					? { OPENCLAW_HOOK_TOKEN: runtimeCfg.hookToken }
-					: {}),
+	return await withServeSpawnLock(async () => {
+		const registry = normalizeServeRegistry(readServeRegistry());
+		for (const existing of registry.entries) {
+			if (existing.status !== "running") continue;
+			const healthy = await waitForHealth(existing.opencode_server_url, 2000);
+			if (!healthy) continue;
+			return {
+				reused: true,
+				entry: existing,
+				registryPath: getServeRegistryPath(),
+				reuseStrategy: "registry_running",
+			};
+		}
+		for (const live of listLiveOpencodeServeProcesses()) {
+			const healthy = await waitForHealth(live.serverUrl, 2000);
+			if (!healthy) continue;
+			const entry: ServeRegistryEntry = {
+				serve_id: live.serverUrl,
+				opencode_server_url: live.serverUrl,
+				pid: live.pid,
+				status: "running",
+				last_event_at: new Date().toISOString(),
+				idle_timeout_ms: input.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS,
+				updated_at: new Date().toISOString(),
+			};
+			const result = upsertServeRegistry(entry);
+			return { reused: true, adopted: true, entry, registryPath: result.path, reuseStrategy: "live_process_adopted" };
+		}
+		const port = await allocatePort();
+		const runtimeCfg = getRuntimeConfig({});
+		const child = spawn(
+			"opencode",
+			["serve", "--hostname", "127.0.0.1", "--port", String(port)],
+			{
+				cwd: input.repo_root,
+				detached: true,
+				stdio: "ignore",
+				env: {
+					...process.env,
+					...(runtimeCfg.hookBaseUrl
+						? { OPENCLAW_HOOK_BASE_URL: runtimeCfg.hookBaseUrl }
+						: {}),
+					...(runtimeCfg.hookToken
+						? { OPENCLAW_HOOK_TOKEN: runtimeCfg.hookToken }
+						: {}),
+				},
 			},
-		},
-	);
-	child.unref();
-	const serverUrl = `http://127.0.0.1:${port}`;
-	const healthy = await waitForHealth(serverUrl, 10000);
-	const entry: ServeRegistryEntry = {
-		serve_id: serverUrl,
-		opencode_server_url: serverUrl,
-		pid: child.pid,
-		status: healthy ? "running" : "unknown",
-		last_event_at: new Date().toISOString(),
-		idle_timeout_ms: input.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS,
-		updated_at: new Date().toISOString(),
-	};
-	const result = upsertServeRegistry(entry);
-	return { reused: false, entry, healthy, registryPath: result.path };
+		);
+		child.unref();
+		const serverUrl = `http://127.0.0.1:${port}`;
+		const healthy = await waitForHealth(serverUrl, 10000);
+		const entry: ServeRegistryEntry = {
+			serve_id: serverUrl,
+			opencode_server_url: serverUrl,
+			pid: child.pid,
+			status: healthy ? "running" : "unknown",
+			last_event_at: new Date().toISOString(),
+			idle_timeout_ms: input.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS,
+			updated_at: new Date().toISOString(),
+		};
+		const result = upsertServeRegistry(entry);
+		return { reused: false, entry, healthy, registryPath: result.path, reuseStrategy: "spawned_new" };
+	});
 }
 
 export function markServeStopped(serveId: string) {

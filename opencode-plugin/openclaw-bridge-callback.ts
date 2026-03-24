@@ -2,8 +2,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	buildPluginCallbackDedupeKey,
-	parseTaggedSessionTitle,
 	OPENCODE_CALLBACK_HTTP_PATH,
+	parseTaggedSessionTitle,
 } from "../src/shared-contracts";
 import type { OpenCodeContinuationCallbackMetadata } from "../src/types";
 
@@ -54,13 +54,31 @@ function loadPersistedPluginConfig(directory: string): PersistedPluginConfig {
 	const candidates = [
 		join(directory, ".opencode", "plugins", "openclaw-bridge", "config.json"),
 		join(directory, ".opencode", "openclaw-bridge-callback.json"),
-		join(directory, ".opencode", "plugins", "openclaw-bridge-callback.config.json"),
+		join(
+			directory,
+			".opencode",
+			"plugins",
+			"openclaw-bridge-callback.config.json",
+		),
 		...(home
 			? [
-					join(home, ".config", "opencode", "plugins", "openclaw-bridge", "config.json"),
+					join(
+						home,
+						".config",
+						"opencode",
+						"plugins",
+						"openclaw-bridge",
+						"config.json",
+					),
 					join(home, ".config", "opencode", "openclaw-bridge-callback.json"),
-					join(home, ".config", "opencode", "plugins", "openclaw-bridge-callback.config.json"),
-			  ]
+					join(
+						home,
+						".config",
+						"opencode",
+						"plugins",
+						"openclaw-bridge-callback.config.json",
+					),
+				]
 			: []),
 	];
 	for (const path of candidates) {
@@ -230,7 +248,7 @@ async function postCallback(
 		});
 		return { ok: false, status: 0, reason: "missing_hook_env" };
 	}
-	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}/hooks/agent`;
+	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CALLBACK_HTTP_PATH}`;
 	appendAudit(directory, {
 		phase: "callback_attempt",
 		diagnostics: {

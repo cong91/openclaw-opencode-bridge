@@ -1,5 +1,5 @@
-import { appendFileSync, mkdirSync } from "node:fs";
 import { execSync } from "node:child_process";
+import { appendFileSync, mkdirSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import type { EventScope } from "./observability";
@@ -25,8 +25,8 @@ import {
 	getRuntimeConfig,
 	getServeRegistryPath,
 	getSessionRegistryPath,
-	listRunStatuses,
 	listLiveOpencodeServeProcesses,
+	listRunStatuses,
 	normalizeRegistry,
 	normalizeServeRegistry,
 	normalizeSessionRegistry,
@@ -933,7 +933,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 			name: "opencode_check_hook_policy",
 			label: "OpenCode Check Hook Policy",
 			description:
-				"Kiểm tra checklist/policy tối thiểu cho callback `/hooks/agent` với agentId và sessionKey cụ thể.",
+				"Kiểm tra checklist/policy tối thiểu cho callback `/plugin/opencode-bridge/callback` với agentId và sessionKey cụ thể.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -1827,7 +1827,10 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				const registry = normalizeServeRegistry(readServeRegistry());
 				const activeServePids = new Set(
 					registry.entries
-						.filter((entry) => entry.status === "running" && typeof entry.pid === "number")
+						.filter(
+							(entry) =>
+								entry.status === "running" && typeof entry.pid === "number",
+						)
 						.map((entry) => entry.pid as number),
 				);
 				const runStatuses = listRunStatuses();
@@ -1837,32 +1840,47 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					if (typeof pid === "number") activeAttachPids.set(pid, run);
 				}
 				const processes = listLiveOpencodeServeProcesses();
-				const serveProcesses = processes.map((item: { pid: number; serverUrl: string }) => ({
-					pid: item.pid,
-					serverUrl: item.serverUrl,
-					class: activeServePids.has(item.pid) ? "active_serve" : "orphan_serve",
-				}));
+				const serveProcesses = processes.map(
+					(item: { pid: number; serverUrl: string }) => ({
+						pid: item.pid,
+						serverUrl: item.serverUrl,
+						class: activeServePids.has(item.pid)
+							? "active_serve"
+							: "orphan_serve",
+					}),
+				);
 				return {
-					content: [{
-						type: "text",
-						text: JSON.stringify({
-							ok: true,
-							activeServeRegistry: registry.entries,
-							serveProcesses,
-							attachRunArtifacts: runStatuses.map((run) => ({
-								runId: run.runId,
-								state: run.state,
-								pid: run.attachRun?.pid,
-								repoRoot: run.envelope.repo_root,
-								serverUrl: run.envelope.opencode_server_url,
-								classification: typeof run.attachRun?.pid === "number"
-									? (run.state === "running" || run.state === "queued" || run.state === "planning" || run.state === "awaiting_permission" || run.state === "stalled"
-										? "active_attach_run"
-										: "stale_attach_run")
-									: "no_pid",
-							})),
-						}, null, 2),
-					}],
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify(
+								{
+									ok: true,
+									activeServeRegistry: registry.entries,
+									serveProcesses,
+									attachRunArtifacts: runStatuses.map((run) => ({
+										runId: run.runId,
+										state: run.state,
+										pid: run.attachRun?.pid,
+										repoRoot: run.envelope.repo_root,
+										serverUrl: run.envelope.opencode_server_url,
+										classification:
+											typeof run.attachRun?.pid === "number"
+												? run.state === "running" ||
+													run.state === "queued" ||
+													run.state === "planning" ||
+													run.state === "awaiting_permission" ||
+													run.state === "stalled"
+													? "active_attach_run"
+													: "stale_attach_run"
+												: "no_pid",
+									})),
+								},
+								null,
+								2,
+							),
+						},
+					],
 				};
 			},
 		},
@@ -1886,18 +1904,31 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				const registry = normalizeServeRegistry(readServeRegistry());
 				const activeServePids = new Set(
 					registry.entries
-						.filter((entry) => entry.status === "running" && typeof entry.pid === "number")
+						.filter(
+							(entry) =>
+								entry.status === "running" && typeof entry.pid === "number",
+						)
 						.map((entry) => entry.pid as number),
 				);
 				const runStatuses = listRunStatuses();
 				const keepAttachPids = new Set<number>();
 				for (const run of runStatuses) {
 					const pid = run.attachRun?.pid;
-					if (typeof pid === "number" && (run.state === "running" || run.state === "queued" || run.state === "planning" || run.state === "awaiting_permission" || run.state === "stalled")) {
+					if (
+						typeof pid === "number" &&
+						(run.state === "running" ||
+							run.state === "queued" ||
+							run.state === "planning" ||
+							run.state === "awaiting_permission" ||
+							run.state === "stalled")
+					) {
 						keepAttachPids.add(pid);
 					}
 				}
-				const ps = execSync("ps -axo pid,command", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+				const ps = execSync("ps -axo pid,command", {
+					encoding: "utf8",
+					stdio: ["ignore", "pipe", "ignore"],
+				});
 				const actions: any[] = [];
 				const selfPid = process.pid;
 				const parentPid = process.ppid;
@@ -1909,22 +1940,39 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					if (pid === selfPid || pid === parentPid) continue;
 					if (cmd.startsWith("opencode serve --hostname 127.0.0.1 --port")) {
 						if (!activeServePids.has(pid)) {
-							actions.push({ pid, kind: "orphan_serve", action: apply ? "killed" : "would_kill" });
+							actions.push({
+								pid,
+								kind: "orphan_serve",
+								action: apply ? "killed" : "would_kill",
+							});
 							if (apply) {
-								try { process.kill(pid, "SIGTERM"); } catch {}
+								try {
+									process.kill(pid, "SIGTERM");
+								} catch {}
 							}
 						}
 					} else if (cmd.startsWith("opencode run --attach")) {
 						if (!keepAttachPids.has(pid)) {
-							actions.push({ pid, kind: "orphan_or_stale_attach_run", action: apply ? "killed" : "would_kill" });
+							actions.push({
+								pid,
+								kind: "orphan_or_stale_attach_run",
+								action: apply ? "killed" : "would_kill",
+							});
 							if (apply) {
-								try { process.kill(pid, "SIGTERM"); } catch {}
+								try {
+									process.kill(pid, "SIGTERM");
+								} catch {}
 							}
 						}
 					}
 				}
 				return {
-					content: [{ type: "text", text: JSON.stringify({ ok: true, apply, actions }, null, 2) }],
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify({ ok: true, apply, actions }, null, 2),
+						},
+					],
 				};
 			},
 		},

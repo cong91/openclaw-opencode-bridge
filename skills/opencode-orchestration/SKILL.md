@@ -493,9 +493,9 @@ The current bridge stack already proves these capabilities:
 - callback payload construction for `/hooks/agent`
 - callback execution into OpenClaw hook ingress
 - run-status artifact persistence
-- SSE probe path
-- `listen_once` / `listen_loop` baseline for event-driven execution
-- per-project serve registry baseline
+- session-first execution bootstrap (`POST /session` + `prompt_async`)
+- directory-scoped routing via `x-opencode-directory`
+- split runtime/session registry baseline (`serves.json` + `sessions.json`)
 - serve spawn / reuse / shutdown / idle-check baseline
 
 ### What is **not** yet safe to assume
@@ -542,9 +542,11 @@ Operational rules:
 - If a serve remains alive intentionally, the agent must report the reason explicitly.
 
 
-1. **One project = one OpenCode serve instance**
-   - Do not assume one shared serve is safe for multiple repos.
-   - Always bind execution to a single project/repo root.
+1. **Serve is shared runtime; session is the execution lane**
+   - Do not assume `project -> serve` is the primary identity.
+   - One OpenCode serve may host sessions for multiple project directories.
+   - Project context is selected by `directory` and session creation, not by permanently binding one serve to one project.
+   - The canonical runtime routing key is `serve + directory + session`.
 
 2. **Callback primary = `/hooks/agent`**
    - Do not use `cron`, `group:sessions`, or `/hooks/wake` as the primary callback path.
@@ -596,11 +598,12 @@ Use when you are about to delegate a concrete task into OpenCode lane and need t
 
 #### `opencode_execute_task`
 Use as the standard serve/plugin-mode execution entrypoint:
-- resolve/spawn project-bound serve
-- create session
-- send prompt async
-- start watcher path
-- persist run artifact
+- resolve/reuse a healthy serve runtime
+- create or reuse the current session for the target `directory`
+- create new session via `POST /session` with `x-opencode-directory`
+- send work via `POST /session/{id}/prompt_async` with `x-opencode-directory`
+- persist run artifact plus current-session routing in `sessions.json`
+- do not assume `project -> serve`; execution now routes by `serve + directory + session`
 
 #### `opencode_run_status`
 Use to inspect run state and event-derived lifecycle summary.
@@ -627,16 +630,20 @@ Use to evaluate lifecycle state from:
 - soft/hard stall thresholds
 
 #### `opencode_registry_get`
-Use to read the current project -> serve registry.
+Use to read the current session-centric registry:
+- `serves.json` for runtime serve inventory
+- `sessions.json` for current session routing per `serve + directory`
 
 #### `opencode_registry_upsert`
-Use to create/update project -> serve registry entries.
+Use to create/update serve registry entries only.
+Do not treat it as the canonical project routing tool.
 
 #### `opencode_registry_cleanup`
-Use to normalize and clean invalid/incomplete registry entries.
+Use to normalize and clean both `serves.json` and `sessions.json`.
 
 #### `opencode_serve_spawn`
-Use to spawn an OpenCode serve for a project with dynamic port allocation and registry update.
+Use to spawn or reuse an OpenCode serve runtime.
+Serve selection is independent from project ownership; the project context is applied later via session creation and `directory`.
 
 #### `opencode_serve_idle_check`
 Use to evaluate whether a serve should be shut down based on idle timeout.
@@ -657,6 +664,12 @@ When a task must enter OpenCode execution lane, use this order:
    - prefer explicit `--model` if needed
    - report no callback expectation unless a separate tracking path is in place
 4. If using **serve/plugin mode**:
+   - choose or reuse a healthy serve runtime first
+   - choose the target repo by `directory`
+   - resolve the current session for `(serve, directory)` from `sessions.json`
+   - if absent, create a new session with `POST /session` + `x-opencode-directory`
+   - dispatch work with `POST /session/{id}/prompt_async` + `x-opencode-directory`
+   - query `GET /permission?directory=...` when permission-state observability is needed
    - resolve project/server via `opencode_resolve_project`
    - or spawn one via `opencode_serve_spawn`
    - build routing envelope via `opencode_build_envelope`

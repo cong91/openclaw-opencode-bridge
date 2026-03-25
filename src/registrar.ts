@@ -2,6 +2,11 @@ import { execSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
+import {
+	deriveAgentIdFromSessionKey,
+	resolveCallbackIngressTarget,
+	upsertCallbackPendingItem,
+} from "./heartbeat-dispatcher";
 import type { EventScope } from "./observability";
 import { summarizeLifecycle } from "./observability";
 import {
@@ -317,12 +322,6 @@ function isTerminalState(state?: BridgeRunStatus["state"] | null): boolean {
 	return state === "completed" || state === "failed" || state === "stalled";
 }
 
-function deriveAgentIdFromSessionKey(sessionKey?: string): string | undefined {
-	if (!sessionKey) return undefined;
-	const matched = sessionKey.match(/^agent:([^:]+):/);
-	return matched?.[1];
-}
-
 function parseDirectTelegramTarget(sessionKey?: string): string | undefined {
 	if (!sessionKey) return undefined;
 	const matched = sessionKey.match(/^agent:[^:]+:telegram:direct:(.+)$/);
@@ -462,6 +461,69 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						humanActionRequired: false,
 						callback: callback.message,
 					};
+			const ingressResolution = resolveCallbackIngressTarget({
+				cfg,
+				callback,
+				metadata: parsed.metadata,
+				runStatus,
+			});
+			const heartbeatAgentId =
+				ingressResolution.agentId ||
+				callback.agentId ||
+				deriveAgentIdFromSessionKey(callback.sessionKey);
+			const pendingSessionId = ingressResolution.sessionId;
+			let callbackPendingWrite:
+				| {
+						ok: true;
+						filePath: string;
+						deduped: boolean;
+				  }
+				| {
+						ok: false;
+						error: string;
+				  } = {
+				ok: false,
+				error: "workspace/session unresolved",
+			};
+
+			if (
+				ingressResolution.workspaceDir &&
+				pendingSessionId &&
+				heartbeatAgentId
+			) {
+				try {
+					const pendingWrite = upsertCallbackPendingItem({
+						workspaceDir: ingressResolution.workspaceDir,
+						agentId: heartbeatAgentId,
+						sessionKey: callback.sessionKey,
+						sessionId: pendingSessionId,
+						dedupeKey,
+						runId: parsed.metadata?.runId,
+						eventType: parsed.metadata?.eventType,
+						metadata: parsed.metadata,
+						rawMessage: callback.message,
+					});
+					callbackPendingWrite = {
+						ok: true,
+						filePath: pendingWrite.filePath,
+						deduped: pendingWrite.deduped,
+					};
+				} catch (error) {
+					callbackPendingWrite = {
+						ok: false,
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+			}
+
+			if ((callback.wakeMode || "now") === "now") {
+				api.runtime.system.requestHeartbeatNow({
+					reason: dedupeKey || "opencode-callback",
+					...callbackTarget,
+					...(heartbeatAgentId ? { agentId: heartbeatAgentId } : {}),
+				});
+			}
+
 			const callbackMessageText = [
 				"<opencode_callback_control_internal>",
 				JSON.stringify(callbackControlEnvelope),
@@ -519,15 +581,6 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					});
 				}
 			}
-			if ((callback.wakeMode || "now") === "now") {
-				const wakeAgentId =
-					callback.agentId || deriveAgentIdFromSessionKey(callback.sessionKey);
-				api.runtime.system.requestHeartbeatNow({
-					reason: dedupeKey || "opencode-callback",
-					...callbackTarget,
-					...(wakeAgentId ? { agentId: wakeAgentId } : {}),
-				});
-			}
 			appendCallbackDebugAudit({
 				phase: "callback_enqueued",
 				sessionKey: callback.sessionKey,
@@ -537,6 +590,8 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				dedupeKey,
 				runId: parsed.metadata?.runId || null,
 				eventType: parsed.metadata?.eventType || null,
+				workspaceResolution: ingressResolution,
+				callbackPendingWrite,
 				deliver: callback.deliver === true,
 				hasContinuation: Boolean(runStatus?.continuation),
 				continuation: runStatus?.continuation || null,
@@ -695,17 +750,19 @@ function buildExecutionPrompt(params: any, envelope: any): string {
 			)
 		: [];
 	const beadId = asString(params?.beadId);
-	const policyConstraints = envelope.resolved_agent_id === "build"
-		? [
-			"Do not spawn more than one explore subagent unless blocked by missing exact file/function location.",
-			"Do not use explore for generic repo layout discovery when repo scope is already explicit.",
-			"After the first useful audit result, continue implementation directly.",
-			"If scoped changes are complete and unrelated tests fail outside approved scope, do not ask for approval. Report unrelated failures separately and stop after scoped completion.",
-			"Do not expand scope to fix unrelated failures unless the packet explicitly authorizes scope expansion.",
-			"Do not open a decision checkpoint for unrelated red tests outside the approved scope.",
-			"If no patch is needed, conclude explicitly instead of continuing reconnaissance.",
-			"Do not loop on todowrite more than once per milestone.",
-		] : [];
+	const policyConstraints =
+		envelope.resolved_agent_id === "build"
+			? [
+					"Do not spawn more than one explore subagent unless blocked by missing exact file/function location.",
+					"Do not use explore for generic repo layout discovery when repo scope is already explicit.",
+					"After the first useful audit result, continue implementation directly.",
+					"If scoped changes are complete and unrelated tests fail outside approved scope, do not ask for approval. Report unrelated failures separately and stop after scoped completion.",
+					"Do not expand scope to fix unrelated failures unless the packet explicitly authorizes scope expansion.",
+					"Do not open a decision checkpoint for unrelated red tests outside the approved scope.",
+					"If no patch is needed, conclude explicitly instead of continuing reconnaissance.",
+					"Do not loop on todowrite more than once per milestone.",
+				]
+			: [];
 	const mergedConstraints = [...constraints, ...policyConstraints];
 	return [
 		`Task: ${objective}`,

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { registerOpenCodeBridgeTools } from "../src/registrar";
@@ -290,4 +293,138 @@ test("callback http route does not send telegram notify for non-direct telegram 
 	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
 	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);
 	assert.equal(telegramSends.length, 0);
+});
+
+test("callback http route sends exactly one telegram notify when continuation notify exists (no duplicate ingress ack)", async () => {
+	const tempRoot = mkdtempSync(
+		join(tmpdir(), "opencode-bridge-callback-visible-"),
+	);
+	const stateDir = join(tempRoot, "state");
+	const bridgeDir = join(stateDir, "opencode-bridge");
+	mkdirSync(join(bridgeDir, "runs"), { recursive: true });
+	writeFileSync(
+		join(bridgeDir, "runs", "run-visible-continue-1.json"),
+		JSON.stringify(
+			{
+				taskId: "task-visible-continue-1",
+				runId: "run-visible-continue-1",
+				state: "running",
+				updatedAt: new Date().toISOString(),
+				envelope: {
+					task_id: "task-visible-continue-1",
+					run_id: "run-visible-continue-1",
+					agent_id: "builder",
+					requested_agent_id: "creator",
+					resolved_agent_id: "builder",
+					session_key: "hook:opencode:builder:task-visible-continue-1",
+					origin_session_key: "agent:creator:telegram:direct:5165741309",
+					callback_target_session_key:
+						"agent:creator:telegram:direct:5165741309",
+					callback_target_session_id: "sess-origin-continue-1",
+					project_id: "proj-visible-continue-1",
+					repo_root: "/tmp/repo-visible-continue-1",
+					opencode_server_url: "http://opencode.local",
+				},
+				continuation: {
+					callbackEventKind: "opencode.callback",
+					workflowId: "wf-visible-continue-1",
+					stepId: "step-visible-continue-1",
+					nextOnSuccess: {
+						action: "notify",
+						taskId: "task-followup-visible-1",
+						objective: "Follow-up notification for direct session",
+					},
+					nextOnFailure: { action: "none" },
+				},
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
+	const prevStateDir = process.env.OPENCLAW_STATE_DIR;
+	process.env.OPENCLAW_STATE_DIR = stateDir;
+
+	const routes: RegisteredRoute[] = [];
+	const systemEvents: any[] = [];
+	const heartbeatCalls: any[] = [];
+	const telegramSends: any[] = [];
+
+	registerOpenCodeBridgeTools(
+		{
+			registerTool() {},
+			registerHttpRoute(route: RegisteredRoute) {
+				routes.push(route);
+			},
+			runtime: {
+				system: {
+					enqueueSystemEvent(text: string, opts: any) {
+						systemEvents.push({ text, opts });
+						return true;
+					},
+					requestHeartbeatNow(opts: any) {
+						heartbeatCalls.push(opts);
+					},
+				},
+				channel: {
+					telegram: {
+						async sendMessageTelegram(to: string, text: string, opts: any) {
+							telegramSends.push({ to, text, opts });
+							return { ok: true, channel: "telegram", to };
+						},
+					},
+				},
+			},
+		},
+		{ hookToken: "test-token" },
+	);
+
+	try {
+		const route = routes.find(
+			(x) => x.path === "/plugin/opencode-bridge/callback",
+		);
+		assert.ok(route, "callback route should be registered");
+
+		const payload = {
+			name: "OpenCode",
+			agentId: "creator",
+			sessionKey: "agent:creator:telegram:direct:5165741309",
+			sessionId: "sess-origin-continue-1",
+			wakeMode: "now",
+			deliver: true,
+			message: JSON.stringify({
+				kind: "opencode.callback",
+				eventType: "task.completed",
+				runId: "run-visible-continue-1",
+				taskId: "task-visible-continue-1",
+				callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
+				callbackTargetSessionId: "sess-origin-continue-1",
+				opencodeSessionId: "oc-sess-continue-1",
+			}),
+		};
+
+		const req = createMockReq(JSON.stringify(payload), "test-token");
+		const res = createMockRes();
+		const handled = await route!.handler(req, res);
+
+		assert.equal(handled, true);
+		assert.equal(res.statusCode, 200);
+		assert.equal(systemEvents.length, 1);
+		assert.match(systemEvents[0].text, /<opencode_callback_control_internal>/);
+		assert.equal(heartbeatCalls.length, 1);
+		assert.equal(telegramSends.length, 1);
+		assert.equal(telegramSends[0]?.to, "5165741309");
+		assert.equal(
+			telegramSends[0]?.text,
+			"Follow-up notification for direct session",
+		);
+		assert.equal(
+			telegramSends[0]?.opts?.contextKey,
+			"opencode:run-visible-continue-1:task.completed:continuation-notify-telegram",
+		);
+	} finally {
+		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+		else process.env.OPENCLAW_STATE_DIR = prevStateDir;
+		rmSync(tempRoot, { recursive: true, force: true });
+	}
 });

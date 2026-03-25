@@ -111,24 +111,29 @@ export function resolveCallbackIngressTarget(input: {
 		asString(input.callback.sessionId);
 	const agentId =
 		asString(input.callback.agentId) ||
-		deriveAgentIdFromSessionKey(input.callback.sessionKey) ||
 		asString(input.metadata?.requestedAgentId) ||
-		asString(input.runStatus?.envelope?.requested_agent_id);
+		asString(input.runStatus?.envelope?.requested_agent_id) ||
+		deriveAgentIdFromSessionKey(input.callback.sessionKey);
 
 	const registry = normalizeSessionRegistry(readSessionRegistry());
-	if (sessionId) {
+	const workspaceSessionCandidates = [
+		asString(input.metadata?.opencodeSessionId),
+		asString(input.runStatus?.opencodeSessionId),
+		asString(input.runStatus?.sessionId),
+		sessionId,
+	].filter(Boolean) as string[];
+	for (const candidateSessionId of workspaceSessionCandidates) {
 		const bySessionId = registry.entries.find(
-			(entry) => entry.session_id === sessionId,
+			(entry) => entry.session_id === candidateSessionId,
 		);
-		if (bySessionId?.directory) {
-			return {
-				agentId,
-				sessionId,
-				sessionKey: input.callback.sessionKey,
-				workspaceDir: bySessionId.directory,
-				workspaceSource: "session_registry",
-			};
-		}
+		if (!bySessionId?.directory) continue;
+		return {
+			agentId,
+			sessionId,
+			sessionKey: input.callback.sessionKey,
+			workspaceDir: bySessionId.directory,
+			workspaceSource: "session_registry",
+		};
 	}
 
 	const runRepoRoot = asString(input.runStatus?.envelope?.repo_root);
@@ -156,8 +161,9 @@ export function resolveCallbackIngressTarget(input: {
 	const cfg = getRuntimeConfig(input.cfg);
 	const registryEntry = findRegistryEntry(
 		cfg,
-		asString(input.metadata?.projectId),
-		metadataRepoRoot,
+		asString(input.metadata?.projectId) ||
+			asString(input.runStatus?.envelope?.project_id),
+		metadataRepoRoot || asString(input.runStatus?.envelope?.repo_root),
 	);
 	if (registryEntry?.repoRoot) {
 		return {

@@ -73,6 +73,146 @@ test("resolveCallbackIngressTarget resolves workspace dynamically from session r
 	}
 });
 
+test("resolveCallbackIngressTarget uses target opencode session workspace over callback target session", () => {
+	const tempRoot = mkdtempSync(
+		join(tmpdir(), "opencode-bridge-hb-resolve-target-session-"),
+	);
+	const stateDir = join(tempRoot, "state");
+	const originWorkspaceDir = join(tempRoot, "workspace-origin");
+	const targetWorkspaceDir = join(tempRoot, "workspace-scrum");
+	mkdirSync(originWorkspaceDir, { recursive: true });
+	mkdirSync(targetWorkspaceDir, { recursive: true });
+	mkdirSync(join(stateDir, "opencode-bridge"), { recursive: true });
+	writeFileSync(
+		join(stateDir, "opencode-bridge", "sessions.json"),
+		JSON.stringify(
+			{
+				entries: [
+					{
+						session_id: "sess-origin-callback",
+						serve_id: "serve-1",
+						opencode_server_url: "http://127.0.0.1:4096",
+						directory: originWorkspaceDir,
+						updated_at: new Date().toISOString(),
+					},
+					{
+						session_id: "sess-exec-target",
+						serve_id: "serve-1",
+						opencode_server_url: "http://127.0.0.1:4096",
+						directory: targetWorkspaceDir,
+						updated_at: new Date().toISOString(),
+					},
+				],
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
+
+	const prevStateDir = process.env.OPENCLAW_STATE_DIR;
+	process.env.OPENCLAW_STATE_DIR = stateDir;
+	try {
+		const resolved = resolveCallbackIngressTarget({
+			cfg: {},
+			callback: {
+				sessionKey: "agent:builder:telegram:direct:123",
+				sessionId: "sess-origin-callback",
+			},
+			metadata: {
+				kind: "opencode.callback",
+				eventType: "task.completed",
+				runId: "run-hb-target-1",
+				taskId: "task-hb-target-1",
+				requestedAgentId: "scrum",
+				callbackTargetSessionId: "sess-origin-callback",
+				opencodeSessionId: "sess-exec-target",
+			},
+		});
+
+		assert.equal(resolved.workspaceSource, "session_registry");
+		assert.equal(resolved.workspaceDir, targetWorkspaceDir);
+		assert.equal(resolved.sessionId, "sess-origin-callback");
+		assert.equal(resolved.agentId, "scrum");
+	} finally {
+		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+		else process.env.OPENCLAW_STATE_DIR = prevStateDir;
+		rmSync(tempRoot, { recursive: true, force: true });
+	}
+});
+
+test("resolveCallbackIngressTarget falls back to project registry via run status project_id", () => {
+	const tempRoot = mkdtempSync(
+		join(tmpdir(), "opencode-bridge-hb-resolve-project-"),
+	);
+	const stateDir = join(tempRoot, "state");
+	const workspaceDir = join(tempRoot, "workspace-assistant");
+	mkdirSync(workspaceDir, { recursive: true });
+	mkdirSync(join(stateDir, "opencode-bridge"), { recursive: true });
+	writeFileSync(
+		join(stateDir, "opencode-bridge", "sessions.json"),
+		JSON.stringify({ entries: [] }, null, 2),
+		"utf8",
+	);
+	writeFileSync(
+		join(stateDir, "opencode-bridge", "config.json"),
+		JSON.stringify(
+			{
+				opencodeServerUrl: "http://127.0.0.1:4096",
+				projectRegistry: [
+					{
+						projectId: "proj-scrum",
+						repoRoot: workspaceDir,
+						serverUrl: "http://127.0.0.1:4096",
+					},
+				],
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
+
+	const prevStateDir = process.env.OPENCLAW_STATE_DIR;
+	process.env.OPENCLAW_STATE_DIR = stateDir;
+	try {
+		const resolved = resolveCallbackIngressTarget({
+			cfg: {},
+			callback: {
+				sessionKey: "agent:assistant:telegram:direct:123",
+			},
+			runStatus: {
+				taskId: "task-hb-proj-1",
+				runId: "run-hb-proj-1",
+				state: "running",
+				lastEvent: null,
+				updatedAt: new Date().toISOString(),
+				envelope: {
+					task_id: "task-hb-proj-1",
+					run_id: "run-hb-proj-1",
+					agent_id: "builder",
+					requested_agent_id: "assistant",
+					resolved_agent_id: "builder",
+					session_key: "hook:opencode:builder:task-hb-proj-1",
+					origin_session_key: "agent:assistant:telegram:direct:123",
+					callback_target_session_key: "agent:assistant:telegram:direct:123",
+					project_id: "proj-scrum",
+					repo_root: "",
+					opencode_server_url: "http://127.0.0.1:4096",
+				},
+			},
+		});
+
+		assert.equal(resolved.workspaceSource, "project_registry");
+		assert.equal(resolved.workspaceDir, workspaceDir);
+		assert.equal(resolved.agentId, "assistant");
+	} finally {
+		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+		else process.env.OPENCLAW_STATE_DIR = prevStateDir;
+		rmSync(tempRoot, { recursive: true, force: true });
+	}
+});
+
 test("getCallbackPendingFilePath validates session id and keeps path inside workspace", () => {
 	const tempRoot = mkdtempSync(join(tmpdir(), "opencode-bridge-hb-path-"));
 	try {

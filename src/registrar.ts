@@ -2,11 +2,6 @@ import { execSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
-import {
-	deriveAgentIdFromSessionKey,
-	resolveCallbackIngressTarget,
-	upsertCallbackPendingItem,
-} from "./heartbeat-dispatcher";
 import type { EventScope } from "./observability";
 import { summarizeLifecycle } from "./observability";
 import {
@@ -50,6 +45,9 @@ import {
 	writeSessionRegistryFile,
 } from "./runtime";
 import { OPENCODE_CALLBACK_HTTP_PATH } from "./shared-contracts";
+import { mapCallbackEventToContinuationIntent } from "./hook-continuation";
+
+const OPENCODE_CONTINUATION_HOOK_PATH = "/hooks/opencode-callback";
 import type {
 	BridgeRunStatus,
 	OpenCodeContinuationCallbackMetadata,
@@ -62,6 +60,12 @@ import type {
 } from "./types";
 
 const PLUGIN_VERSION = "0.1.6";
+
+function deriveAgentIdFromSessionKey(sessionKey?: string): string | undefined {
+	if (!sessionKey) return undefined;
+	const matched = sessionKey.match(/^agent:([^:]+):/);
+	return matched?.[1];
+}
 
 function asContinuationStep(
 	value: unknown,
@@ -132,6 +136,9 @@ function buildContinuationCommandPayload(input: {
 		eventType: input.metadata?.eventType || null,
 		projectId: input.runStatus.envelope.project_id,
 		repoRoot: input.runStatus.envelope.repo_root,
+		agentWorkspaceDir:
+			input.runStatus.envelope.agent_workspace_dir ||
+			input.runStatus.envelope.repo_root,
 		requestedAgentId: input.runStatus.envelope.requested_agent_id,
 		resolvedAgentId: input.runStatus.envelope.resolved_agent_id,
 		originSessionKey: input.runStatus.envelope.origin_session_key,
@@ -144,6 +151,72 @@ function buildContinuationCommandPayload(input: {
 		stepId: input.runStatus.continuation?.stepId,
 		next: input.step,
 	};
+}
+
+async function dispatchContinuationToCustomHook(input: {
+	cfg: any;
+	metadata: OpenCodeContinuationCallbackMetadata | null;
+	runStatus: BridgeRunStatus;
+	step: NonNullable<OpenCodeRunContinuation["nextOnSuccess"]>;
+}) {
+	const runtimeCfg = getRuntimeConfig(input.cfg);
+	const hookBaseUrl = asString(runtimeCfg.hookBaseUrl);
+	const hookToken = asString(runtimeCfg.hookToken);
+	if (!hookBaseUrl || !hookToken) {
+		return { ok: false as const, error: "hook base/token missing" };
+	}
+	const intent = mapCallbackEventToContinuationIntent({
+		metadata: input.metadata,
+		next: input.step,
+	});
+	const payload = {
+		source: "opencode.callback",
+		kind: "opencode.callback",
+		runId: input.metadata?.runId || input.runStatus.runId,
+		taskId: input.metadata?.taskId || input.runStatus.taskId,
+		eventType: input.metadata?.eventType || null,
+		projectId: input.runStatus.envelope.project_id,
+		repoRoot: input.runStatus.envelope.repo_root,
+		agentWorkspaceDir:
+			input.runStatus.envelope.agent_workspace_dir ||
+			input.runStatus.envelope.repo_root,
+		requestedAgentId: input.runStatus.envelope.requested_agent_id,
+		resolvedAgentId: input.runStatus.envelope.resolved_agent_id,
+		originSessionKey: input.runStatus.envelope.origin_session_key,
+		originSessionId: input.runStatus.envelope.origin_session_id,
+		callbackTargetSessionKey:
+			input.runStatus.envelope.callback_target_session_key,
+		callbackTargetSessionId:
+			input.runStatus.envelope.callback_target_session_id,
+		workflowId: input.runStatus.continuation?.workflowId,
+		stepId: input.runStatus.continuation?.stepId,
+		next: input.step,
+		intent,
+	};
+	const url = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_HOOK_PATH}`;
+	try {
+		const response = await fetch(url, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${hookToken}`,
+			},
+			body: JSON.stringify(payload),
+		});
+		const bodyText = await response.text().catch(() => "");
+		return {
+			ok: response.ok,
+			status: response.status,
+			body: bodyText,
+			url,
+		};
+	} catch (error) {
+		return {
+			ok: false as const,
+			error: error instanceof Error ? error.message : String(error),
+			url,
+		};
+	}
 }
 
 function registerContinuationCommand(api: any, cfg: any) {
@@ -170,6 +243,7 @@ function registerContinuationCommand(api: any, cfg: any) {
 				asString(payload.resolvedAgentId) || requestedAgentId || "creator";
 			const projectId = asString(payload.projectId) || "unknown-project";
 			const repoRoot = asString(payload.repoRoot) || ".";
+			const agentWorkspaceDir = asString(payload.agentWorkspaceDir) || repoRoot;
 			const originSessionKey =
 				asString(payload.originSessionKey) || "session:unknown";
 			const serverUrl =
@@ -187,6 +261,7 @@ function registerContinuationCommand(api: any, cfg: any) {
 				originSessionId: asString(payload.originSessionId),
 				projectId,
 				repoRoot,
+				agentWorkspaceDir,
 				serverUrl,
 				deliver: true,
 			});
@@ -333,7 +408,9 @@ function resolveContinuationStep(input: {
 	eventType?: string;
 }): OpenCodeRunContinuation["nextOnSuccess"] | undefined {
 	if (!input.runStatus?.continuation) return undefined;
-	return input.eventType === "task.failed" || input.eventType === "task.stalled"
+	return input.eventType === "task.failed" ||
+		input.eventType === "task.stalled" ||
+		input.eventType === "session.error"
 		? input.runStatus.continuation.nextOnFailure
 		: input.runStatus.continuation.nextOnSuccess;
 }
@@ -341,8 +418,7 @@ function resolveContinuationStep(input: {
 function registerCallbackIngressRoute(api: any, cfg: any) {
 	if (
 		typeof api?.registerHttpRoute !== "function" ||
-		typeof api?.runtime?.system?.enqueueSystemEvent !== "function" ||
-		typeof api?.runtime?.system?.requestHeartbeatNow !== "function"
+		typeof api?.runtime?.system?.enqueueSystemEvent !== "function"
 	) {
 		return;
 	}
@@ -461,68 +537,9 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						humanActionRequired: false,
 						callback: callback.message,
 					};
-			const ingressResolution = resolveCallbackIngressTarget({
-				cfg,
-				callback,
-				metadata: parsed.metadata,
-				runStatus,
-			});
 			const heartbeatAgentId =
-				ingressResolution.agentId ||
 				callback.agentId ||
 				deriveAgentIdFromSessionKey(callback.sessionKey);
-			const pendingSessionId = ingressResolution.sessionId;
-			let callbackPendingWrite:
-				| {
-						ok: true;
-						filePath: string;
-						deduped: boolean;
-				  }
-				| {
-						ok: false;
-						error: string;
-				  } = {
-				ok: false,
-				error: "workspace/session unresolved",
-			};
-
-			if (
-				ingressResolution.workspaceDir &&
-				pendingSessionId &&
-				heartbeatAgentId
-			) {
-				try {
-					const pendingWrite = upsertCallbackPendingItem({
-						workspaceDir: ingressResolution.workspaceDir,
-						agentId: heartbeatAgentId,
-						sessionKey: callback.sessionKey,
-						sessionId: pendingSessionId,
-						dedupeKey,
-						runId: parsed.metadata?.runId,
-						eventType: parsed.metadata?.eventType,
-						metadata: parsed.metadata,
-						rawMessage: callback.message,
-					});
-					callbackPendingWrite = {
-						ok: true,
-						filePath: pendingWrite.filePath,
-						deduped: pendingWrite.deduped,
-					};
-				} catch (error) {
-					callbackPendingWrite = {
-						ok: false,
-						error: error instanceof Error ? error.message : String(error),
-					};
-				}
-			}
-
-			if ((callback.wakeMode || "now") === "now") {
-				api.runtime.system.requestHeartbeatNow({
-					reason: dedupeKey || "opencode-callback",
-					...callbackTarget,
-					...(heartbeatAgentId ? { agentId: heartbeatAgentId } : {}),
-				});
-			}
 
 			const callbackMessageText = [
 				"<opencode_callback_control_internal>",
@@ -590,8 +607,6 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				dedupeKey,
 				runId: parsed.metadata?.runId || null,
 				eventType: parsed.metadata?.eventType || null,
-				workspaceResolution: ingressResolution,
-				callbackPendingWrite,
 				deliver: callback.deliver === true,
 				hasContinuation: Boolean(runStatus?.continuation),
 				continuation: runStatus?.continuation || null,
@@ -645,19 +660,21 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						metadata: parsed.metadata,
 						step,
 					});
-					const command = `/opencode-continue ${JSON.stringify(commandPayload)}`;
-					api.runtime.system.enqueueSystemEvent(command, {
-						...callbackTarget,
-						...(dedupeKey
-							? { contextKey: `${dedupeKey}:continuation-command` }
-							: {}),
+					const hookDispatch = await dispatchContinuationToCustomHook({
+						cfg,
+						metadata: parsed.metadata,
+						runStatus,
+						step,
 					});
 					appendCallbackDebugAudit({
-						phase: "continuation_command_enqueued",
+						phase: hookDispatch.ok
+							? "continuation_hook_dispatched"
+							: "continuation_hook_failed",
 						sessionKey: callback.sessionKey,
 						dedupeKey,
 						runId: parsed.metadata?.runId || null,
 						commandPayload,
+						hookDispatch,
 					});
 				} else if (step?.action === "notify") {
 					const notifyMessage =
@@ -1089,6 +1106,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					originSessionId: { type: "string" },
 					projectId: { type: "string" },
 					repoRoot: { type: "string" },
+					agentWorkspaceDir: { type: "string" },
 					prompt: { type: "string" },
 					objective: { type: "string" },
 					message: { type: "string" },
@@ -1168,11 +1186,26 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					};
 				}
 
-				const spawned = await spawnServeForProject({
-					project_id: params.projectId,
-					repo_root: params.repoRoot,
-					idle_timeout_ms: asNumber(params.idleTimeoutMs),
-				});
+				const explicitServerUrl = resolveServerUrl(cfg, params);
+				const shouldUseExplicitServer = Boolean(
+					asString(params?.opencodeServerUrl) || asString(params?.serverUrl),
+				);
+				const spawned = shouldUseExplicitServer
+					? {
+							reused: true,
+							entry: {
+								serve_id: explicitServerUrl,
+								opencode_server_url: explicitServerUrl,
+								status: "running",
+								updated_at: new Date().toISOString(),
+							},
+							reuseStrategy: "explicit_server_url",
+						}
+					: await spawnServeForProject({
+							project_id: params.projectId,
+							repo_root: params.repoRoot,
+							idle_timeout_ms: asNumber(params.idleTimeoutMs),
+						});
 				const serverUrl = spawned.entry.opencode_server_url;
 				const envelope = buildEnvelope({
 					taskId: params.taskId,
@@ -1183,6 +1216,8 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					originSessionId: asString(params.originSessionId),
 					projectId: params.projectId,
 					repoRoot: params.repoRoot,
+					agentWorkspaceDir:
+						asString(params.agentWorkspaceDir) || asString(params.repoRoot),
 					serverUrl,
 					channel: params.channel,
 					to: params.to,
@@ -1301,6 +1336,12 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 										runId: execution.runId,
 										taskId: execution.taskId,
 										sessionId: execution.sessionId,
+										opencodeSessionId: (execution as any).opencodeSessionId,
+										sessionResolvedAt: (execution as any).sessionResolvedAt,
+										sessionResolutionStrategy: (execution as any)
+											.sessionResolutionStrategy,
+										sessionResolutionPending: (execution as any)
+											.sessionResolutionPending,
 										state: execution.state,
 										attachRun: (execution as any).attachRun,
 										callbackAuthority: "opencode_plugin",

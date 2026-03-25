@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	buildPluginCallbackDedupeKey,
-	OPENCODE_CALLBACK_HTTP_PATH,
+	OPENCODE_CONTINUATION_HOOK_PATH,
 	parseTaggedSessionTitle,
 } from "../src/shared-contracts";
 import type { OpenCodeContinuationCallbackMetadata } from "../src/types";
@@ -132,7 +132,7 @@ function appendOpenClawAudit(directory: string, record: any) {
 	);
 }
 
-function buildCallbackPayload(
+function buildHookContinuationPayload(
 	tags: Record<string, string>,
 	eventType: string,
 	opencodeSessionId?: string,
@@ -148,12 +148,20 @@ function buildCallbackPayload(
 		opencodeSessionId,
 	);
 	return {
-		message: JSON.stringify(metadata),
-		name: "OpenCode",
-		agentId,
-		sessionKey,
-		...(sessionId ? { sessionId } : {}),
-		wakeMode: "now",
+		source: "opencode.callback",
+		runId: metadata.runId,
+		taskId: metadata.taskId,
+		eventType: metadata.eventType,
+		projectId: metadata.projectId,
+		repoRoot: metadata.repoRoot,
+		requestedAgentId: metadata.requestedAgentId || agentId,
+		resolvedAgentId: metadata.resolvedAgentId,
+		callbackTargetSessionKey: metadata.callbackTargetSessionKey || sessionKey,
+		callbackTargetSessionId: metadata.callbackTargetSessionId || sessionId,
+		opencodeSessionId: metadata.opencodeSessionId,
+		workflowId: metadata.workflowId,
+		stepId: metadata.stepId,
+		next: { action: "launch_run", taskId: metadata.taskId },
 		deliver,
 	};
 }
@@ -248,7 +256,7 @@ async function postCallback(
 		});
 		return { ok: false, status: 0, reason: "missing_hook_env" };
 	}
-	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CALLBACK_HTTP_PATH}`;
+	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_HOOK_PATH}`;
 	appendAudit(directory, {
 		phase: "callback_attempt",
 		diagnostics: {
@@ -406,7 +414,7 @@ export const OpenClawBridgeCallbackPlugin = async ({
 				return;
 			}
 			callbackDedupe.add(dedupeKey);
-			const payload = buildCallbackPayload(tags, type, sessionId);
+			const payload = buildHookContinuationPayload(tags, type, sessionId);
 			if (!payload) {
 				appendAudit(directory, {
 					phase: "skipped_no_payload",

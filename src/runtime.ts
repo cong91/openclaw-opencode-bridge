@@ -1,9 +1,9 @@
-import { spawn, execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import {
+	closeSync,
 	existsSync,
 	mkdirSync,
 	openSync,
-	closeSync,
 	readdirSync,
 	readFileSync,
 	unlinkSync,
@@ -19,7 +19,11 @@ import {
 	resolveSessionId,
 	summarizeLifecycle,
 } from "./observability";
-import { buildTaggedSessionTitle, OPENCODE_CALLBACK_HTTP_PATH } from "./shared-contracts";
+import {
+	buildTaggedSessionTitle,
+	OPENCODE_CALLBACK_HTTP_PATH,
+	OPENCODE_CONTINUATION_HOOK_PATH,
+} from "./shared-contracts";
 import type {
 	BridgeConfigFile,
 	BridgeLifecycleState,
@@ -252,6 +256,7 @@ export function buildEnvelope(input: {
 	originSessionId?: string;
 	projectId: string;
 	repoRoot: string;
+	agentWorkspaceDir?: string;
 	serverUrl: string;
 	channel?: string;
 	to?: string;
@@ -278,6 +283,9 @@ export function buildEnvelope(input: {
 			: {}),
 		project_id: input.projectId,
 		repo_root: input.repoRoot,
+		...(input.agentWorkspaceDir
+			? { agent_workspace_dir: input.agentWorkspaceDir }
+			: {}),
 		opencode_server_url: input.serverUrl,
 		...(input.channel ? { channel: input.channel } : {}),
 		...(input.to ? { to: input.to } : {}),
@@ -536,17 +544,28 @@ export function normalizeSessionRegistry(
 			const serve_id = asString(e.serve_id);
 			const opencode_server_url = asString(e.opencode_server_url);
 			const directory = asString(e.directory);
-			if (!session_id || !serve_id || !opencode_server_url || !directory) return null;
+			if (!session_id || !serve_id || !opencode_server_url || !directory)
+				return null;
 			return {
 				session_id,
 				serve_id,
 				opencode_server_url,
 				directory,
-				...(asString(e.project_id) ? { project_id: asString(e.project_id) } : {}),
-				...(asString(e.session_title) ? { session_title: asString(e.session_title) } : {}),
-				...(asString(e.session_updated_at) ? { session_updated_at: asString(e.session_updated_at) } : {}),
-				...(asString(e.status) ? { status: asString(e.status) as SessionRegistryEntry["status"] } : {}),
-				...(typeof e.is_current_for_directory === "boolean" ? { is_current_for_directory: e.is_current_for_directory } : {}),
+				...(asString(e.project_id)
+					? { project_id: asString(e.project_id) }
+					: {}),
+				...(asString(e.session_title)
+					? { session_title: asString(e.session_title) }
+					: {}),
+				...(asString(e.session_updated_at)
+					? { session_updated_at: asString(e.session_updated_at) }
+					: {}),
+				...(asString(e.status)
+					? { status: asString(e.status) as SessionRegistryEntry["status"] }
+					: {}),
+				...(typeof e.is_current_for_directory === "boolean"
+					? { is_current_for_directory: e.is_current_for_directory }
+					: {}),
 				updated_at: asString(e.updated_at) || new Date().toISOString(),
 			} as SessionRegistryEntry;
 		})
@@ -554,7 +573,9 @@ export function normalizeSessionRegistry(
 	return { entries };
 }
 
-function compactServeRegistryLiveOnly(data: ServeRegistryFile): ServeRegistryFile {
+function compactServeRegistryLiveOnly(
+	data: ServeRegistryFile,
+): ServeRegistryFile {
 	const normalized = normalizeServeRegistry(data);
 	return {
 		entries: normalized.entries.filter(
@@ -586,13 +607,17 @@ export function writeSessionRegistryFile(data: SessionRegistryFile) {
 export function upsertServeRegistry(entry: ServeRegistryEntry) {
 	const registry = normalizeServeRegistry(readServeRegistry());
 	const idx = registry.entries.findIndex(
-		(x) => x.serve_id === entry.serve_id || x.opencode_server_url === entry.opencode_server_url,
+		(x) =>
+			x.serve_id === entry.serve_id ||
+			x.opencode_server_url === entry.opencode_server_url,
 	);
 	if (idx >= 0) registry.entries[idx] = entry;
 	else registry.entries.push(entry);
 	if (entry.status === "running" || entry.status === "unknown") {
 		registry.entries = registry.entries.filter(
-			(x) => x.serve_id === entry.serve_id || x.opencode_server_url === entry.opencode_server_url,
+			(x) =>
+				x.serve_id === entry.serve_id ||
+				x.opencode_server_url === entry.opencode_server_url,
 		);
 	}
 	const path = writeServeRegistryFile(registry);
@@ -602,7 +627,10 @@ export function upsertServeRegistry(entry: ServeRegistryEntry) {
 export function upsertSessionRegistry(entry: SessionRegistryEntry) {
 	const registry = normalizeSessionRegistry(readSessionRegistry());
 	for (const item of registry.entries) {
-		if (item.serve_id === entry.serve_id && item.directory === entry.directory) {
+		if (
+			item.serve_id === entry.serve_id &&
+			item.directory === entry.directory
+		) {
 			item.is_current_for_directory = false;
 		}
 	}
@@ -677,9 +705,10 @@ export async function fetchServeProjectBinding(serverUrl: string): Promise<{
 
 	const project = projectRes.ok ? projectRes.data : undefined;
 	const path = pathRes.ok ? pathRes.data : undefined;
-	const session = sessionRes.ok && Array.isArray(sessionRes.data)
-		? sessionRes.data[0]
-		: undefined;
+	const session =
+		sessionRes.ok && Array.isArray(sessionRes.data)
+			? sessionRes.data[0]
+			: undefined;
 	const directory =
 		asString(project?.directory) ||
 		asString(project?.path) ||
@@ -716,12 +745,18 @@ export function getServeSpawnLockPath() {
 	return join(getBridgeStateDir(), "serve-spawn.lock");
 }
 
-export function listLiveOpencodeServeProcesses(): Array<{ pid: number; serverUrl: string }> {
+export function listLiveOpencodeServeProcesses(): Array<{
+	pid: number;
+	serverUrl: string;
+}> {
 	try {
-		const out = execSync("ps -axo pid,command | rg 'opencode serve --hostname 127.0.0.1 --port'", {
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-		});
+		const out = execSync(
+			"ps -axo pid,command | rg 'opencode serve --hostname 127.0.0.1 --port'",
+			{
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+			},
+		);
 		return out
 			.split("\n")
 			.map((line: string) => line.trim())
@@ -755,8 +790,12 @@ async function withServeSpawnLock<T>(fn: () => Promise<T>): Promise<T> {
 	try {
 		return await fn();
 	} finally {
-		try { closeSync(fd); } catch {}
-		try { unlinkSync(lockPath); } catch {}
+		try {
+			closeSync(fd);
+		} catch {}
+		try {
+			unlinkSync(lockPath);
+		} catch {}
 	}
 }
 
@@ -791,7 +830,13 @@ export async function spawnServeForProject(input: {
 				updated_at: new Date().toISOString(),
 			};
 			const result = upsertServeRegistry(entry);
-			return { reused: true, adopted: true, entry, registryPath: result.path, reuseStrategy: "live_process_adopted" };
+			return {
+				reused: true,
+				adopted: true,
+				entry,
+				registryPath: result.path,
+				reuseStrategy: "live_process_adopted",
+			};
 		}
 		const port = await allocatePort();
 		const runtimeCfg = getRuntimeConfig({});
@@ -826,13 +871,21 @@ export async function spawnServeForProject(input: {
 			updated_at: new Date().toISOString(),
 		};
 		const result = upsertServeRegistry(entry);
-		return { reused: false, entry, healthy, registryPath: result.path, reuseStrategy: "spawned_new" };
+		return {
+			reused: false,
+			entry,
+			healthy,
+			registryPath: result.path,
+			reuseStrategy: "spawned_new",
+		};
 	});
 }
 
 export function markServeStopped(serveId: string) {
 	const registry = normalizeServeRegistry(readServeRegistry());
-	const entry = registry.entries.find((x) => x.serve_id === serveId || x.opencode_server_url === serveId);
+	const entry = registry.entries.find(
+		(x) => x.serve_id === serveId || x.opencode_server_url === serveId,
+	);
 	if (!entry) return { ok: false, error: "Serve entry not found" };
 	entry.status = "stopped";
 	entry.updated_at = new Date().toISOString();
@@ -879,14 +932,22 @@ export async function cleanupExpiredServes(nowMs?: number) {
 		const sessionList = await fetchJsonSafe(
 			`${entry.opencode_server_url.replace(/\/$/, "")}/session`,
 		);
-		const statusData = sessionStatus.ok && sessionStatus.data && typeof sessionStatus.data === "object"
-			? (sessionStatus.data as Record<string, any>)
-			: {};
-		const sessions = sessionList.ok && Array.isArray(sessionList.data) ? sessionList.data : [];
+		const statusData =
+			sessionStatus.ok &&
+			sessionStatus.data &&
+			typeof sessionStatus.data === "object"
+				? (sessionStatus.data as Record<string, any>)
+				: {};
+		const sessions =
+			sessionList.ok && Array.isArray(sessionList.data) ? sessionList.data : [];
 		const hasBusySession = sessions.some((session: any) => {
 			const sid = asString(session?.id);
 			const state = sid ? statusData[sid] : undefined;
-			return state && typeof state === "object" && asString((state as any).type) === "busy";
+			return (
+				state &&
+				typeof state === "object" &&
+				asString((state as any).type) === "busy"
+			);
 		});
 		if (hasBusySession) {
 			results.push({
@@ -1061,12 +1122,25 @@ export function resolveSessionForRun(input: {
 
 	const filteredSessionList = Array.isArray(input.sessionList)
 		? input.sessionList.filter((session: any) => {
-			if (artifactRepoRoot && JSON.stringify(session || {}).includes(artifactRepoRoot)) return true;
-			if (artifactProjectId && JSON.stringify(session || {}).includes(artifactProjectId)) return true;
-			if (artifactSessionId && asString(session?.id) === artifactSessionId) return true;
-			if (artifactSessionKey && JSON.stringify(session || {}).includes(artifactSessionKey)) return true;
-			return !artifactRepoRoot && !artifactProjectId;
-		})
+				if (
+					artifactRepoRoot &&
+					JSON.stringify(session || {}).includes(artifactRepoRoot)
+				)
+					return true;
+				if (
+					artifactProjectId &&
+					JSON.stringify(session || {}).includes(artifactProjectId)
+				)
+					return true;
+				if (artifactSessionId && asString(session?.id) === artifactSessionId)
+					return true;
+				if (
+					artifactSessionKey &&
+					JSON.stringify(session || {}).includes(artifactSessionKey)
+				)
+					return true;
+				return !artifactRepoRoot && !artifactProjectId;
+			})
 		: [];
 	const resolved = resolveSessionId({
 		explicitSessionId: input.sessionId,
@@ -1197,7 +1271,7 @@ export async function executeHooksAgentCallback(
 	callback: HooksAgentCallbackPayload,
 ) {
 	const response = await fetch(
-		`${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CALLBACK_HTTP_PATH}`,
+		`${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_HOOK_PATH}`,
 		{
 			method: "POST",
 			headers: {
@@ -1239,7 +1313,6 @@ function coerceLifecycleState(
 	return "running";
 }
 
-
 export function buildTaggedTitleForEnvelope(envelope: RoutingEnvelope): string {
 	return buildTaggedSessionTitle({
 		runId: envelope.run_id,
@@ -1251,6 +1324,7 @@ export function buildTaggedTitleForEnvelope(envelope: RoutingEnvelope): string {
 		callbackDeliver: envelope.deliver,
 		projectId: envelope.project_id,
 		repoRoot: envelope.repo_root,
+		agentWorkspaceDir: envelope.agent_workspace_dir,
 	});
 }
 
@@ -1326,8 +1400,12 @@ function selectPromptVariant(input: {
 	}
 	const objective = asString(input.objective) || "";
 	const prompt = asString(input.prompt) || "";
-	const constraintCount = Array.isArray(input.constraints) ? input.constraints.length : 0;
-	const acceptanceCount = Array.isArray(input.acceptanceCriteria) ? input.acceptanceCriteria.length : 0;
+	const constraintCount = Array.isArray(input.constraints)
+		? input.constraints.length
+		: 0;
+	const acceptanceCount = Array.isArray(input.acceptanceCriteria)
+		? input.acceptanceCriteria.length
+		: 0;
 	const complexityScore =
 		objective.length +
 		prompt.length +
@@ -1398,9 +1476,8 @@ export async function verifyPromptAsyncMaterialized(input: {
 			fetchJsonSafe(`${serverUrl}/session/${input.sessionId}/message`),
 			fetchJsonSafe(`${serverUrl}/session/${input.sessionId}`),
 		]);
-		const messages = messageRes.ok && Array.isArray(messageRes.data)
-			? messageRes.data
-			: [];
+		const messages =
+			messageRes.ok && Array.isArray(messageRes.data) ? messageRes.data : [];
 		const hasMessage = messages.some((message: any) => {
 			const info = message?.info;
 			return (
@@ -1487,6 +1564,7 @@ export async function runAttachExecutionForEnvelope(input: {
 		callbackDeliver: input.envelope.deliver,
 		projectId: input.envelope.project_id,
 		repoRoot: input.envelope.repo_root,
+		agentWorkspaceDir: input.envelope.agent_workspace_dir,
 	});
 	const args = [
 		"run",
@@ -1554,6 +1632,7 @@ export function buildContinuationCallbackMetadata(input: {
 		taskId: input.runStatus.taskId,
 		projectId: input.runStatus.envelope.project_id,
 		repoRoot: input.runStatus.envelope.repo_root,
+		agentWorkspaceDir: input.runStatus.envelope.agent_workspace_dir,
 		requestedAgentId: input.runStatus.envelope.requested_agent_id,
 		resolvedAgentId: input.runStatus.envelope.resolved_agent_id,
 		callbackTargetSessionKey:
@@ -1627,9 +1706,15 @@ export async function startExecutionRun(input: {
 	const current =
 		patchRunStatus(input.envelope.run_id, (status) => ({
 			...status,
-			sessionId: sessionResolution.ok ? sessionResolution.sessionId : status.sessionId,
-			opencodeSessionId: sessionResolution.ok ? sessionResolution.sessionId : status.opencodeSessionId,
-			sessionResolvedAt: sessionResolution.ok ? sessionResolution.sessionResolvedAt : status.sessionResolvedAt,
+			sessionId: sessionResolution.ok
+				? sessionResolution.sessionId
+				: status.sessionId,
+			opencodeSessionId: sessionResolution.ok
+				? sessionResolution.sessionId
+				: status.opencodeSessionId,
+			sessionResolvedAt: sessionResolution.ok
+				? sessionResolution.sessionResolvedAt
+				: status.sessionResolvedAt,
 			sessionResolutionStrategy: sessionResolution.sessionResolutionStrategy,
 			sessionResolutionPending: sessionResolution.ok ? false : true,
 			executionLane: "attach_run",
@@ -1645,7 +1730,11 @@ export async function startExecutionRun(input: {
 		ok: Boolean(attachRun.started),
 		runId: input.envelope.run_id,
 		taskId: input.envelope.task_id,
-		sessionId: undefined,
+		sessionId: current.sessionId,
+		opencodeSessionId: current.opencodeSessionId,
+		sessionResolvedAt: current.sessionResolvedAt,
+		sessionResolutionStrategy: current.sessionResolutionStrategy,
+		sessionResolutionPending: current.sessionResolutionPending,
 		state: current.state,
 		sessionMode: "attach_run",
 		createdSession: null,
@@ -1655,7 +1744,7 @@ export async function startExecutionRun(input: {
 
 export function buildHookPolicyChecklist(agentId: string, sessionKey: string) {
 	return {
-		primaryCallbackPath: OPENCODE_CALLBACK_HTTP_PATH,
+		primaryCallbackPath: OPENCODE_CONTINUATION_HOOK_PATH,
 		requirements: {
 			hooksEnabled: true,
 			allowRequestSessionKey: true,

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import {
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -69,9 +70,6 @@ test("callback http route enqueues callback message into target session and wake
 						systemEvents.push({ text, opts });
 						return true;
 					},
-					requestHeartbeatNow(opts: any) {
-						heartbeats.push(opts);
-					},
 				},
 			},
 		},
@@ -123,10 +121,6 @@ test("callback http route enqueues callback message into target session and wake
 		systemEvents[0]?.opts?.contextKey,
 		"opencode:run-1:session.idle",
 	);
-	assert.equal(heartbeats.length, 1);
-	assert.equal(heartbeats[0]?.sessionKey, payload.sessionKey);
-	assert.equal(heartbeats[0]?.sessionId, payload.sessionId);
-	assert.equal(heartbeats[0]?.agentId, payload.agentId);
 });
 
 test("callback http route materializes terminal run artifact on message.updated callback", async () => {
@@ -243,3 +237,5 @@ test("callback http route materializes terminal run artifact on message.updated 
 		rmSync(tempRoot, { recursive: true, force: true });
 	}
 });
+
+

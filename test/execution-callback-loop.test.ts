@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import * as childProcess from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -15,7 +16,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import * as childProcess from "node:child_process";
 
 import { registerOpenCodeBridgeTools } from "../src/registrar";
 
@@ -102,8 +102,8 @@ function setupHarness(configFile: any) {
 
 test("opencode_execute_task starts execution with plugin-owned callback authority", async () => {
 	const callbackRequests: any[] = [];
-	let createdSessionCount = 0;
-	let promptAsyncCount = 0;
+	const createdSessionCount = 0;
+	const promptAsyncCount = 0;
 	let eventReadCount = 0;
 
 	const originalFetch = globalThis.fetch;
@@ -118,12 +118,28 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 		}
 		if (req.method === "GET" && url === "/session") {
 			res.setHeader("content-type", "application/json");
-			res.end(JSON.stringify([{ id: "sess-exec-1", title: "task-exec-1 runId=run-exec-1 taskId=task-exec-1 requested=creator resolved=creator callbackSession=session:origin:exec-1 callbackSessionId=origin-session-1 callbackDeliver=false projectId=proj-exec-1 repoRoot=" + repoRoot } ]));
+			res.end(
+				JSON.stringify([
+					{
+						id: "sess-exec-1",
+						title:
+							"task-exec-1 runId=run-exec-1 taskId=task-exec-1 requested=creator resolved=creator callbackSession=session:origin:exec-1 callbackSessionId=origin-session-1 callbackDeliver=false projectId=proj-exec-1 repoRoot=" +
+							repoRoot,
+					},
+				]),
+			);
 			return;
 		}
 		if (req.method === "GET" && url === "/session/sess-exec-1") {
 			res.setHeader("content-type", "application/json");
-			res.end(JSON.stringify({ id: "sess-exec-1", title: "task-exec-1 runId=run-exec-1 taskId=task-exec-1 requested=creator resolved=creator callbackSession=session:origin:exec-1 callbackSessionId=origin-session-1 callbackDeliver=false projectId=proj-exec-1 repoRoot=" + repoRoot }));
+			res.end(
+				JSON.stringify({
+					id: "sess-exec-1",
+					title:
+						"task-exec-1 runId=run-exec-1 taskId=task-exec-1 requested=creator resolved=creator callbackSession=session:origin:exec-1 callbackSessionId=origin-session-1 callbackDeliver=false projectId=proj-exec-1 repoRoot=" +
+						repoRoot,
+				}),
+			);
 			return;
 		}
 		if (req.method === "GET" && url === "/session/sess-exec-1/message") {
@@ -231,7 +247,10 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 		const payload = parseToolJson(result);
 
 		assert.equal(payload.ok, true);
-		assert.equal(payload.execution.sessionId, undefined);
+		assert.equal(
+			payload.execution.sessionId,
+			payload.execution.opencodeSessionId,
+		);
 		assert.equal(payload.execution.callbackAuthority, "opencode_plugin");
 		assert.equal(payload.execution.continuationEnabled, true);
 
@@ -254,10 +273,7 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 		assert.equal(runStatus.continuation.nextOnFailure.action, "launch_run");
 		assert.equal(createdSessionCount, 0);
 		assert.equal(promptAsyncCount, 0);
-		assert.match(
-			runStatus.lastSummary,
-			/Attach-run dispatched/,
-		);
+		assert.match(runStatus.lastSummary, /Attach-run dispatched/);
 		assert.equal(runStatus.callbackOk, undefined);
 		assert.equal(runStatus.callbackSentAt, undefined);
 		assert.equal(runStatus.callbackAttempts, undefined);
@@ -265,7 +281,11 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 		assert.equal(callbackRequests.length, 0);
 		assert.equal(runStatus.attachRun?.command, "opencode");
 		assert.ok(runStatus.attachRun?.args.includes("--attach"));
-		assert.ok((runStatus.attachRun?.args || []).some((arg: string) => /^http:\/\/127\.0\.0\.1:\d+$/.test(arg)));
+		assert.ok(
+			(runStatus.attachRun?.args || []).some((arg: string) =>
+				/^http:\/\/127\.0\.0\.1:\d+$/.test(arg),
+			),
+		);
 		assert.ok(runStatus.attachRun?.args.includes("--dir"));
 		assert.ok(runStatus.attachRun?.args.includes(repoRoot));
 		assert.ok(runStatus.attachRun?.args.includes("--variant"));

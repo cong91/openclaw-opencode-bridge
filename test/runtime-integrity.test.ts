@@ -263,6 +263,7 @@ test("buildContinuationCallbackMetadata projects continuation correlation fields
 			callback_target_session_id: "sess-origin-5",
 			project_id: "proj-5",
 			repo_root: "/tmp/repo5",
+			agent_workspace_dir: "/tmp/workspaces/agent-5",
 			opencode_server_url: "http://127.0.0.1:4100",
 		},
 	} as any;
@@ -277,6 +278,7 @@ test("buildContinuationCallbackMetadata projects continuation correlation fields
 	assert.equal(metadata.taskId, "task-5");
 	assert.equal(metadata.projectId, "proj-5");
 	assert.equal(metadata.repoRoot, "/tmp/repo5");
+	assert.equal(metadata.agentWorkspaceDir, "/tmp/workspaces/agent-5");
 	assert.equal(metadata.requestedAgentId, "creator");
 	assert.equal(metadata.resolvedAgentId, "coder-lane");
 	assert.equal(metadata.callbackTargetSessionKey, "session:origin:key:5");

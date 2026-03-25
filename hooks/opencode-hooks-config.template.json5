@@ -1,0 +1,28 @@
+{
+  hooks: {
+    enabled: true,
+    token: "${OPENCLAW_HOOKS_TOKEN}",
+    path: "/hooks",
+    defaultSessionKey: "hook:ingress",
+    allowRequestSessionKey: true,
+    allowedAgentIds: ["scrum", "creator", "fullstack", "trader"],
+    allowedSessionKeyPrefixes: ["hook:", "opencode:"],
+    transformsDir: "./hooks/transforms",
+    mappings: [
+      {
+        id: "opencode-callback",
+        match: {
+          path: "opencode-callback",
+          source: "opencode.callback",
+        },
+        action: "agent",
+        agentId: "scrum",
+        sessionKey: "opencode:default",
+        deliver: false,
+        transform: {
+          module: "opencode-callback.js",
+        },
+      },
+    ],
+  },
+}

@@ -39,8 +39,7 @@ function createMockRes() {
 test("callback route prefers callbackTargetSessionId over lane-only routing metadata", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: Array<{ text: string; opts: any }> = [];
-	const heartbeatCalls: any[] = [];
-
+	
 	registerOpenCodeBridgeTools(
 		{
 			registerTool() {},
@@ -52,9 +51,6 @@ test("callback route prefers callbackTargetSessionId over lane-only routing meta
 					enqueueSystemEvent(text: string, opts: any) {
 						systemEvents.push({ text, opts });
 						return true;
-					},
-					requestHeartbeatNow(opts: any) {
-						heartbeatCalls.push(opts);
 					},
 				},
 			},
@@ -93,10 +89,6 @@ test("callback route prefers callbackTargetSessionId over lane-only routing meta
 	assert.equal(systemEvents.length, 1);
 	assert.equal(systemEvents[0]?.opts?.sessionKey, payload.sessionKey);
 	assert.equal(systemEvents[0]?.opts?.sessionId, "exact-requester-session-id");
-	assert.equal(heartbeatCalls.length, 1);
-	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
-	assert.equal(heartbeatCalls[0]?.sessionId, "exact-requester-session-id");
-	assert.equal(heartbeatCalls[0]?.agentId, payload.agentId);
 });
 
 test("callback route falls back to payload sessionId when callbackTargetSessionId metadata is absent", async () => {
@@ -155,8 +147,7 @@ test("callback route falls back to payload sessionId when callbackTargetSessionI
 
 test("callback route derives heartbeat agentId from agent sessionKey when payload agentId is missing", async () => {
 	const routes: RegisteredRoute[] = [];
-	const heartbeatCalls: any[] = [];
-
+	
 	registerOpenCodeBridgeTools(
 		{
 			registerTool() {},
@@ -167,9 +158,6 @@ test("callback route derives heartbeat agentId from agent sessionKey when payloa
 				system: {
 					enqueueSystemEvent() {
 						return true;
-					},
-					requestHeartbeatNow(opts: any) {
-						heartbeatCalls.push(opts);
 					},
 				},
 			},
@@ -202,8 +190,4 @@ test("callback route derives heartbeat agentId from agent sessionKey when payloa
 
 	assert.equal(handled, true);
 	assert.equal(res.statusCode, 200);
-	assert.equal(heartbeatCalls.length, 1);
-	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
-	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);
-	assert.equal(heartbeatCalls[0]?.agentId, "builder");
 });

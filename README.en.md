@@ -42,8 +42,14 @@ Global mode:
 npm run install:bridge:global
 ```
 
+## Canonical hook continuation artifacts
+This repository now carries the hook continuation artifacts needed for shipping the new loop:
+- `hooks/opencode-callback.js`
+- `hooks/opencode-hooks-config.template.json5`
+- install guide: `docs/install/opencode-hook-install-2026-03-25.md`
+
 ## Required callback environment
-The OpenCode-side callback plugin needs:
+The OpenCode-side callback plugin / hook continuation needs:
 - `OPENCLAW_HOOK_BASE_URL`
 - `OPENCLAW_HOOK_TOKEN`
 

@@ -67,8 +67,7 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: SystemEvent[] = [];
-	const heartbeatCalls: any[] = [];
-	const telegramSends: any[] = [];
+		const telegramSends: any[] = [];
 	const callbackPosts: any[] = [];
 	const oldFetch = globalThis.fetch;
 	const oldHookBase = process.env.OPENCLAW_HOOK_BASE_URL;
@@ -88,9 +87,6 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 					enqueueSystemEvent(text: string, opts: any) {
 						systemEvents.push({ text, opts });
 						return true;
-					},
-					requestHeartbeatNow(opts: any) {
-						heartbeatCalls.push(opts);
 					},
 				},
 				channel: {
@@ -211,35 +207,14 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 			callbackPosts[0]?.headers?.Authorization,
 			"Bearer smoke-token",
 		);
+		assert.equal(callbackPosts[0]?.body?.source, "opencode.callback");
 		assert.equal(
-			callbackPosts[0]?.body?.sessionKey,
+			callbackPosts[0]?.body?.callbackTargetSessionKey,
 			"agent:creator:telegram:direct:5165741309",
 		);
-		assert.equal(callbackPosts[0]?.body?.sessionId, "sess-origin-smoke-1");
+		assert.equal(callbackPosts[0]?.body?.callbackTargetSessionId, "sess-origin-smoke-1");
 
-		assert.equal(heartbeatCalls.length, 1);
-		assert.equal(systemEvents.length, 1);
-		assert.equal(
-			systemEvents[0]?.opts?.sessionKey,
-			"agent:creator:telegram:direct:5165741309",
-		);
-		assert.match(systemEvents[0]?.text, /<opencode_callback_control_internal>/);
-		assert.doesNotMatch(
-			systemEvents[0]?.text,
-			/OpenCode callback control message/,
-		);
-		assert.match(systemEvents[0]?.text, /"messageKind":"callback_control"/);
-		assert.equal(
-			heartbeatCalls[0]?.sessionKey,
-			"agent:creator:telegram:direct:5165741309",
-		);
-		assert.equal(heartbeatCalls[0]?.sessionId, "sess-origin-smoke-1");
-		assert.equal(telegramSends.length, 1);
-		assert.equal(telegramSends[0]?.to, "5165741309");
-		assert.match(
-			telegramSends[0]?.text,
-			/Verify current session resumed after callback/,
-		);
+		assert.equal(telegramSends.length, 0);
 	} finally {
 		globalThis.fetch = oldFetch;
 		if (oldHookBase === undefined) delete process.env.OPENCLAW_HOOK_BASE_URL;

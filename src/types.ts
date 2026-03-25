@@ -24,6 +24,7 @@ export type RoutingEnvelope = {
 	callback_target_session_id?: string;
 	project_id: string;
 	repo_root: string;
+	agent_workspace_dir?: string;
 	opencode_server_url: string;
 	channel?: string;
 	to?: string;
@@ -82,6 +83,7 @@ export type OpenCodeContinuationCallbackMetadata = {
 	taskId?: string;
 	projectId?: string;
 	repoRoot?: string;
+	agentWorkspaceDir?: string;
 	requestedAgentId?: string;
 	resolvedAgentId?: string;
 	callbackTargetSessionKey?: string;
@@ -96,7 +98,10 @@ export type BridgeRunStatus = {
 	runId: string;
 	state: BridgeLifecycleState;
 	realState?: BridgeLifecycleState;
-	stateConfidence?: "artifact_only" | "artifact_plus_session" | "artifact_plus_callback";
+	stateConfidence?:
+		| "artifact_only"
+		| "artifact_plus_session"
+		| "artifact_plus_callback";
 	warnings?: string[];
 	callbackCleaned?: boolean;
 	lastEvent?: OpenCodeEventKind | null;
@@ -172,7 +177,10 @@ export type RunStatusResponse = {
 	};
 	state: BridgeLifecycleState;
 	realState?: BridgeLifecycleState | null;
-	stateConfidence?: "artifact_only" | "artifact_plus_session" | "artifact_plus_callback";
+	stateConfidence?:
+		| "artifact_only"
+		| "artifact_plus_session"
+		| "artifact_plus_callback";
 	warnings?: string[];
 	currentState?: BridgeLifecycleState | null;
 	current_state?: BridgeLifecycleState | null;
@@ -287,7 +295,12 @@ export type SessionTailResponse = {
 	taskId?: string;
 	projectId?: string;
 	repoRoot?: string;
-	resolvedFrom?: "explicit_session_id" | "artifact_session_id" | "callback_target" | "project_filtered_fallback" | "scored_fallback";
+	resolvedFrom?:
+		| "explicit_session_id"
+		| "artifact_session_id"
+		| "callback_target"
+		| "project_filtered_fallback"
+		| "scored_fallback";
 	correlation?: {
 		sessionResolution: {
 			strategy: string;

@@ -60,8 +60,14 @@ Global mode:
 npm run install:bridge:global
 ```
 
+## Hook continuation artifact (canonical trong repo)
+Repo hiện đã chứa sẵn artifact hook continuation để ship cùng package:
+- `hooks/opencode-callback.js`
+- `hooks/opencode-hooks-config.template.json5`
+- hướng dẫn cài: `docs/install/opencode-hook-install-2026-03-25.md`
+
 ## Environment callback tối thiểu
-OpenCode-side callback plugin cần:
+OpenCode-side plugin / hook continuation cần:
 - `OPENCLAW_HOOK_BASE_URL`
 - `OPENCLAW_HOOK_TOKEN`
 

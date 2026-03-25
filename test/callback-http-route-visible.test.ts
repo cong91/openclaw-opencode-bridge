@@ -49,7 +49,6 @@ function createMockRes() {
 test("callback http route enqueues control message and wakes session without emitting user-visible ack text", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: any[] = [];
-	const heartbeatCalls: any[] = [];
 	const telegramSends: any[] = [];
 
 	registerOpenCodeBridgeTools(
@@ -63,9 +62,6 @@ test("callback http route enqueues control message and wakes session without emi
 					enqueueSystemEvent(text: string, opts: any) {
 						systemEvents.push({ text, opts });
 						return true;
-					},
-					requestHeartbeatNow(opts: any) {
-						heartbeatCalls.push(opts);
 					},
 				},
 				channel: {
@@ -124,10 +120,6 @@ test("callback http route enqueues control message and wakes session without emi
 		systemEvents[0].text,
 		/OpenCode callback received for run run-visible-1; code finished; agent is continuing\./,
 	);
-	assert.equal(heartbeatCalls.length, 1);
-	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
-	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);
-	assert.equal(heartbeatCalls[0]?.agentId, payload.agentId);
 	assert.equal(telegramSends.length, 1);
 	assert.equal(telegramSends[0]?.to, "5165741309");
 	assert.equal(telegramSends[0]?.text, "Background run update received.");
@@ -141,8 +133,7 @@ test("callback http route enqueues control message and wakes session without emi
 test("callback http route still avoids user-visible ack text even when deliver=false", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: any[] = [];
-	const heartbeatCalls: any[] = [];
-	const telegramSends: any[] = [];
+		const telegramSends: any[] = [];
 
 	registerOpenCodeBridgeTools(
 		{
@@ -155,9 +146,6 @@ test("callback http route still avoids user-visible ack text even when deliver=f
 					enqueueSystemEvent(text: string, opts: any) {
 						systemEvents.push({ text, opts });
 						return true;
-					},
-					requestHeartbeatNow(opts: any) {
-						heartbeatCalls.push(opts);
 					},
 				},
 				channel: {
@@ -210,18 +198,13 @@ test("callback http route still avoids user-visible ack text even when deliver=f
 		systemEvents[0].text,
 		/OpenCode callback control message/,
 	);
-	assert.equal(heartbeatCalls.length, 1);
-	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
-	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);
-	assert.equal(heartbeatCalls[0]?.agentId, payload.agentId);
 	assert.equal(telegramSends.length, 0);
 });
 
 test("callback http route does not send telegram notify for non-direct telegram session even when deliver=true", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: any[] = [];
-	const heartbeatCalls: any[] = [];
-	const telegramSends: any[] = [];
+		const telegramSends: any[] = [];
 
 	registerOpenCodeBridgeTools(
 		{
@@ -234,9 +217,6 @@ test("callback http route does not send telegram notify for non-direct telegram 
 					enqueueSystemEvent(text: string, opts: any) {
 						systemEvents.push({ text, opts });
 						return true;
-					},
-					requestHeartbeatNow(opts: any) {
-						heartbeatCalls.push(opts);
 					},
 				},
 				channel: {
@@ -289,9 +269,6 @@ test("callback http route does not send telegram notify for non-direct telegram 
 		systemEvents[0].text,
 		/OpenCode callback control message/,
 	);
-	assert.equal(heartbeatCalls.length, 1);
-	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
-	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);
 	assert.equal(telegramSends.length, 0);
 });
 
@@ -347,8 +324,7 @@ test("callback http route sends exactly one telegram notify when continuation no
 
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: any[] = [];
-	const heartbeatCalls: any[] = [];
-	const telegramSends: any[] = [];
+		const telegramSends: any[] = [];
 
 	registerOpenCodeBridgeTools(
 		{
@@ -361,9 +337,6 @@ test("callback http route sends exactly one telegram notify when continuation no
 					enqueueSystemEvent(text: string, opts: any) {
 						systemEvents.push({ text, opts });
 						return true;
-					},
-					requestHeartbeatNow(opts: any) {
-						heartbeatCalls.push(opts);
 					},
 				},
 				channel: {
@@ -411,8 +384,7 @@ test("callback http route sends exactly one telegram notify when continuation no
 		assert.equal(res.statusCode, 200);
 		assert.equal(systemEvents.length, 1);
 		assert.match(systemEvents[0].text, /<opencode_callback_control_internal>/);
-		assert.equal(heartbeatCalls.length, 1);
-		assert.equal(telegramSends.length, 1);
+				assert.equal(telegramSends.length, 1);
 		assert.equal(telegramSends[0]?.to, "5165741309");
 		assert.equal(
 			telegramSends[0]?.text,
@@ -423,6 +395,248 @@ test("callback http route sends exactly one telegram notify when continuation no
 			"opencode:run-visible-continue-1:task.completed:continuation-notify-telegram",
 		);
 	} finally {
+		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+		else process.env.OPENCLAW_STATE_DIR = prevStateDir;
+		rmSync(tempRoot, { recursive: true, force: true });
+	}
+});
+
+
+test("callback launch_run dispatches to custom hook endpoint instead of enqueueing session baton", async () => {
+	const tempRoot = mkdtempSync(join(tmpdir(), "opencode-bridge-hook-dispatch-"));
+	const stateDir = join(tempRoot, "state");
+	const bridgeDir = join(stateDir, "opencode-bridge");
+	const runsDir = join(bridgeDir, "runs");
+	mkdirSync(runsDir, { recursive: true });
+	writeFileSync(
+		join(bridgeDir, "config.json"),
+		JSON.stringify(
+			{
+				opencodeServerUrl: "http://127.0.0.1:4096",
+				hookBaseUrl: "http://127.0.0.1:18789",
+				hookToken: "test-token"
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
+	const runId = "run-hook-dispatch-1";
+	writeFileSync(
+		join(runsDir, `${runId}.json`),
+		JSON.stringify({
+			taskId: "task-hook-dispatch-1",
+			runId,
+			state: "running",
+			lastEvent: "task.progress",
+			updatedAt: "2000-01-01T00:00:00.000Z",
+			envelope: {
+				task_id: "task-hook-dispatch-1",
+				run_id: runId,
+				agent_id: "creator",
+				requested_agent_id: "scrum",
+				resolved_agent_id: "creator",
+				session_key: "hook:opencode:creator:task-hook-dispatch-1",
+				origin_session_key: "agent:scrum:telegram:direct:5165741309",
+				origin_session_id: "telegram-msg-origin-1",
+				callback_target_session_key: "agent:scrum:telegram:direct:5165741309",
+				callback_target_session_id: "telegram-msg-origin-1",
+				project_id: "proj-hook-dispatch-1",
+				repo_root: "/tmp/repo-hook-dispatch-1",
+				agent_workspace_dir: "/tmp/repo-hook-dispatch-1",
+				opencode_server_url: "http://opencode.local"
+			},
+			continuation: {
+				workflowId: "wf-hook-1",
+				stepId: "step-hook-1",
+				callbackEventKind: "opencode.callback",
+				nextOnSuccess: {
+					action: "launch_run",
+					taskId: "verify-hook-1",
+					objective: "Verify callback output",
+					prompt: "Run verification now"
+				}
+			}
+		}, null, 2),
+		"utf8"
+	);
+	const prevStateDir = process.env.OPENCLAW_STATE_DIR;
+	process.env.OPENCLAW_STATE_DIR = stateDir;
+	const oldFetch = globalThis.fetch;
+	const fetchCalls = [];
+	globalThis.fetch = async (url, init) => {
+		fetchCalls.push({ url: String(url), init });
+		return {
+			ok: true,
+			status: 202,
+			text: async () => '{"ok":true}'
+		};
+	};
+	const routes = [];
+	const systemEvents = [];
+	registerOpenCodeBridgeTools({
+		registerTool() {},
+		registerHttpRoute(route) { routes.push(route); },
+		runtime: {
+			system: {
+				enqueueSystemEvent(text, opts) { systemEvents.push({ text, opts }); return true; }
+			}
+		}
+	}, { hookToken: "test-token" });
+	try {
+		const route = routes.find((x) => x.path === "/plugin/opencode-bridge/callback");
+		assert.ok(route);
+		const payload = {
+			name: "OpenCode",
+			agentId: "scrum",
+			sessionKey: "agent:scrum:telegram:direct:5165741309",
+			sessionId: "telegram-msg-origin-1",
+			wakeMode: "now",
+			deliver: false,
+			message: JSON.stringify({
+				kind: "opencode.callback",
+				eventType: "task.completed",
+				runId,
+				taskId: "task-hook-dispatch-1",
+				requestedAgentId: "scrum",
+				resolvedAgentId: "creator",
+				callbackTargetSessionKey: "agent:scrum:telegram:direct:5165741309",
+				callbackTargetSessionId: "telegram-msg-origin-1"
+			})
+		};
+		const req = createMockReq(JSON.stringify(payload), "test-token");
+		const res = createMockRes();
+		const handled = await route.handler(req, res);
+		assert.equal(handled, true);
+		assert.equal(res.statusCode, 200);
+		assert.equal(fetchCalls.length, 1);
+		assert.equal(fetchCalls[0].url, "http://127.0.0.1:18789/hooks/opencode-callback");
+		const body = JSON.parse(fetchCalls[0].init.body);
+		assert.equal(body.source, "opencode.callback");
+		assert.equal(body.runId, runId);
+		assert.equal(body.next.action, "launch_run");
+		assert.equal(body.next.taskId, "verify-hook-1");
+		assert.equal(systemEvents.length, 1);
+		assert.match(systemEvents[0].text, /<opencode_callback_control_internal>/);
+	} finally {
+		globalThis.fetch = oldFetch;
+		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+		else process.env.OPENCLAW_STATE_DIR = prevStateDir;
+		rmSync(tempRoot, { recursive: true, force: true });
+	}
+});
+
+
+test("hook continuation payload includes derived loop intent for session.error callback", async () => {
+	const tempRoot = mkdtempSync(join(tmpdir(), "opencode-bridge-hook-intent-"));
+	const stateDir = join(tempRoot, "state");
+	const bridgeDir = join(stateDir, "opencode-bridge");
+	const runsDir = join(bridgeDir, "runs");
+	mkdirSync(runsDir, { recursive: true });
+	writeFileSync(
+		join(bridgeDir, "config.json"),
+		JSON.stringify({
+			opencodeServerUrl: "http://127.0.0.1:4096",
+			hookBaseUrl: "http://127.0.0.1:18789",
+			hookToken: "test-token"
+		}, null, 2),
+		"utf8",
+	);
+	const runId = "run-hook-intent-1";
+	writeFileSync(
+		join(bridgeDir, "config.json"),
+		JSON.stringify({
+			opencodeServerUrl: "http://127.0.0.1:4096",
+			hookBaseUrl: "http://127.0.0.1:18789",
+			hookToken: "test-token"
+		}, null, 2),
+		"utf8",
+	);
+	writeFileSync(
+		join(runsDir, `${runId}.json`),
+		JSON.stringify({
+			taskId: "task-hook-intent-1",
+			runId,
+			state: "running",
+			lastEvent: "task.progress",
+			updatedAt: "2000-01-01T00:00:00.000Z",
+			envelope: {
+				task_id: "task-hook-intent-1",
+				run_id: runId,
+				agent_id: "scrum",
+				requested_agent_id: "scrum",
+				resolved_agent_id: "scrum",
+				session_key: "hook:opencode:scrum:task-hook-intent-1",
+				origin_session_key: "agent:scrum:telegram:direct:5165741309",
+				origin_session_id: "probe-session-intent-1",
+				callback_target_session_key: "agent:scrum:telegram:direct:5165741309",
+				callback_target_session_id: "probe-session-intent-1",
+				project_id: "TAA",
+				repo_root: "/Users/mrcagents/Work/projects/TAA/repo",
+				agent_workspace_dir: "/Users/mrcagents/.openclaw/workspace/scrum",
+				opencode_server_url: "http://127.0.0.1:50565"
+			},
+			continuation: {
+				workflowId: "wf-hook-intent-1",
+				stepId: "step-hook-intent-1",
+				callbackEventKind: "opencode.callback",
+				nextOnFailure: {
+					action: "launch_run",
+					taskId: "fix-hook-intent-1",
+					objective: "Fix verification failure",
+					prompt: "Inspect the verification error and continue with the corrective next step"
+				}
+			}
+		}, null, 2),
+		"utf8"
+	);
+	const prevStateDir = process.env.OPENCLAW_STATE_DIR;
+	process.env.OPENCLAW_STATE_DIR = stateDir;
+	const oldFetch = globalThis.fetch;
+	const fetchCalls = [];
+	globalThis.fetch = async (url, init) => {
+		fetchCalls.push({ url: String(url), init });
+		return { ok: true, status: 202, text: async () => '{"ok":true}' };
+	};
+	const routes = [];
+	registerOpenCodeBridgeTools({
+		registerTool() {},
+		registerHttpRoute(route) { routes.push(route); },
+		runtime: { system: { enqueueSystemEvent() { return true; } } }
+	}, { hookToken: "test-token" });
+	try {
+		const route = routes.find((x) => x.path === "/plugin/opencode-bridge/callback");
+		assert.ok(route);
+		const payload = {
+			name: "OpenCode",
+			agentId: "scrum",
+			sessionKey: "agent:scrum:telegram:direct:5165741309",
+			sessionId: "probe-session-intent-1",
+			wakeMode: "now",
+			deliver: false,
+			message: JSON.stringify({
+				kind: "opencode.callback",
+				eventType: "session.error",
+				runId,
+				taskId: "task-hook-intent-1",
+				requestedAgentId: "scrum",
+				resolvedAgentId: "scrum",
+				callbackTargetSessionKey: "agent:scrum:telegram:direct:5165741309",
+				callbackTargetSessionId: "probe-session-intent-1"
+			})
+		};
+		const req = createMockReq(JSON.stringify(payload), "test-token");
+		const res = createMockRes();
+		const handled = await route.handler(req, res);
+		assert.equal(handled, true);
+		assert.equal(res.statusCode, 200);
+		assert.equal(fetchCalls.length, 1);
+		const body = JSON.parse(fetchCalls[0].init.body);
+		assert.equal(body.intent.kind, "launch_run");
+		assert.equal(body.intent.taskId, "fix-hook-intent-1");
+		assert.match(body.intent.prompt, /previous step failed|verification error|corrective next step/i);
+	} finally {
+		globalThis.fetch = oldFetch;
 		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
 		else process.env.OPENCLAW_STATE_DIR = prevStateDir;
 		rmSync(tempRoot, { recursive: true, force: true });

@@ -114,8 +114,7 @@ test("pragmatic smoke: callback arrives, session wakes, and direct telegram ingr
 		/OpenCode callback control message/,
 	);
 	assert.match(systemEvents[0]?.text, /"messageKind":"callback_control"/);
-	assert.equal(heartbeats.length, 1);
-	assert.equal(telegramSends.length, 1);
+		assert.equal(telegramSends.length, 1);
 	assert.equal(telegramSends[0]?.to, "5165741309");
 	assert.equal(telegramSends[0]?.text, "Background run update received.");
 	assert.equal(telegramSends[0]?.opts?.silent, false);

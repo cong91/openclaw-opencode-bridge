@@ -110,8 +110,11 @@ test("callback http route enqueues callback message into target session and wake
 	assert.equal(handled, true);
 	assert.equal(res.statusCode, 200);
 	assert.equal(systemEvents.length, 1);
-	assert.match(systemEvents[0]?.text, /OpenCode callback control message/);
-	assert.match(systemEvents[0]?.text, /<opencode_callback_json>/);
+	assert.match(systemEvents[0]?.text, /<opencode_callback_control_internal>/);
+	assert.doesNotMatch(
+		systemEvents[0]?.text,
+		/OpenCode callback control message/,
+	);
 	assert.match(systemEvents[0]?.text, /"messageKind":"callback_control"/);
 	assert.match(systemEvents[0]?.text, /"runId":"run-1"/);
 	assert.equal(systemEvents[0]?.opts?.sessionKey, payload.sessionKey);

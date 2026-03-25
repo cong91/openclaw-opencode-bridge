@@ -443,26 +443,16 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						callback: callback.message,
 					};
 			const callbackMessageText = [
-				"OpenCode callback control message. Do not treat this as a normal user query.",
-				"Use the callback metadata below to continue the workflow in this session.",
-				"",
-				"<opencode_callback_json>",
+				"<opencode_callback_control_internal>",
 				JSON.stringify(callbackControlEnvelope),
-				"</opencode_callback_json>",
+				"</opencode_callback_control_internal>",
 			].join("\n");
 			api.runtime.system.enqueueSystemEvent(callbackMessageText, {
 				...callbackTarget,
 				...(dedupeKey ? { contextKey: dedupeKey } : {}),
 			});
-			const callbackEventType = parsed.metadata?.eventType;
-			const callbackLooksTerminal =
-				callbackEventType === "message.updated" ||
-				callbackEventType === "task.completed" ||
-				callbackEventType === "task.failed" ||
-				callbackEventType === "task.stalled";
-			const callbackAckText = parsed.metadata
-				? `OpenCode callback received for run ${parsed.metadata.runId || "unknown-run"}; ${callbackLooksTerminal ? "code finished; " : ""}agent is continuing.`
-				: "OpenCode callback received; agent is continuing.";
+			const callbackAckText =
+				"Background run update received. Agent is continuing.";
 			const telegramDirectMatch = callback.sessionKey.match(
 				/^agent:[^:]+:telegram:direct:(.+)$/,
 			);
@@ -539,7 +529,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					patchRunStatus(parsed.metadata.runId, (current) => ({
 						...current,
 						attachRun: {
-							...(current.attachRun || {}),
+							...current.attachRun,
 							cleaned: killResult === "sigterm_sent",
 							cleanedAt: new Date().toISOString(),
 							killSignal: "SIGTERM",
@@ -592,25 +582,65 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						commandPayload,
 					});
 				} else if (step?.action === "notify") {
-					const notifyMessage = [
-						`OpenCode callback received for run ${parsed.metadata?.runId || "unknown-run"}.`,
+					const notifyMessage =
 						step.objective ||
-							step.prompt ||
-							"Next step requires operator notice.",
-					].join("\n");
-					api.runtime.system.enqueueSystemEvent(notifyMessage, {
-						...callbackTarget,
-						...(dedupeKey
-							? { contextKey: `${dedupeKey}:continuation-notify` }
-							: {}),
-					});
-					appendCallbackDebugAudit({
-						phase: "continuation_notify_enqueued",
-						sessionKey: callback.sessionKey,
-						dedupeKey,
-						runId: parsed.metadata?.runId || null,
-						notifyMessage,
-					});
+						step.prompt ||
+						"Next step requires operator notice.";
+					if (
+						typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
+							"function" &&
+						telegramDirectTo
+					) {
+						try {
+							await api.runtime.channel.telegram.sendMessageTelegram(
+								telegramDirectTo,
+								notifyMessage,
+								{
+									...(dedupeKey
+										? {
+												contextKey: `${dedupeKey}:continuation-notify-telegram`,
+											}
+										: {}),
+									silent: false,
+								},
+							);
+							appendCallbackDebugAudit({
+								phase: "continuation_notify_telegram_sent",
+								sessionKey: callback.sessionKey,
+								telegramTo: telegramDirectTo,
+								dedupeKey,
+								runId: parsed.metadata?.runId || null,
+								notifyMessage,
+							});
+						} catch (error) {
+							appendCallbackDebugAudit({
+								phase: "continuation_notify_telegram_failed",
+								sessionKey: callback.sessionKey,
+								telegramTo: telegramDirectTo,
+								dedupeKey,
+								runId: parsed.metadata?.runId || null,
+								notifyMessage,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+					} else {
+						api.runtime.system.enqueueSystemEvent(notifyMessage, {
+							...callbackTarget,
+							...(dedupeKey
+								? { contextKey: `${dedupeKey}:continuation-notify` }
+								: {}),
+						});
+						appendCallbackDebugAudit({
+							phase: "continuation_notify_enqueued",
+							sessionKey: callback.sessionKey,
+							dedupeKey,
+							runId: parsed.metadata?.runId || null,
+							notifyMessage,
+							reason: telegramDirectTo
+								? "telegram_channel_unavailable"
+								: "non_telegram_direct_session",
+						});
+					}
 				}
 			}
 			sendJson(res, 200, {

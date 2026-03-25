@@ -110,7 +110,11 @@ test("callback http route enqueues control message, wakes session, and sends dir
 	assert.equal(handled, true);
 	assert.equal(res.statusCode, 200);
 	assert.equal(systemEvents.length, 1);
-	assert.match(systemEvents[0].text, /OpenCode callback control message/);
+	assert.match(systemEvents[0].text, /<opencode_callback_control_internal>/);
+	assert.doesNotMatch(
+		systemEvents[0].text,
+		/OpenCode callback control message/,
+	);
 	assert.match(systemEvents[0].text, /"messageKind":"callback_control"/);
 	assert.equal(systemEvents[0]?.opts?.sessionId, payload.sessionId);
 	assert.doesNotMatch(
@@ -125,7 +129,7 @@ test("callback http route enqueues control message, wakes session, and sends dir
 	assert.equal(telegramSends[0]?.to, "5165741309");
 	assert.match(
 		telegramSends[0]?.text,
-		/OpenCode callback received for run run-visible-1; code finished; agent is continuing\./,
+		/Background run update received\. Agent is continuing\./,
 	);
 	assert.equal(telegramSends[0]?.opts?.silent, false);
 });
@@ -197,7 +201,11 @@ test("callback http route sends direct telegram ack even when deliver=false", as
 	assert.equal(handled, true);
 	assert.equal(res.statusCode, 200);
 	assert.equal(systemEvents.length, 1);
-	assert.match(systemEvents[0].text, /OpenCode callback control message/);
+	assert.match(systemEvents[0].text, /<opencode_callback_control_internal>/);
+	assert.doesNotMatch(
+		systemEvents[0].text,
+		/OpenCode callback control message/,
+	);
 	assert.equal(heartbeatCalls.length, 1);
 	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
 	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);
@@ -206,7 +214,7 @@ test("callback http route sends direct telegram ack even when deliver=false", as
 	assert.equal(telegramSends[0]?.to, "5165741309");
 	assert.match(
 		telegramSends[0]?.text,
-		/OpenCode callback received for run run-visible-2; code finished; agent is continuing\./,
+		/Background run update received\. Agent is continuing\./,
 	);
 	assert.equal(telegramSends[0]?.opts?.silent, false);
 });
@@ -278,7 +286,11 @@ test("callback http route does not send telegram ack for telegram group session"
 	assert.equal(handled, true);
 	assert.equal(res.statusCode, 200);
 	assert.equal(systemEvents.length, 1);
-	assert.match(systemEvents[0].text, /OpenCode callback control message/);
+	assert.match(systemEvents[0].text, /<opencode_callback_control_internal>/);
+	assert.doesNotMatch(
+		systemEvents[0].text,
+		/OpenCode callback control message/,
+	);
 	assert.equal(heartbeatCalls.length, 1);
 	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
 	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);

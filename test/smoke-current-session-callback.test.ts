@@ -234,15 +234,10 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 			"agent:creator:telegram:direct:5165741309",
 		);
 		assert.equal(heartbeatCalls[0]?.sessionId, "sess-origin-smoke-1");
-		assert.equal(telegramSends.length, 2);
+		assert.equal(telegramSends.length, 1);
 		assert.equal(telegramSends[0]?.to, "5165741309");
 		assert.match(
 			telegramSends[0]?.text,
-			/Background run update received\. Agent is continuing\./,
-		);
-		assert.equal(telegramSends[1]?.to, "5165741309");
-		assert.match(
-			telegramSends[1]?.text,
 			/Verify current session resumed after callback/,
 		);
 	} finally {

@@ -95,6 +95,10 @@ export type BridgeRunStatus = {
 	taskId: string;
 	runId: string;
 	state: BridgeLifecycleState;
+	realState?: BridgeLifecycleState;
+	stateConfidence?: "artifact_only" | "artifact_plus_session" | "artifact_plus_callback";
+	warnings?: string[];
+	callbackCleaned?: boolean;
 	lastEvent?: OpenCodeEventKind | null;
 	lastSummary?: string;
 	updatedAt: string;
@@ -167,6 +171,9 @@ export type RunStatusResponse = {
 		};
 	};
 	state: BridgeLifecycleState;
+	realState?: BridgeLifecycleState | null;
+	stateConfidence?: "artifact_only" | "artifact_plus_session" | "artifact_plus_callback";
+	warnings?: string[];
 	currentState?: BridgeLifecycleState | null;
 	current_state?: BridgeLifecycleState | null;
 	lastEvent?: OpenCodeEventKind | null;
@@ -192,6 +199,20 @@ export type RunStatusResponse = {
 	};
 	apiSnapshot?: OpenCodeApiSnapshot;
 	continuation?: OpenCodeRunContinuation;
+	callbackSummary?: {
+		ok?: boolean;
+		status?: number;
+		body?: string;
+	};
+	attachRunSummary?: {
+		pid?: number;
+		started?: boolean;
+		cleaned?: boolean;
+		cleanedAt?: string;
+		killSignal?: string;
+		killResult?: string;
+	};
+	operatorHints?: string[];
 	note?: string;
 };
 
@@ -223,11 +244,20 @@ export type RunEventsResponse = {
 	runId?: string;
 	taskId?: string;
 	sessionId?: string;
+	projectId?: string;
+	repoRoot?: string;
 	correlation?: {
 		sessionResolution?: {
 			strategy: string;
 			score?: number;
 		};
+	};
+	progressionSummary?: {
+		hasStarted?: boolean;
+		hasSubagentActivity?: boolean;
+		hasToolHeavyLoop?: boolean;
+		hasCallbackEvidence?: boolean;
+		hasTerminalEvent?: boolean;
 	};
 	scope: EventScope;
 	schemaVersion: "opencode.event.v1";
@@ -255,6 +285,9 @@ export type SessionTailResponse = {
 	sessionId: string;
 	runId?: string;
 	taskId?: string;
+	projectId?: string;
+	repoRoot?: string;
+	resolvedFrom?: "explicit_session_id" | "artifact_session_id" | "callback_target" | "project_filtered_fallback" | "scored_fallback";
 	correlation?: {
 		sessionResolution: {
 			strategy: string;

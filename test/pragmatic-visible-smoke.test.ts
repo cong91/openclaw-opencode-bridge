@@ -38,7 +38,7 @@ function createMockRes() {
 	} as any;
 }
 
-test("pragmatic smoke: callback arrives, session wakes, and visible telegram confirmation is sent", async () => {
+test("pragmatic smoke: callback arrives, session wakes, and direct telegram ingress notify is sent", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: Array<{ text: string; opts: any }> = [];
 	const heartbeats: any[] = [];
@@ -117,9 +117,10 @@ test("pragmatic smoke: callback arrives, session wakes, and visible telegram con
 	assert.equal(heartbeats.length, 1);
 	assert.equal(telegramSends.length, 1);
 	assert.equal(telegramSends[0]?.to, "5165741309");
-	assert.match(
-		telegramSends[0]?.text,
-		/Background run update received\. Agent is continuing\./,
-	);
+	assert.equal(telegramSends[0]?.text, "Background run update received.");
 	assert.equal(telegramSends[0]?.opts?.silent, false);
+	assert.equal(
+		telegramSends[0]?.opts?.contextKey,
+		"opencode:run-pragmatic-1:task.completed:callback-ingress-telegram",
+	);
 });

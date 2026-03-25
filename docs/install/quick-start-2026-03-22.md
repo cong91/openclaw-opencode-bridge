@@ -96,4 +96,8 @@ Nếu callback path đã được wiring:
 ## Ghi chú
 - Local debug mode và productized install mode là 2 flow khác nhau.
 - Không dùng `openclaw plugins install -l` như flow debug chính cho repo này khi local path policy còn gây nhiễu.
-- Project binding phải fail-closed: nếu serve không bind đúng repo, bridge phải spawn mới hoặc reject, không được chạy nhầm project.
+- Shared-serve contract hiện tại là: one active serve, many projects via `run --attach --dir <repoRoot>`.
+- Project-aware observability is mandatory: use run artifact + persisted sessionId/opencodeSessionId + callback audit before trusting recency.
+- `sessions.json` là supporting index, không phải execution source of truth.
+- Nếu artifact còn `running`, hãy kiểm tra thêm `realState`, `warnings`, `callbackSummary`, và `attachRunSummary`.
+- Sau terminal callback accepted, attach-run PID phải được cleanup; active serve được giữ lại.

@@ -43,7 +43,7 @@ function createMockRes() {
 	} as any;
 }
 
-test("callback http route enqueues control message, wakes session, and sends direct telegram ack when deliver=true", async () => {
+test("callback http route enqueues control message and wakes session without emitting user-visible ack text", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: any[] = [];
 	const heartbeatCalls: any[] = [];
@@ -127,14 +127,15 @@ test("callback http route enqueues control message, wakes session, and sends dir
 	assert.equal(heartbeatCalls[0]?.agentId, payload.agentId);
 	assert.equal(telegramSends.length, 1);
 	assert.equal(telegramSends[0]?.to, "5165741309");
-	assert.match(
-		telegramSends[0]?.text,
-		/Background run update received\. Agent is continuing\./,
-	);
+	assert.equal(telegramSends[0]?.text, "Background run update received.");
 	assert.equal(telegramSends[0]?.opts?.silent, false);
+	assert.equal(
+		telegramSends[0]?.opts?.contextKey,
+		"opencode:run-visible-1:message.updated:callback-ingress-telegram",
+	);
 });
 
-test("callback http route sends direct telegram ack even when deliver=false", async () => {
+test("callback http route still avoids user-visible ack text even when deliver=false", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: any[] = [];
 	const heartbeatCalls: any[] = [];
@@ -210,16 +211,10 @@ test("callback http route sends direct telegram ack even when deliver=false", as
 	assert.equal(heartbeatCalls[0]?.sessionKey, payload.sessionKey);
 	assert.equal(heartbeatCalls[0]?.sessionId, payload.sessionId);
 	assert.equal(heartbeatCalls[0]?.agentId, payload.agentId);
-	assert.equal(telegramSends.length, 1);
-	assert.equal(telegramSends[0]?.to, "5165741309");
-	assert.match(
-		telegramSends[0]?.text,
-		/Background run update received\. Agent is continuing\./,
-	);
-	assert.equal(telegramSends[0]?.opts?.silent, false);
+	assert.equal(telegramSends.length, 0);
 });
 
-test("callback http route does not send telegram ack for telegram group session", async () => {
+test("callback http route does not send telegram notify for non-direct telegram session even when deliver=true", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: any[] = [];
 	const heartbeatCalls: any[] = [];
@@ -267,7 +262,7 @@ test("callback http route does not send telegram ack for telegram group session"
 		sessionKey: "agent:creator:telegram:group:-10011223344",
 		sessionId: "sess-group-1",
 		wakeMode: "now",
-		deliver: false,
+		deliver: true,
 		message: JSON.stringify({
 			kind: "opencode.callback",
 			eventType: "message.updated",

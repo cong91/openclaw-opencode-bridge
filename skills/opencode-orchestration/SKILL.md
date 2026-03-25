@@ -791,10 +791,14 @@ When handing work into OpenCode lane, the outer agent should report:
 - Do choose execution lane explicitly: CLI-direct vs serve/plugin mode.
 - Do use `opencode-orchestration` when coordination or bridge semantics matter.
 - Do use `verification-before-completion` before claiming completion.
+- Do trust run artifact + callback + project-aware session resolution over recency-only intuition.
+- Do treat active serve registry as active-only truth and use process audit/cleanup for OS hygiene.
 
 #### Don’t
 - Don’t use ad-hoc `opencode run` for callback/lifecycle-sensitive work without explicit lane selection.
-- Don’t assume a single serve is multi-project-safe.
+- Don’t assume a single serve is multi-project-safe unless project-aware observability is respected.
+- Don’t assume `sessions.json` is the primary truth for execution state.
+- Don’t assume `state=running` means the run is truly active without checking `realState`, warnings, callback summary, and attach-run summary.
 - Don’t assume bridge/runtime-manager features are production-perfect without verification.
 - Don’t over-claim that the bridge is fully autonomous when only functionally verified/hardened behavior is available.
 

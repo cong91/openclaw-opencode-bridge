@@ -323,6 +323,22 @@ function deriveAgentIdFromSessionKey(sessionKey?: string): string | undefined {
 	return matched?.[1];
 }
 
+function parseDirectTelegramTarget(sessionKey?: string): string | undefined {
+	if (!sessionKey) return undefined;
+	const matched = sessionKey.match(/^agent:[^:]+:telegram:direct:(.+)$/);
+	return matched?.[1];
+}
+
+function resolveContinuationStep(input: {
+	runStatus: BridgeRunStatus | null;
+	eventType?: string;
+}): OpenCodeRunContinuation["nextOnSuccess"] | undefined {
+	if (!input.runStatus?.continuation) return undefined;
+	return input.eventType === "task.failed" || input.eventType === "task.stalled"
+		? input.runStatus.continuation.nextOnFailure
+		: input.runStatus.continuation.nextOnSuccess;
+}
+
 function registerCallbackIngressRoute(api: any, cfg: any) {
 	if (
 		typeof api?.registerHttpRoute !== "function" ||
@@ -375,6 +391,10 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			const runStatus = parsed.metadata?.runId
 				? readRunStatus(parsed.metadata.runId)
 				: null;
+			const continuationStep = resolveContinuationStep({
+				runStatus,
+				eventType: parsed.metadata?.eventType,
+			});
 			const callbackAt = new Date().toISOString();
 			const callbackPersistence = mapCallbackEventToArtifactState(
 				parsed.metadata?.eventType,
@@ -451,12 +471,16 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				...callbackTarget,
 				...(dedupeKey ? { contextKey: dedupeKey } : {}),
 			});
-			const telegramDirectMatch = callback.sessionKey.match(
-				/^agent:[^:]+:telegram:direct:(.+)$/,
-			);
-			const telegramDirectTo = telegramDirectMatch?.[1];
+			const telegramDirectTo =
+				parseDirectTelegramTarget(
+					parsed.metadata?.callbackTargetSessionKey || callback.sessionKey,
+				) ||
+				parseDirectTelegramTarget(callback.sessionKey) ||
+				(callback.channel === "telegram" ? callback.to : undefined);
+			const continuationWillNotify = continuationStep?.action === "notify";
 			if (
 				callback.deliver === true &&
+				!continuationWillNotify &&
 				typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
 					"function" &&
 				telegramDirectTo
@@ -551,11 +575,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				}
 			}
 			if (runStatus?.continuation) {
-				const step =
-					parsed.metadata?.eventType === "task.failed" ||
-					parsed.metadata?.eventType === "task.stalled"
-						? runStatus.continuation.nextOnFailure
-						: runStatus.continuation.nextOnSuccess;
+				const step = continuationStep;
 				appendCallbackDebugAudit({
 					phase: "continuation_evaluated",
 					sessionKey: callback.sessionKey,
@@ -675,6 +695,18 @@ function buildExecutionPrompt(params: any, envelope: any): string {
 			)
 		: [];
 	const beadId = asString(params?.beadId);
+	const policyConstraints = envelope.resolved_agent_id === "build"
+		? [
+			"Do not spawn more than one explore subagent unless blocked by missing exact file/function location.",
+			"Do not use explore for generic repo layout discovery when repo scope is already explicit.",
+			"After the first useful audit result, continue implementation directly.",
+			"If scoped changes are complete and unrelated tests fail outside approved scope, do not ask for approval. Report unrelated failures separately and stop after scoped completion.",
+			"Do not expand scope to fix unrelated failures unless the packet explicitly authorizes scope expansion.",
+			"Do not open a decision checkpoint for unrelated red tests outside the approved scope.",
+			"If no patch is needed, conclude explicitly instead of continuing reconnaissance.",
+			"Do not loop on todowrite more than once per milestone.",
+		] : [];
+	const mergedConstraints = [...constraints, ...policyConstraints];
 	return [
 		`Task: ${objective}`,
 		`Run ID: ${envelope.run_id}`,
@@ -685,8 +717,8 @@ function buildExecutionPrompt(params: any, envelope: any): string {
 		beadId
 			? `Use bead/task identity '${beadId}' as the execution identity inside OpenCode. Do not call 'br show ${envelope.task_id}' if that Jira key is not a bead id; use the bead id above when interacting with beads.`
 			: undefined,
-		constraints.length
-			? `Constraints:\n- ${constraints.join("\n- ")}`
+		mergedConstraints.length
+			? `Constraints:\n- ${mergedConstraints.join("\n- ")}`
 			: undefined,
 		acceptance.length
 			? `Acceptance criteria:\n- ${acceptance.join("\n- ")}`
@@ -1333,7 +1365,8 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					})),
 				);
 				const state = artifact?.state || (sessionId ? "running" : "queued");
-				const migratedSessionId = artifact?.sessionId || artifact?.opencodeSessionId;
+				const migratedSessionId =
+					artifact?.sessionId || artifact?.opencodeSessionId;
 				const currentState = isTerminalState(artifact?.state)
 					? artifact!.state
 					: (lifecycleSummary.currentState as any) || state;
@@ -1351,18 +1384,31 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					warnings.push("session_resolution_pending");
 				}
 				if (!artifact?.sessionId && artifact?.opencodeSessionId) {
-					warnings.push("legacy_artifact_sessionid_backfilled_from_opencodesessionid");
+					warnings.push(
+						"legacy_artifact_sessionid_backfilled_from_opencodesessionid",
+					);
 				}
 				if (artifact?.state === "running" && !sessionId) {
 					warnings.push("no_session_materialized");
 				}
-				if (artifact?.callbackOk === true && !isTerminalState(artifact?.state)) {
+				if (
+					artifact?.callbackOk === true &&
+					!isTerminalState(artifact?.state)
+				) {
 					warnings.push("callback_sent_but_not_reconciled");
 				}
-				if (artifact?.state === "running" && artifact?.attachRun?.pid && artifact?.callbackCleaned) {
+				if (
+					artifact?.state === "running" &&
+					artifact?.attachRun?.pid &&
+					artifact?.callbackCleaned
+				) {
 					warnings.push("attach_run_cleaned_but_artifact_not_terminal");
 				}
-				if (artifact?.state === "running" && artifact?.attachRun?.pid && artifact?.callbackCleaned === false) {
+				if (
+					artifact?.state === "running" &&
+					artifact?.attachRun?.pid &&
+					artifact?.callbackCleaned === false
+				) {
 					warnings.push("process_missing_but_running_artifact");
 				}
 				const stateConfidence = isTerminalState(artifact?.state)
@@ -1373,30 +1419,57 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 
 				const callbackSummary = artifact
 					? {
-						...(typeof artifact.callbackOk === "boolean" ? { ok: artifact.callbackOk } : {}),
-						...(typeof artifact.callbackStatus === "number" ? { status: artifact.callbackStatus } : {}),
-						...(typeof artifact.callbackBody === "string" ? { body: artifact.callbackBody } : {}),
-					  }
+							...(typeof artifact.callbackOk === "boolean"
+								? { ok: artifact.callbackOk }
+								: {}),
+							...(typeof artifact.callbackStatus === "number"
+								? { status: artifact.callbackStatus }
+								: {}),
+							...(typeof artifact.callbackBody === "string"
+								? { body: artifact.callbackBody }
+								: {}),
+						}
 					: undefined;
 				const attachRunSummary = artifact?.attachRun
 					? {
-						...(typeof artifact.attachRun.pid === "number" ? { pid: artifact.attachRun.pid } : {}),
-						...(typeof artifact.attachRun.started === "boolean" ? { started: artifact.attachRun.started } : {}),
-						...(typeof artifact.attachRun.cleaned === "boolean" ? { cleaned: artifact.attachRun.cleaned } : {}),
-						...(typeof artifact.attachRun.cleanedAt === "string" ? { cleanedAt: artifact.attachRun.cleanedAt } : {}),
-						...(typeof artifact.attachRun.killSignal === "string" ? { killSignal: artifact.attachRun.killSignal } : {}),
-						...(typeof artifact.attachRun.killResult === "string" ? { killResult: artifact.attachRun.killResult } : {}),
-					  }
+							...(typeof artifact.attachRun.pid === "number"
+								? { pid: artifact.attachRun.pid }
+								: {}),
+							...(typeof artifact.attachRun.started === "boolean"
+								? { started: artifact.attachRun.started }
+								: {}),
+							...(typeof artifact.attachRun.cleaned === "boolean"
+								? { cleaned: artifact.attachRun.cleaned }
+								: {}),
+							...(typeof artifact.attachRun.cleanedAt === "string"
+								? { cleanedAt: artifact.attachRun.cleanedAt }
+								: {}),
+							...(typeof artifact.attachRun.killSignal === "string"
+								? { killSignal: artifact.attachRun.killSignal }
+								: {}),
+							...(typeof artifact.attachRun.killResult === "string"
+								? { killResult: artifact.attachRun.killResult }
+								: {}),
+						}
 					: undefined;
 				const operatorHints: string[] = [];
 				if (warnings.includes("artifact_running_but_session_completed")) {
-					operatorHints.push("Artifact is lagging behind runtime; trust realState over state for this run.");
+					operatorHints.push(
+						"Artifact is lagging behind runtime; trust realState over state for this run.",
+					);
 				}
-				if (warnings.includes("session_resolution_pending") || warnings.includes("no_session_materialized")) {
-					operatorHints.push("Session resolution is incomplete; audit with project-aware session lookup before acting on artifact state.");
+				if (
+					warnings.includes("session_resolution_pending") ||
+					warnings.includes("no_session_materialized")
+				) {
+					operatorHints.push(
+						"Session resolution is incomplete; audit with project-aware session lookup before acting on artifact state.",
+					);
 				}
 				if (warnings.includes("callback_sent_but_not_reconciled")) {
-					operatorHints.push("Callback evidence exists but artifact is not terminal; inspect callback reconciliation before rerunning.");
+					operatorHints.push(
+						"Callback evidence exists but artifact is not terminal; inspect callback reconciliation before rerunning.",
+					);
 				}
 				const response: RunStatusResponse = {
 					ok: true,
@@ -1530,19 +1603,38 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					sessionIdHint: sessionId,
 				});
 				const progressionSummary = {
-					hasStarted: events.some((e) => e.normalizedKind === "task.started" || e.normalizedKind === "task.progress"),
-					hasSubagentActivity: events.some((e) => JSON.stringify(e.data || {}).includes("@explore") || JSON.stringify(e.data || {}).includes("@general")),
-					hasToolHeavyLoop: events.filter((e) => e.normalizedKind === "task.progress").length >= 3,
+					hasStarted: events.some(
+						(e) =>
+							e.normalizedKind === "task.started" ||
+							e.normalizedKind === "task.progress",
+					),
+					hasSubagentActivity: events.some(
+						(e) =>
+							JSON.stringify(e.data || {}).includes("@explore") ||
+							JSON.stringify(e.data || {}).includes("@general"),
+					),
+					hasToolHeavyLoop:
+						events.filter((e) => e.normalizedKind === "task.progress").length >=
+						3,
 					hasCallbackEvidence: Boolean(artifact?.callbackOk),
-					hasTerminalEvent: events.some((e) => e.normalizedKind === "task.completed" || e.normalizedKind === "task.failed" || e.normalizedKind === "task.stalled"),
+					hasTerminalEvent: events.some(
+						(e) =>
+							e.normalizedKind === "task.completed" ||
+							e.normalizedKind === "task.failed" ||
+							e.normalizedKind === "task.stalled",
+					),
 				};
 				const response: RunEventsResponse = {
 					ok: true,
 					...(runId ? { runId } : {}),
 					...(artifact?.taskId ? { taskId: artifact.taskId } : {}),
 					...(sessionId ? { sessionId } : {}),
-					...(artifact?.envelope?.project_id ? { projectId: artifact.envelope.project_id } : {}),
-					...(artifact?.envelope?.repo_root ? { repoRoot: artifact.envelope.repo_root } : {}),
+					...(artifact?.envelope?.project_id
+						? { projectId: artifact.envelope.project_id }
+						: {}),
+					...(artifact?.envelope?.repo_root
+						? { repoRoot: artifact.envelope.repo_root }
+						: {}),
 					correlation: {
 						sessionResolution: {
 							strategy: resolution.strategy,
@@ -1674,17 +1766,22 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					sessionId,
 					...(runId ? { runId } : {}),
 					...(artifact?.taskId ? { taskId: artifact.taskId } : {}),
-					...(artifact?.envelope?.project_id ? { projectId: artifact.envelope.project_id } : {}),
-					...(artifact?.envelope?.repo_root ? { repoRoot: artifact.envelope.repo_root } : {}),
-					resolvedFrom: resolution.strategy === "explicit_session_id"
-						? "explicit_session_id"
-						: artifact?.sessionId || artifact?.opencodeSessionId
-							? "artifact_session_id"
-							: artifact?.envelope?.callback_target_session_key
-								? "callback_target"
-								: resolution.strategy.includes("project")
-									? "project_filtered_fallback"
-									: "scored_fallback",
+					...(artifact?.envelope?.project_id
+						? { projectId: artifact.envelope.project_id }
+						: {}),
+					...(artifact?.envelope?.repo_root
+						? { repoRoot: artifact.envelope.repo_root }
+						: {}),
+					resolvedFrom:
+						resolution.strategy === "explicit_session_id"
+							? "explicit_session_id"
+							: artifact?.sessionId || artifact?.opencodeSessionId
+								? "artifact_session_id"
+								: artifact?.envelope?.callback_target_session_key
+									? "callback_target"
+									: resolution.strategy.includes("project")
+										? "project_filtered_fallback"
+										: "scored_fallback",
 					correlation: {
 						sessionResolution: {
 							strategy: resolution.strategy,

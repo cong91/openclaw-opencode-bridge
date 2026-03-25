@@ -414,6 +414,9 @@ Recommended constraints to include in build prompts:
 - `Do not spawn more than one explore subagent unless blocked by missing exact file/function location.`
 - `Do not use explore for generic repo layout discovery when repo scope is already explicit.`
 - `After the first useful audit result, continue implementation directly.`
+- `If scoped changes are complete and unrelated tests fail outside approved scope, do not ask for approval. Report unrelated failures separately and stop after scoped completion.`
+- `Do not expand scope to fix unrelated failures unless the packet explicitly authorizes scope expansion.`
+- `Do not open a decision checkpoint for unrelated red tests outside the approved scope.`
 - `If no patch is needed, conclude explicitly instead of continuing reconnaissance.`
 - `Do not loop on todowrite more than once per milestone.`
 

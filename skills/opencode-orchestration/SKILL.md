@@ -400,6 +400,36 @@ When handing off into OpenCode execution:
   - multi-agent lane routing
   - event-driven terminal signaling
 
+### Prompt tightening rule for build lane (MANDATORY)
+For implementation-focused attach-run tasks, prompts must bias strongly toward direct execution rather than open-ended reconnaissance.
+
+Required rules for build-oriented packets:
+- require one short audit pass only
+- forbid prolonged analysis/report-only behavior
+- tell the agent to materialize code changes immediately after the first useful audit result
+- require verification after edits
+- require explicit completion or explicit blocker; do not allow silent looping
+
+Recommended constraints to include in build prompts:
+- `Do not spawn more than one explore subagent unless blocked by missing exact file/function location.`
+- `Do not use explore for generic repo layout discovery when repo scope is already explicit.`
+- `After the first useful audit result, continue implementation directly.`
+- `If no patch is needed, conclude explicitly instead of continuing reconnaissance.`
+- `Do not loop on todowrite more than once per milestone.`
+
+### Early-stall operational rule
+Treat a run as early-stalled when all of the following are true:
+- no meaningful diff / files_changed evidence
+- no callback attempt
+- no terminal event
+- main session only shows setup + todo + subagent dispatch
+- no meaningful progress after roughly 2-5 minutes
+
+When early-stall is detected:
+- stop waiting
+- rerun with a stricter build packet
+- reduce or forbid explore fan-out unless the run is truly blocked
+
 ### Mandatory reporting after execution handoff
 Outer agents should report:
 - whether the task was handed to OpenCode direct path or bridge path

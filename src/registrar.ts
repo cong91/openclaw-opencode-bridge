@@ -2,6 +2,7 @@ import { execSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
+import { mapCallbackEventToContinuationIntent } from "./hook-continuation";
 import type { EventScope } from "./observability";
 import { summarizeLifecycle } from "./observability";
 import {
@@ -49,7 +50,6 @@ import {
 	OPENCODE_CONTINUATION_CONTROL_HTTP_PATH,
 	OPENCODE_CONTINUATION_HOOK_PATH,
 } from "./shared-contracts";
-import { mapCallbackEventToContinuationIntent } from "./hook-continuation";
 import type {
 	BridgeRunStatus,
 	OpenCodeContinuationCallbackMetadata,
@@ -121,7 +121,8 @@ function buildDirectOperatorTelegramMessage(payload: Record<string, unknown>) {
 			? (payload.intent as Record<string, unknown>)
 			: {};
 	const eventType = asString(payload.eventType) || "unknown-event";
-	const taskId = asString(payload.taskId) || asString(payload.runId) || "unknown-task";
+	const taskId =
+		asString(payload.taskId) || asString(payload.runId) || "unknown-task";
 	const runId = asString(payload.runId) || "unknown-run";
 	const agentId = asString(payload.requestedAgentId) || "unknown-agent";
 	const projectId = asString(payload.projectId) || "unknown-project";
@@ -513,12 +514,11 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				return true;
 			}
 			const telegramDirectTo =
-				parseDirectTelegramTarget(
-					asString(payload.callbackTargetSessionKey),
-				) || "5165741309";
+				parseDirectTelegramTarget(asString(payload.callbackTargetSessionKey)) ||
+				"5165741309";
 			if (
 				typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
-					"function"
+				"function"
 			) {
 				try {
 					await api.runtime.channel.telegram.sendMessageTelegram(
@@ -535,14 +535,21 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					appendCallbackDebugAudit({
 						phase: "continuation_control_telegram_failed",
 						telegramTo: telegramDirectTo,
-						error:
-							error instanceof Error ? error.message : String(error),
+						error: error instanceof Error ? error.message : String(error),
 						payload,
 					});
 				}
 			}
-			const metadata = payload as unknown as OpenCodeContinuationCallbackMetadata;
+			const metadata =
+				payload as unknown as OpenCodeContinuationCallbackMetadata;
 			const retryCount = Math.max(0, Number(payload.retryCount || 0));
+			const fallbackAgentId =
+				asString(payload.resolvedAgentId) ||
+				asString(payload.requestedAgentId) ||
+				deriveAgentIdFromSessionKey(
+					asString(payload.callbackTargetSessionKey),
+				) ||
+				"unknown-agent";
 			const fakeRunStatus = {
 				taskId: asString(payload.taskId) || "",
 				runId: asString(payload.runId) || "",
@@ -551,19 +558,13 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				envelope: {
 					task_id: asString(payload.taskId) || "",
 					run_id: asString(payload.runId) || "",
-					agent_id:
-						asString(payload.resolvedAgentId) ||
-						asString(payload.requestedAgentId) ||
-						"scrum",
+					agent_id: fallbackAgentId,
 					requested_agent_id:
-						asString(payload.requestedAgentId) || "scrum",
+						asString(payload.requestedAgentId) || fallbackAgentId,
 					resolved_agent_id:
-						asString(payload.resolvedAgentId) ||
-						asString(payload.requestedAgentId) ||
-						"scrum",
+						asString(payload.resolvedAgentId) || fallbackAgentId,
 					session_key: asString(payload.callbackTargetSessionKey) || "",
-					origin_session_key:
-						asString(payload.callbackTargetSessionKey) || "",
+					origin_session_key: asString(payload.callbackTargetSessionKey) || "",
 					callback_target_session_key:
 						asString(payload.callbackTargetSessionKey) || "",
 					callback_target_session_id: asString(payload.callbackTargetSessionId),
@@ -588,7 +589,8 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				},
 			} as unknown as BridgeRunStatus;
 			if (
-				(metadata.eventType === "session.error" || metadata.eventType === "task.failed") &&
+				(metadata.eventType === "session.error" ||
+					metadata.eventType === "task.failed") &&
 				retryCount >= 2
 			) {
 				sendJson(res, 200, {
@@ -613,18 +615,31 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				const runtimeCfg = getRuntimeConfig(cfg);
 				const hookBaseUrl = asString(runtimeCfg.hookBaseUrl);
 				const hookToken = asString(runtimeCfg.hookToken);
-				if (!hookBaseUrl || !hookToken) return { ok: false as const, error: "hook base/token missing" };
+				if (!hookBaseUrl || !hookToken)
+					return { ok: false as const, error: "hook base/token missing" };
 				const url = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_HOOK_PATH}`;
 				try {
 					const response = await fetch(url, {
 						method: "POST",
-						headers: { "Content-Type": "application/json", Authorization: `Bearer ${hookToken}` },
+						headers: {
+							"Content-Type": "application/json",
+							Authorization: `Bearer ${hookToken}`,
+						},
 						body: JSON.stringify(nextPayload),
 					});
 					const bodyText = await response.text().catch(() => "");
-					return { ok: response.ok, status: response.status, body: bodyText, url };
+					return {
+						ok: response.ok,
+						status: response.status,
+						body: bodyText,
+						url,
+					};
 				} catch (error) {
-					return { ok: false as const, error: error instanceof Error ? error.message : String(error), url };
+					return {
+						ok: false as const,
+						error: error instanceof Error ? error.message : String(error),
+						url,
+					};
 				}
 			})();
 			sendJson(res, hookDispatch.ok ? 200 : 500, {
@@ -752,8 +767,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						callback: callback.message,
 					};
 			const heartbeatAgentId =
-				callback.agentId ||
-				deriveAgentIdFromSessionKey(callback.sessionKey);
+				callback.agentId || deriveAgentIdFromSessionKey(callback.sessionKey);
 
 			const callbackMessageText = [
 				"<opencode_callback_control_internal>",

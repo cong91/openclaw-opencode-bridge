@@ -67,7 +67,7 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: SystemEvent[] = [];
-		const telegramSends: any[] = [];
+	const telegramSends: any[] = [];
 	const callbackPosts: any[] = [];
 	const oldFetch = globalThis.fetch;
 	const oldHookBase = process.env.OPENCLAW_HOOK_BASE_URL;
@@ -212,9 +212,17 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 			callbackPosts[0]?.body?.callbackTargetSessionKey,
 			"agent:creator:telegram:direct:5165741309",
 		);
-		assert.equal(callbackPosts[0]?.body?.callbackTargetSessionId, "sess-origin-smoke-1");
+		assert.equal(
+			callbackPosts[0]?.body?.callbackTargetSessionId,
+			"sess-origin-smoke-1",
+		);
 
-		assert.equal(telegramSends.length, 0);
+		assert.equal(telegramSends.length, 1);
+		assert.equal(telegramSends[0]?.to, "5165741309");
+		assert.match(
+			String(telegramSends[0]?.text || ""),
+			/Verify current session resumed after callback/,
+		);
 	} finally {
 		globalThis.fetch = oldFetch;
 		if (oldHookBase === undefined) delete process.env.OPENCLAW_HOOK_BASE_URL;

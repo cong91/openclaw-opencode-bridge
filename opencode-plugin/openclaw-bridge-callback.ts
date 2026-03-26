@@ -7,6 +7,14 @@ import {
 } from "../src/shared-contracts";
 import type { OpenCodeContinuationCallbackMetadata } from "../src/types";
 
+const LOOP_UPDATE_INTERVAL_MS = 120_000;
+const PERIODIC_UPDATE_EVENT_TYPES = new Set([
+	"task.started",
+	"task.progress",
+	"permission.requested",
+	"task.stalled",
+]);
+
 function asString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
@@ -147,47 +155,81 @@ function buildHookContinuationPayload(
 		eventType,
 		opencodeSessionId,
 	);
+	const isFailureEvent =
+		eventType === "session.error" || eventType === "task.failed";
+	const isPeriodicUpdate =
+		PERIODIC_UPDATE_EVENT_TYPES.has(eventType) && !isFailureEvent;
+	const statusLine = isFailureEvent
+		? "step failed; corrective relaunch requested"
+		: isPeriodicUpdate
+			? "step in progress; periodic checkpoint"
+			: "step completed; continuation in progress";
+	const actionLine = isFailureEvent
+		? "launching corrective continuation run"
+		: isPeriodicUpdate
+			? "dispatching loop checkpoint update"
+			: "launching continuation / verification";
+	const requestedAgentId = metadata.requestedAgentId || agentId;
+	const resolvedAgentId =
+		metadata.resolvedAgentId || metadata.requestedAgentId || agentId;
+	const callbackTargetSessionKey =
+		metadata.callbackTargetSessionKey || sessionKey;
+	const callbackTargetSessionId = metadata.callbackTargetSessionId || sessionId;
+	const callbackMetadata: OpenCodeContinuationCallbackMetadata = {
+		...metadata,
+		requestedAgentId,
+		resolvedAgentId,
+		callbackTargetSessionKey,
+		callbackTargetSessionId,
+	};
 	return {
 		source: "opencode.callback",
+		name: "OpenCode",
+		agentId,
+		sessionKey: callbackTargetSessionKey,
+		sessionId: callbackTargetSessionId,
+		wakeMode: "now",
+		message: JSON.stringify(callbackMetadata),
 		runId: metadata.runId,
 		taskId: metadata.taskId,
 		eventType: metadata.eventType,
 		projectId: metadata.projectId,
 		repoRoot: metadata.repoRoot,
-		requestedAgentId: metadata.requestedAgentId || agentId,
-		resolvedAgentId: metadata.resolvedAgentId,
-		callbackTargetSessionKey: metadata.callbackTargetSessionKey || sessionKey,
-		callbackTargetSessionId: metadata.callbackTargetSessionId || sessionId,
+		requestedAgentId,
+		resolvedAgentId,
+		callbackTargetSessionKey,
+		callbackTargetSessionId,
 		opencodeSessionId: metadata.opencodeSessionId,
 		workflowId: metadata.workflowId,
 		stepId: metadata.stepId,
-		next: { action: "launch_run", taskId: metadata.taskId },
+		next: isPeriodicUpdate
+			? { action: "none", taskId: metadata.taskId }
+			: { action: "launch_run", taskId: metadata.taskId },
 		intent: {
-			kind:
-				eventType === "session.error" || eventType === "task.failed"
-					? "launch_run"
-					: "notify",
+			kind: isFailureEvent ? "launch_run" : "notify",
 			taskId: metadata.taskId,
-			objective:
-				eventType === "session.error" || eventType === "task.failed"
-					? "Analyze the failure and continue with the corrective next step."
+			objective: isFailureEvent
+				? "Analyze the failure and continue with the corrective next step."
+				: isPeriodicUpdate
+					? "OpenCode step is still running; send checkpoint update and continue monitoring."
 					: "OpenCode step completed; send operator update and continue if needed.",
-			prompt:
-				eventType === "session.error" || eventType === "task.failed"
-					? "The previous step failed. Inspect the failure, summarize the likely reason, then continue with the corrective next step."
+			prompt: isFailureEvent
+				? "The previous step failed. Inspect the failure, summarize the likely reason, then continue with the corrective next step."
+				: isPeriodicUpdate
+					? "OpenCode reports in-progress activity. Send a concise checkpoint update for operators, then continue waiting for terminal callback."
 					: "The previous step completed. Send a concise operator update, then continue with verification or the next task if needed.",
 			notify: [
 				"OpenCode Loop Update",
-				`- Agent: ${metadata.requestedAgentId || agentId || "unknown-agent"}`,
+				`- Agent: ${requestedAgentId || "unknown-agent"}`,
 				`- Task: ${metadata.taskId || metadata.runId || "unknown-task"}`,
 				`- Run: ${metadata.runId || "unknown-run"}`,
 				`- Event: ${metadata.eventType || "unknown-event"}`,
 				`- Project: ${metadata.projectId || "unknown-project"}`,
 				`- Repo: ${metadata.repoRoot || "unknown-repo"}`,
-				`- Status: ${eventType === "session.error" || eventType === "task.failed" ? "step failed; corrective relaunch requested" : "step completed; continuation in progress"}`,
-				`- Action taken: ${eventType === "session.error" || eventType === "task.failed" ? "launching corrective continuation run" : "launching continuation / verification"}`,
+				`- Status: ${statusLine}`,
+				`- Action taken: ${actionLine}`,
 				`- Next step: ${metadata.taskId || metadata.runId || "unknown-task"}`,
-				"- Need from operator: none"
+				"- Need from operator: none",
 			].join("\n"),
 			reason: metadata.eventType,
 		},
@@ -200,6 +242,9 @@ function buildContinuationMetadata(
 	eventType: string,
 	opencodeSessionId?: string,
 ): OpenCodeContinuationCallbackMetadata {
+	const requestedAgentId = tags.requested || tags.requested_agent_id;
+	const resolvedAgentId =
+		tags.resolved || tags.resolved_agent_id || requestedAgentId;
 	return {
 		kind: "opencode.callback",
 		eventType,
@@ -207,8 +252,8 @@ function buildContinuationMetadata(
 		taskId: tags.taskId || tags.task_id,
 		projectId: tags.projectId || tags.project_id,
 		repoRoot: tags.repoRoot || tags.repo_root,
-		requestedAgentId: tags.requested || tags.requested_agent_id,
-		resolvedAgentId: tags.resolved || tags.resolved_agent_id,
+		requestedAgentId,
+		resolvedAgentId,
 		callbackTargetSessionKey:
 			tags.callbackSession || tags.callback_target_session_key,
 		callbackTargetSessionId:
@@ -345,6 +390,7 @@ async function postCallback(
 
 const callbackDedupe = new Set<string>();
 const sessionTagCache = new Map<string, Record<string, string>>();
+const runCheckpointAt = new Map<string, number>();
 
 function readSessionId(event: any): string | undefined {
 	return (
@@ -372,6 +418,22 @@ function isTerminalEvent(event: any, type: string): boolean {
 	const finish = readMessageFinish(event);
 	if (type === "message.updated" && finish === "stop") return true;
 	return false;
+}
+
+function shouldEmitPeriodicLoopUpdate(
+	type: string,
+	tags: Record<string, string>,
+) {
+	if (!PERIODIC_UPDATE_EVENT_TYPES.has(type)) return false;
+	const runId = asString(tags.runId || tags.run_id);
+	if (!runId) return false;
+	const now = Date.now();
+	const previous = runCheckpointAt.get(runId) || 0;
+	if (previous > 0 && now - previous < LOOP_UPDATE_INTERVAL_MS) {
+		return false;
+	}
+	runCheckpointAt.set(runId, now);
+	return true;
 }
 
 export const OpenClawBridgeCallbackPlugin = async ({
@@ -427,12 +489,16 @@ export const OpenClawBridgeCallbackPlugin = async ({
 			});
 			if (!tags || !(tags.callbackSession || tags.callback_target_session_key))
 				return;
-			if (!isTerminalEvent(event, type)) return;
+			const terminal = isTerminalEvent(event, type);
+			const periodicUpdate = terminal
+				? false
+				: shouldEmitPeriodicLoopUpdate(type, tags);
+			if (!terminal && !periodicUpdate) return;
 			const dedupeKey = buildPluginCallbackDedupeKey({
 				sessionId,
 				runId: tags.runId || tags.run_id,
 			});
-			if (callbackDedupe.has(dedupeKey)) {
+			if (terminal && callbackDedupe.has(dedupeKey)) {
 				appendAudit(directory, {
 					phase: "deduped",
 					event_type: type,
@@ -442,7 +508,10 @@ export const OpenClawBridgeCallbackPlugin = async ({
 				});
 				return;
 			}
-			callbackDedupe.add(dedupeKey);
+			if (terminal) {
+				callbackDedupe.add(dedupeKey);
+				runCheckpointAt.delete(asString(tags.runId || tags.run_id) || "");
+			}
 			const payload = buildHookContinuationPayload(tags, type, sessionId);
 			if (!payload) {
 				appendAudit(directory, {

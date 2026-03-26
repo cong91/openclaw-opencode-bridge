@@ -17,6 +17,51 @@ function asTrimmedString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function buildOperatorUpdate(payload, routedSessionKey) {
+  const intent = payload && typeof payload.intent === "object" ? payload.intent : {};
+  const intentKind = asTrimmedString(intent.kind) || "blocked";
+  const eventType = asTrimmedString(payload.eventType) || asTrimmedString(payload.event_type) || "unknown-event";
+  const runId = asTrimmedString(payload.runId) || asTrimmedString(payload.run_id) || "unknown-run";
+  const taskId = asTrimmedString(payload.taskId) || asTrimmedString(payload.task_id) || "unknown-task";
+  const requestedAgentId = asTrimmedString(payload.requestedAgentId) || asTrimmedString(payload.requested_agent_id) || "scrum";
+  const projectId = asTrimmedString(payload.projectId) || asTrimmedString(payload.project_id) || "unknown-project";
+  const repoRoot = asTrimmedString(payload.repoRoot) || asTrimmedString(payload.repo_root) || "unknown-repo";
+  const nextTaskId = asTrimmedString(intent.taskId);
+  const objective = asTrimmedString(intent.objective);
+  const notify = asTrimmedString(intent.notify);
+  const status = intentKind === "launch_run"
+    ? (eventType === "session.error" || eventType === "task.failed" ? "step failed; corrective relaunch requested" : "next step launched")
+    : intentKind === "notify"
+      ? "operator update required"
+      : intentKind === "done"
+        ? "loop completed"
+        : "blocked / manual triage";
+  const actionTaken = intentKind === "launch_run"
+    ? (eventType === "session.error" || eventType === "task.failed" ? "launching corrective continuation run" : "launching verification / next task")
+    : intentKind === "notify"
+      ? "sending operator-facing update"
+      : intentKind === "done"
+        ? "closing loop"
+        : "waiting manual intervention";
+  const nextStep = nextTaskId || objective || notify || "none";
+  const needFromOperator = intentKind === "blocked" ? "manual review required" : "none";
+
+  return [
+    "OpenCode Loop Update",
+    `- Agent: ${requestedAgentId}`,
+    `- Task: ${taskId}`,
+    `- Run: ${runId}`,
+    `- Event: ${eventType}`,
+    `- Project: ${projectId}`,
+    `- Repo: ${repoRoot}`,
+    `- Status: ${status}`,
+    `- Action taken: ${actionTaken}`,
+    `- Next step: ${nextStep}`,
+    `- Need from operator: ${needFromOperator}`,
+    `- Continuation session: ${routedSessionKey}`,
+  ].join("\n");
+}
+
 function buildContinuationInstruction(payload, routedSessionKey) {
   const intent = payload && typeof payload.intent === "object" ? payload.intent : {};
   const intentKind = asTrimmedString(intent.kind) || "blocked";
@@ -37,6 +82,8 @@ function buildContinuationInstruction(payload, routedSessionKey) {
   const stepId = asTrimmedString(payload.stepId) || asTrimmedString(payload.step_id);
 
   const lines = [
+    buildOperatorUpdate(payload, routedSessionKey),
+    "",
     "OpenCode hook continuation loop.",
     `Run ID: ${runId}`,
     `Task ID: ${taskId}`,
@@ -79,6 +126,22 @@ function buildContinuationInstruction(payload, routedSessionKey) {
     );
   }
 
+  lines.push(
+    "When finishing this isolated turn, end with a final operator report in exactly this format:",
+    "OpenCode Loop Result",
+    "- Agent: <agent>",
+    "- Task: <task>",
+    "- Run: <run>",
+    "- Event: <event>",
+    "- Project: <project>",
+    "- Repo: <repo>",
+    "- Result: <pass/fail/blocked>",
+    "- Action taken: <what you just did>",
+    "- Next step: <next step>",
+    "- Need from operator: <none/review/approval>",
+    "Do not repeat the immediate Telegram alert verbatim. The final report must add new execution outcome detail."
+  );
+
   return lines.join("\n");
 }
 
@@ -88,16 +151,21 @@ module.exports = async function transform(ctx) {
   const routedSessionKey = buildOpencodeSessionKey(payload);
   const message = buildContinuationInstruction(payload, routedSessionKey);
   const intent = payload && typeof payload.intent === "object" ? payload.intent : {};
-  const deliver = (asTrimmedString(intent.kind) || "") === "notify";
+  const intentKind = asTrimmedString(intent.kind) || "blocked";
+  const shouldNotifyDirect = intentKind === "notify" || intentKind === "done" || intentKind === "blocked";
+  const directPreface = shouldNotifyDirect
+    ? "Send one concise direct Telegram update to the operator summarizing the current callback state. Avoid duplicate updates."
+    : undefined;
+  const finalMessage = [directPreface, message].filter(Boolean).join("\n\n");
   return {
     kind: "agent",
     agentId: requestedAgentId,
     sessionKey: routedSessionKey,
-    message,
+    message: finalMessage,
     name: "OpenCodeCallbackLoop",
     wakeMode: "now",
-    deliver,
+    deliver: shouldNotifyDirect,
     allowUnsafeExternalContent: false,
-    ...(deliver ? { channel: "telegram", to: "5165741309" } : {})
+    ...(shouldNotifyDirect ? { channel: "telegram", to: "5165741309" } : {})
   };
 };

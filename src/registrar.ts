@@ -44,10 +44,12 @@ import {
 	writeServeRegistryFile,
 	writeSessionRegistryFile,
 } from "./runtime";
-import { OPENCODE_CALLBACK_HTTP_PATH } from "./shared-contracts";
+import {
+	OPENCODE_CALLBACK_HTTP_PATH,
+	OPENCODE_CONTINUATION_CONTROL_HTTP_PATH,
+	OPENCODE_CONTINUATION_HOOK_PATH,
+} from "./shared-contracts";
 import { mapCallbackEventToContinuationIntent } from "./hook-continuation";
-
-const OPENCODE_CONTINUATION_HOOK_PATH = "/hooks/opencode-callback";
 import type {
 	BridgeRunStatus,
 	OpenCodeContinuationCallbackMetadata,
@@ -111,6 +113,54 @@ function appendCallbackDebugAudit(record: Record<string, unknown>) {
 		"utf8",
 	);
 	return path;
+}
+
+function buildDirectOperatorTelegramMessage(payload: Record<string, unknown>) {
+	const intent =
+		payload.intent && typeof payload.intent === "object"
+			? (payload.intent as Record<string, unknown>)
+			: {};
+	const eventType = asString(payload.eventType) || "unknown-event";
+	const taskId = asString(payload.taskId) || asString(payload.runId) || "unknown-task";
+	const runId = asString(payload.runId) || "unknown-run";
+	const agentId = asString(payload.requestedAgentId) || "unknown-agent";
+	const projectId = asString(payload.projectId) || "unknown-project";
+	const repoRoot = asString(payload.repoRoot) || "unknown-repo";
+	const nextStep =
+		asString(intent.taskId) ||
+		asString(intent.objective) ||
+		asString(intent.notify) ||
+		"none";
+	const retryCount = Number(payload.retryCount || 0);
+	const status =
+		eventType === "session.error" || eventType === "task.failed"
+			? retryCount > 2
+				? "step failed repeatedly; loop blocked"
+				: "step failed; corrective relaunch requested"
+			: eventType === "task.completed" || eventType === "session.idle"
+				? "step completed; continuation in progress"
+				: "callback received";
+	const actionTaken =
+		eventType === "session.error" || eventType === "task.failed"
+			? retryCount > 2
+				? "escalating to manual review"
+				: "launching corrective continuation run"
+			: "dispatching continuation hook";
+	const needFromOperator = retryCount > 2 ? "manual review required" : "none";
+	return [
+		"OpenCode Loop Update",
+		`- Agent: ${agentId}`,
+		`- Task: ${taskId}`,
+		`- Run: ${runId}`,
+		`- Event: ${eventType}`,
+		`- Project: ${projectId}`,
+		`- Repo: ${repoRoot}`,
+		`- Status: ${status}`,
+		`- Action taken: ${actionTaken}`,
+		`- Next step: ${nextStep}`,
+		`- Retry count: ${retryCount}`,
+		`- Need from operator: ${needFromOperator}`,
+	].join("\n");
 }
 
 function parseJsonObject(raw: string): Record<string, unknown> | null {
@@ -422,6 +472,170 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 	) {
 		return;
 	}
+	api.registerHttpRoute({
+		path: OPENCODE_CONTINUATION_CONTROL_HTTP_PATH,
+		auth: "plugin",
+		handler: async (req: IncomingMessage, res: ServerResponse) => {
+			if (req.method !== "POST") {
+				res.statusCode = 405;
+				res.setHeader("Allow", "POST");
+				res.end("Method Not Allowed");
+				return true;
+			}
+			const runtimeCfg = getRuntimeConfig(cfg);
+			const expectedToken =
+				asString(cfg?.hookToken) || asString(runtimeCfg.hookToken);
+			const authz = req.headers.authorization;
+			const bearer =
+				typeof authz === "string" && authz.startsWith("Bearer ")
+					? authz.slice("Bearer ".length).trim()
+					: undefined;
+			const legacyTokenHeader = req.headers["x-openclaw-token"];
+			const legacyToken =
+				typeof legacyTokenHeader === "string"
+					? legacyTokenHeader.trim()
+					: Array.isArray(legacyTokenHeader)
+						? asString(legacyTokenHeader[0])
+						: undefined;
+			const providedToken = bearer || legacyToken;
+			if (!expectedToken || !providedToken || providedToken !== expectedToken) {
+				sendJson(res, 401, { ok: false, error: "unauthorized" });
+				return true;
+			}
+			const bodyText = await readRequestBody(req);
+			let payload: Record<string, unknown> | null = null;
+			try {
+				payload = bodyText.trim()
+					? (JSON.parse(bodyText) as Record<string, unknown>)
+					: {};
+			} catch {
+				sendJson(res, 400, { ok: false, error: "invalid_json" });
+				return true;
+			}
+			const telegramDirectTo =
+				parseDirectTelegramTarget(
+					asString(payload.callbackTargetSessionKey),
+				) || "5165741309";
+			if (
+				typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
+					"function"
+			) {
+				try {
+					await api.runtime.channel.telegram.sendMessageTelegram(
+						telegramDirectTo,
+						buildDirectOperatorTelegramMessage(payload),
+						{ silent: false },
+					);
+					appendCallbackDebugAudit({
+						phase: "continuation_control_telegram_sent",
+						telegramTo: telegramDirectTo,
+						payload,
+					});
+				} catch (error) {
+					appendCallbackDebugAudit({
+						phase: "continuation_control_telegram_failed",
+						telegramTo: telegramDirectTo,
+						error:
+							error instanceof Error ? error.message : String(error),
+						payload,
+					});
+				}
+			}
+			const metadata = payload as unknown as OpenCodeContinuationCallbackMetadata;
+			const retryCount = Math.max(0, Number(payload.retryCount || 0));
+			const fakeRunStatus = {
+				taskId: asString(payload.taskId) || "",
+				runId: asString(payload.runId) || "",
+				state: "running",
+				updatedAt: new Date().toISOString(),
+				envelope: {
+					task_id: asString(payload.taskId) || "",
+					run_id: asString(payload.runId) || "",
+					agent_id:
+						asString(payload.resolvedAgentId) ||
+						asString(payload.requestedAgentId) ||
+						"scrum",
+					requested_agent_id:
+						asString(payload.requestedAgentId) || "scrum",
+					resolved_agent_id:
+						asString(payload.resolvedAgentId) ||
+						asString(payload.requestedAgentId) ||
+						"scrum",
+					session_key: asString(payload.callbackTargetSessionKey) || "",
+					origin_session_key:
+						asString(payload.callbackTargetSessionKey) || "",
+					callback_target_session_key:
+						asString(payload.callbackTargetSessionKey) || "",
+					callback_target_session_id: asString(payload.callbackTargetSessionId),
+					project_id: asString(payload.projectId) || "",
+					repo_root: asString(payload.repoRoot) || "",
+					opencode_server_url:
+						asString(getRuntimeConfig(cfg).opencodeServerUrl) || "",
+				},
+				continuation: {
+					nextOnSuccess: {
+						action: "launch_run",
+						taskId: asString((payload as any)?.next?.taskId),
+						objective: asString((payload as any)?.next?.objective),
+						prompt: asString((payload as any)?.next?.prompt),
+					},
+					nextOnFailure: {
+						action: "launch_run",
+						taskId: asString((payload as any)?.next?.taskId),
+						objective: asString((payload as any)?.next?.objective),
+						prompt: asString((payload as any)?.next?.prompt),
+					},
+				},
+			} as unknown as BridgeRunStatus;
+			if (
+				(metadata.eventType === "session.error" || metadata.eventType === "task.failed") &&
+				retryCount >= 2
+			) {
+				sendJson(res, 200, {
+					ok: true,
+					blocked: true,
+					reason: "max_retry_reached",
+					retryCount,
+				});
+				return true;
+			}
+			const step = {
+				action: "launch_run",
+				taskId: asString((payload as any)?.next?.taskId),
+				objective: asString((payload as any)?.next?.objective),
+				prompt: asString((payload as any)?.next?.prompt),
+			};
+			const nextPayload = {
+				...payload,
+				retryCount: retryCount + 1,
+			};
+			const hookDispatch = await (async () => {
+				const runtimeCfg = getRuntimeConfig(cfg);
+				const hookBaseUrl = asString(runtimeCfg.hookBaseUrl);
+				const hookToken = asString(runtimeCfg.hookToken);
+				if (!hookBaseUrl || !hookToken) return { ok: false as const, error: "hook base/token missing" };
+				const url = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_HOOK_PATH}`;
+				try {
+					const response = await fetch(url, {
+						method: "POST",
+						headers: { "Content-Type": "application/json", Authorization: `Bearer ${hookToken}` },
+						body: JSON.stringify(nextPayload),
+					});
+					const bodyText = await response.text().catch(() => "");
+					return { ok: response.ok, status: response.status, body: bodyText, url };
+				} catch (error) {
+					return { ok: false as const, error: error instanceof Error ? error.message : String(error), url };
+				}
+			})();
+			sendJson(res, hookDispatch.ok ? 200 : 500, {
+				ok: hookDispatch.ok,
+				hookDispatch,
+				retryCount: retryCount + 1,
+			});
+			return true;
+		},
+	});
+
 	api.registerHttpRoute({
 		path: OPENCODE_CALLBACK_HTTP_PATH,
 		auth: "plugin",

@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	buildPluginCallbackDedupeKey,
-	OPENCODE_CONTINUATION_HOOK_PATH,
+	OPENCODE_CONTINUATION_CONTROL_HTTP_PATH,
 	parseTaggedSessionTitle,
 } from "../src/shared-contracts";
 import type { OpenCodeContinuationCallbackMetadata } from "../src/types";
@@ -162,6 +162,35 @@ function buildHookContinuationPayload(
 		workflowId: metadata.workflowId,
 		stepId: metadata.stepId,
 		next: { action: "launch_run", taskId: metadata.taskId },
+		intent: {
+			kind:
+				eventType === "session.error" || eventType === "task.failed"
+					? "launch_run"
+					: "notify",
+			taskId: metadata.taskId,
+			objective:
+				eventType === "session.error" || eventType === "task.failed"
+					? "Analyze the failure and continue with the corrective next step."
+					: "OpenCode step completed; send operator update and continue if needed.",
+			prompt:
+				eventType === "session.error" || eventType === "task.failed"
+					? "The previous step failed. Inspect the failure, summarize the likely reason, then continue with the corrective next step."
+					: "The previous step completed. Send a concise operator update, then continue with verification or the next task if needed.",
+			notify: [
+				"OpenCode Loop Update",
+				`- Agent: ${metadata.requestedAgentId || agentId || "unknown-agent"}`,
+				`- Task: ${metadata.taskId || metadata.runId || "unknown-task"}`,
+				`- Run: ${metadata.runId || "unknown-run"}`,
+				`- Event: ${metadata.eventType || "unknown-event"}`,
+				`- Project: ${metadata.projectId || "unknown-project"}`,
+				`- Repo: ${metadata.repoRoot || "unknown-repo"}`,
+				`- Status: ${eventType === "session.error" || eventType === "task.failed" ? "step failed; corrective relaunch requested" : "step completed; continuation in progress"}`,
+				`- Action taken: ${eventType === "session.error" || eventType === "task.failed" ? "launching corrective continuation run" : "launching continuation / verification"}`,
+				`- Next step: ${metadata.taskId || metadata.runId || "unknown-task"}`,
+				"- Need from operator: none"
+			].join("\n"),
+			reason: metadata.eventType,
+		},
 		deliver,
 	};
 }
@@ -256,7 +285,7 @@ async function postCallback(
 		});
 		return { ok: false, status: 0, reason: "missing_hook_env" };
 	}
-	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_HOOK_PATH}`;
+	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_CONTROL_HTTP_PATH}`;
 	appendAudit(directory, {
 		phase: "callback_attempt",
 		diagnostics: {

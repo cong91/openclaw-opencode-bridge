@@ -14,6 +14,7 @@ export type BridgeSessionTagFields = {
 };
 
 export const OPENCODE_CALLBACK_HTTP_PATH = "/plugin/opencode-bridge/callback";
+export const OPENCODE_CONTINUATION_CONTROL_HTTP_PATH = "/plugin/opencode-bridge/continue-loop";
 export const OPENCODE_CONTINUATION_HOOK_PATH = "/hooks/opencode-callback";
 
 export type OpenCodePluginCallbackAuditRecord = {

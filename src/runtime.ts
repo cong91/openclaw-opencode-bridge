@@ -20,7 +20,9 @@ import {
 	summarizeLifecycle,
 } from "./observability";
 import {
+	buildCanonicalCallbackSessionKey,
 	buildTaggedSessionTitle,
+	isCanonicalCallbackSessionKey,
 	OPENCODE_CALLBACK_HTTP_PATH,
 	OPENCODE_CONTINUATION_HOOK_PATH,
 } from "./shared-contracts";
@@ -263,6 +265,12 @@ export function buildEnvelope(input: {
 	deliver?: boolean;
 	priority?: string;
 }): RoutingEnvelope {
+	const callbackAnchor =
+		input.originSessionId?.trim() || input.runId || input.taskId;
+	const canonicalCallbackSessionKey = buildCanonicalCallbackSessionKey({
+		agentId: input.requestedAgentId,
+		anchor: callbackAnchor,
+	});
 	return {
 		task_id: input.taskId,
 		run_id: input.runId,
@@ -277,9 +285,10 @@ export function buildEnvelope(input: {
 		...(input.originSessionId
 			? { origin_session_id: input.originSessionId }
 			: {}),
-		callback_target_session_key: input.originSessionKey,
+		callback_target_session_key: canonicalCallbackSessionKey,
+		callback_relay_session_key: input.originSessionKey,
 		...(input.originSessionId
-			? { callback_target_session_id: input.originSessionId }
+			? { callback_relay_session_id: input.originSessionId }
 			: {}),
 		project_id: input.projectId,
 		repo_root: input.repoRoot,
@@ -346,7 +355,7 @@ export function buildHooksAgentCallback(input: {
 	return {
 		message,
 		name: "OpenCode",
-		// callback should wake requester/origin lane, not execution lane
+		// callback should wake canonical callback lane first
 		agentId: input.envelope.requested_agent_id,
 		sessionKey: callbackTargetSessionKey,
 		...(input.envelope.callback_target_session_id
@@ -354,8 +363,6 @@ export function buildHooksAgentCallback(input: {
 			: {}),
 		wakeMode: "now",
 		deliver: false,
-		...(input.envelope.channel ? { channel: input.envelope.channel } : {}),
-		...(input.envelope.to ? { to: input.envelope.to } : {}),
 	};
 }
 
@@ -1075,6 +1082,10 @@ export function resolveSessionForRun(input: {
 		typeof artifactEnvelope?.callback_target_session_id === "string"
 			? artifactEnvelope.callback_target_session_id
 			: undefined;
+	const callbackRelaySessionId =
+		typeof artifactEnvelope?.callback_relay_session_id === "string"
+			? artifactEnvelope.callback_relay_session_id
+			: undefined;
 	const originSessionId =
 		typeof artifactEnvelope?.origin_session_id === "string"
 			? artifactEnvelope.origin_session_id
@@ -1083,6 +1094,10 @@ export function resolveSessionForRun(input: {
 	const callbackTargetSessionKey =
 		typeof artifactEnvelope?.callback_target_session_key === "string"
 			? artifactEnvelope.callback_target_session_key
+			: undefined;
+	const callbackRelaySessionKey =
+		typeof artifactEnvelope?.callback_relay_session_key === "string"
+			? artifactEnvelope.callback_relay_session_key
 			: undefined;
 	const originSessionKey =
 		typeof artifactEnvelope?.origin_session_key === "string"
@@ -1095,6 +1110,7 @@ export function resolveSessionForRun(input: {
 
 	const artifactSessionId =
 		callbackTargetSessionId ||
+		callbackRelaySessionId ||
 		originSessionId ||
 		(typeof artifactEnvelope?.session_id === "string"
 			? artifactEnvelope.session_id
@@ -1104,7 +1120,13 @@ export function resolveSessionForRun(input: {
 			: undefined);
 
 	const artifactSessionKey =
-		callbackTargetSessionKey || originSessionKey || executionSessionKey;
+		callbackTargetSessionKey &&
+		!isCanonicalCallbackSessionKey(callbackTargetSessionKey)
+			? callbackTargetSessionKey
+			: callbackRelaySessionKey ||
+				callbackTargetSessionKey ||
+				originSessionKey ||
+				executionSessionKey;
 	const artifactRepoRoot =
 		typeof artifactEnvelope?.repo_root === "string"
 			? artifactEnvelope.repo_root
@@ -1117,7 +1139,10 @@ export function resolveSessionForRun(input: {
 	// When callback target key is available, avoid biasing scored fallback toward
 	// execution lane sessions via runId/taskId tokens.
 	const hasCallerSessionKey = Boolean(
-		callbackTargetSessionKey || originSessionKey,
+		(callbackTargetSessionKey &&
+			!isCanonicalCallbackSessionKey(callbackTargetSessionKey)) ||
+			callbackRelaySessionKey ||
+			originSessionKey,
 	);
 
 	const filteredSessionList = Array.isArray(input.sessionList)
@@ -1321,6 +1346,10 @@ export function buildTaggedTitleForEnvelope(envelope: RoutingEnvelope): string {
 		resolved: envelope.resolved_agent_id,
 		callbackSession: envelope.callback_target_session_key,
 		callbackSessionId: envelope.callback_target_session_id,
+		originSession: envelope.origin_session_key,
+		originSessionId: envelope.origin_session_id,
+		callbackRelaySession: envelope.callback_relay_session_key,
+		callbackRelaySessionId: envelope.callback_relay_session_id,
 		callbackDeliver: envelope.deliver,
 		projectId: envelope.project_id,
 		repoRoot: envelope.repo_root,
@@ -1561,6 +1590,10 @@ export async function runAttachExecutionForEnvelope(input: {
 		resolved: input.envelope.resolved_agent_id,
 		callbackSession: input.envelope.callback_target_session_key,
 		callbackSessionId: input.envelope.callback_target_session_id,
+		originSession: input.envelope.origin_session_key,
+		originSessionId: input.envelope.origin_session_id,
+		callbackRelaySession: input.envelope.callback_relay_session_key,
+		callbackRelaySessionId: input.envelope.callback_relay_session_id,
 		callbackDeliver: input.envelope.deliver,
 		projectId: input.envelope.project_id,
 		repoRoot: input.envelope.repo_root,
@@ -1635,10 +1668,15 @@ export function buildContinuationCallbackMetadata(input: {
 		agentWorkspaceDir: input.runStatus.envelope.agent_workspace_dir,
 		requestedAgentId: input.runStatus.envelope.requested_agent_id,
 		resolvedAgentId: input.runStatus.envelope.resolved_agent_id,
+		originSessionKey: input.runStatus.envelope.origin_session_key,
+		originSessionId: input.runStatus.envelope.origin_session_id,
 		callbackTargetSessionKey:
 			input.runStatus.envelope.callback_target_session_key,
 		callbackTargetSessionId:
 			input.runStatus.envelope.callback_target_session_id,
+		callbackRelaySessionKey:
+			input.runStatus.envelope.callback_relay_session_key,
+		callbackRelaySessionId: input.runStatus.envelope.callback_relay_session_id,
 		opencodeSessionId: input.runStatus.sessionId,
 		workflowId: continuation?.workflowId,
 		stepId: continuation?.stepId,

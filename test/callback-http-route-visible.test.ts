@@ -87,7 +87,7 @@ test("callback http route enqueues control message and wakes session without emi
 	const payload = {
 		name: "OpenCode",
 		agentId: "creator",
-		sessionKey: "agent:creator:telegram:direct:5165741309",
+		sessionKey: "agent:creator:opencode:creator:callback:run-visible-1",
 		sessionId: "sess-origin-1",
 		wakeMode: "now",
 		deliver: true,
@@ -96,8 +96,11 @@ test("callback http route enqueues control message and wakes session without emi
 			eventType: "message.updated",
 			runId: "run-visible-1",
 			taskId: "task-visible-1",
-			callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackTargetSessionKey:
+				"agent:creator:opencode:creator:callback:run-visible-1",
 			callbackTargetSessionId: "sess-origin-1",
+			callbackRelaySessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackRelaySessionId: "sess-origin-1",
 			opencodeSessionId: "oc-sess-1",
 		}),
 	};
@@ -115,19 +118,16 @@ test("callback http route enqueues control message and wakes session without emi
 		/OpenCode callback control message/,
 	);
 	assert.match(systemEvents[0].text, /"messageKind":"callback_control"/);
-	assert.equal(systemEvents[0]?.opts?.sessionId, payload.sessionId);
+	assert.equal(systemEvents[0]?.opts?.sessionId, undefined);
 	assert.doesNotMatch(
 		systemEvents[0].text,
 		/OpenCode callback received for run run-visible-1; code finished; agent is continuing\./,
 	);
-	assert.equal(telegramSends.length, 1);
-	assert.equal(telegramSends[0]?.to, "5165741309");
-	assert.equal(telegramSends[0]?.text, "Background run update received.");
-	assert.equal(telegramSends[0]?.opts?.silent, false);
 	assert.equal(
-		telegramSends[0]?.opts?.contextKey,
-		"opencode:run-visible-1:message.updated:callback-ingress-telegram",
+		systemEvents[0]?.opts?.contextKey,
+		"opencode:run-visible-1:message.updated:agent:creator:opencode:creator:callback:run-visible-1:callback_control",
 	);
+	assert.equal(telegramSends.length, 0);
 });
 
 test("callback http route still avoids user-visible ack text even when deliver=false", async () => {
@@ -171,7 +171,7 @@ test("callback http route still avoids user-visible ack text even when deliver=f
 	const payload = {
 		name: "OpenCode",
 		agentId: "creator",
-		sessionKey: "agent:creator:telegram:direct:5165741309",
+		sessionKey: "agent:creator:opencode:creator:callback:run-visible-2",
 		sessionId: "sess-origin-2",
 		wakeMode: "now",
 		deliver: false,
@@ -180,8 +180,11 @@ test("callback http route still avoids user-visible ack text even when deliver=f
 			eventType: "message.updated",
 			runId: "run-visible-2",
 			taskId: "task-visible-2",
-			callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackTargetSessionKey:
+				"agent:creator:opencode:creator:callback:run-visible-2",
 			callbackTargetSessionId: "sess-origin-2",
+			callbackRelaySessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackRelaySessionId: "sess-origin-2",
 			opencodeSessionId: "oc-sess-2",
 		}),
 	};
@@ -242,7 +245,7 @@ test("callback http route does not send telegram notify for non-direct telegram 
 	const payload = {
 		name: "OpenCode",
 		agentId: "creator",
-		sessionKey: "agent:creator:telegram:group:-10011223344",
+		sessionKey: "agent:creator:opencode:creator:callback:run-group-1",
 		sessionId: "sess-group-1",
 		wakeMode: "now",
 		deliver: true,
@@ -251,8 +254,11 @@ test("callback http route does not send telegram notify for non-direct telegram 
 			eventType: "message.updated",
 			runId: "run-group-1",
 			taskId: "task-group-1",
-			callbackTargetSessionKey: "agent:creator:telegram:group:-10011223344",
+			callbackTargetSessionKey:
+				"agent:creator:opencode:creator:callback:run-group-1",
 			callbackTargetSessionId: "sess-group-1",
+			callbackRelaySessionKey: "agent:creator:telegram:group:-10011223344",
+			callbackRelaySessionId: "sess-group-1",
 			opencodeSessionId: "oc-sess-group-1",
 		}),
 	};
@@ -272,7 +278,7 @@ test("callback http route does not send telegram notify for non-direct telegram 
 	assert.equal(telegramSends.length, 0);
 });
 
-test("callback http route sends exactly one telegram notify when continuation notify exists (no duplicate ingress ack)", async () => {
+test("callback http route enqueues continuation notify internally when continuation notify exists", async () => {
 	const tempRoot = mkdtempSync(
 		join(tmpdir(), "opencode-bridge-callback-visible-"),
 	);
@@ -295,9 +301,12 @@ test("callback http route sends exactly one telegram notify when continuation no
 					resolved_agent_id: "builder",
 					session_key: "hook:opencode:builder:task-visible-continue-1",
 					origin_session_key: "agent:creator:telegram:direct:5165741309",
+					origin_session_id: "sess-origin-continue-1",
 					callback_target_session_key:
+						"agent:creator:opencode:creator:callback:sess-origin-continue-1",
+					callback_relay_session_key:
 						"agent:creator:telegram:direct:5165741309",
-					callback_target_session_id: "sess-origin-continue-1",
+					callback_relay_session_id: "sess-origin-continue-1",
 					project_id: "proj-visible-continue-1",
 					repo_root: "/tmp/repo-visible-continue-1",
 					opencode_server_url: "http://opencode.local",
@@ -361,7 +370,8 @@ test("callback http route sends exactly one telegram notify when continuation no
 		const payload = {
 			name: "OpenCode",
 			agentId: "creator",
-			sessionKey: "agent:creator:telegram:direct:5165741309",
+			sessionKey:
+				"agent:creator:opencode:creator:callback:sess-origin-continue-1",
 			sessionId: "sess-origin-continue-1",
 			wakeMode: "now",
 			deliver: true,
@@ -370,8 +380,11 @@ test("callback http route sends exactly one telegram notify when continuation no
 				eventType: "task.completed",
 				runId: "run-visible-continue-1",
 				taskId: "task-visible-continue-1",
-				callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
+				callbackTargetSessionKey:
+					"agent:creator:opencode:creator:callback:sess-origin-continue-1",
 				callbackTargetSessionId: "sess-origin-continue-1",
+				callbackRelaySessionKey: "agent:creator:telegram:direct:5165741309",
+				callbackRelaySessionId: "sess-origin-continue-1",
 				opencodeSessionId: "oc-sess-continue-1",
 			}),
 		};
@@ -382,18 +395,17 @@ test("callback http route sends exactly one telegram notify when continuation no
 
 		assert.equal(handled, true);
 		assert.equal(res.statusCode, 200);
-		assert.equal(systemEvents.length, 1);
+		assert.equal(systemEvents.length, 2);
 		assert.match(systemEvents[0].text, /<opencode_callback_control_internal>/);
-		assert.equal(telegramSends.length, 1);
-		assert.equal(telegramSends[0]?.to, "5165741309");
 		assert.equal(
-			telegramSends[0]?.text,
+			systemEvents[1]?.text,
 			"Follow-up notification for direct session",
 		);
 		assert.equal(
-			telegramSends[0]?.opts?.contextKey,
-			"opencode:run-visible-continue-1:task.completed:continuation-notify-telegram",
+			systemEvents[1]?.opts?.contextKey,
+			"opencode:run-visible-continue-1:task.completed:agent:creator:opencode:creator:callback:sess-origin-continue-1:callback_control:continuation-notify",
 		);
+		assert.equal(telegramSends.length, 0);
 	} finally {
 		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
 		else process.env.OPENCLAW_STATE_DIR = prevStateDir;
@@ -441,8 +453,10 @@ test("callback launch_run dispatches to custom hook endpoint instead of enqueuei
 					session_key: "hook:opencode:creator:task-hook-dispatch-1",
 					origin_session_key: "agent:scrum:telegram:direct:5165741309",
 					origin_session_id: "telegram-msg-origin-1",
-					callback_target_session_key: "agent:scrum:telegram:direct:5165741309",
-					callback_target_session_id: "telegram-msg-origin-1",
+					callback_target_session_key:
+						"agent:scrum:opencode:scrum:callback:telegram-msg-origin-1",
+					callback_relay_session_key: "agent:scrum:telegram:direct:5165741309",
+					callback_relay_session_id: "telegram-msg-origin-1",
 					project_id: "proj-hook-dispatch-1",
 					repo_root: "/tmp/repo-hook-dispatch-1",
 					agent_workspace_dir: "/tmp/repo-hook-dispatch-1",
@@ -504,7 +518,7 @@ test("callback launch_run dispatches to custom hook endpoint instead of enqueuei
 		const payload = {
 			name: "OpenCode",
 			agentId: "scrum",
-			sessionKey: "agent:scrum:telegram:direct:5165741309",
+			sessionKey: "agent:scrum:opencode:scrum:callback:telegram-msg-origin-1",
 			sessionId: "telegram-msg-origin-1",
 			wakeMode: "now",
 			deliver: false,
@@ -515,8 +529,11 @@ test("callback launch_run dispatches to custom hook endpoint instead of enqueuei
 				taskId: "task-hook-dispatch-1",
 				requestedAgentId: "scrum",
 				resolvedAgentId: "creator",
-				callbackTargetSessionKey: "agent:scrum:telegram:direct:5165741309",
+				callbackTargetSessionKey:
+					"agent:scrum:opencode:scrum:callback:telegram-msg-origin-1",
 				callbackTargetSessionId: "telegram-msg-origin-1",
+				callbackRelaySessionKey: "agent:scrum:telegram:direct:5165741309",
+				callbackRelaySessionId: "telegram-msg-origin-1",
 			}),
 		};
 		const req = createMockReq(JSON.stringify(payload), "test-token");
@@ -600,8 +617,10 @@ test("hook continuation payload includes derived loop intent for session.error c
 					session_key: "hook:opencode:scrum:task-hook-intent-1",
 					origin_session_key: "agent:scrum:telegram:direct:5165741309",
 					origin_session_id: "probe-session-intent-1",
-					callback_target_session_key: "agent:scrum:telegram:direct:5165741309",
-					callback_target_session_id: "probe-session-intent-1",
+					callback_target_session_key:
+						"agent:scrum:opencode:scrum:callback:probe-session-intent-1",
+					callback_relay_session_key: "agent:scrum:telegram:direct:5165741309",
+					callback_relay_session_id: "probe-session-intent-1",
 					project_id: "TAA",
 					repo_root: "/Users/mrcagents/Work/projects/TAA/repo",
 					agent_workspace_dir: "/Users/mrcagents/.openclaw/workspace/scrum",
@@ -662,7 +681,7 @@ test("hook continuation payload includes derived loop intent for session.error c
 		const payload = {
 			name: "OpenCode",
 			agentId: "scrum",
-			sessionKey: "agent:scrum:telegram:direct:5165741309",
+			sessionKey: "agent:scrum:opencode:scrum:callback:probe-session-intent-1",
 			sessionId: "probe-session-intent-1",
 			wakeMode: "now",
 			deliver: false,
@@ -673,8 +692,11 @@ test("hook continuation payload includes derived loop intent for session.error c
 				taskId: "task-hook-intent-1",
 				requestedAgentId: "scrum",
 				resolvedAgentId: "scrum",
-				callbackTargetSessionKey: "agent:scrum:telegram:direct:5165741309",
+				callbackTargetSessionKey:
+					"agent:scrum:opencode:scrum:callback:probe-session-intent-1",
 				callbackTargetSessionId: "probe-session-intent-1",
+				callbackRelaySessionKey: "agent:scrum:telegram:direct:5165741309",
+				callbackRelaySessionId: "probe-session-intent-1",
 			}),
 		};
 		const req = createMockReq(JSON.stringify(payload), "test-token");

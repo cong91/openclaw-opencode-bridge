@@ -51,7 +51,7 @@ function createMockRes() {
 	} as any;
 }
 
-test("smoke: terminal plugin callback keeps control internal and routes continuation notify by target channel", async () => {
+test("smoke: terminal plugin callback keeps control internal and routes continuation notify via canonical callback session", async () => {
 	const tempRoot = mkdtempSync(join(tmpdir(), "opencode-bridge-smoke-"));
 	const stateDir = join(tempRoot, "state");
 	const bridgeDir = join(stateDir, "opencode-bridge");
@@ -129,8 +129,11 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 					origin_session_key: "session:origin:smoke-1",
 					origin_session_id: "sess-origin-smoke-1",
 					callback_target_session_key:
-						"agent:creator:telegram:direct:5165741309",
+						"agent:creator:opencode:creator:callback:sess-origin-smoke-1",
 					callback_target_session_id: "sess-origin-smoke-1",
+					callback_relay_session_key:
+						"agent:creator:telegram:direct:5165741309",
+					callback_relay_session_id: "sess-origin-smoke-1",
 					project_id: "proj-smoke-1",
 					repo_root: "/tmp/repo-smoke-1",
 					opencode_server_url: "http://opencode.local",
@@ -184,7 +187,7 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 					info: {
 						id: "sess-opencode-smoke-1",
 						title:
-							"task-smoke-1 runId=run-smoke-1 taskId=task-smoke-1 requested=creator resolved=builder callbackSession=agent:creator:telegram:direct:5165741309 callbackSessionId=sess-origin-smoke-1 workflowId=wf-smoke-1 stepId=step-smoke-1",
+							"task-smoke-1 runId=run-smoke-1 taskId=task-smoke-1 requested=creator resolved=builder callbackSession=agent:creator:opencode:creator:callback:sess-origin-smoke-1 callbackSessionId=sess-origin-smoke-1 callbackRelaySession=agent:creator:telegram:direct:5165741309 callbackRelaySessionId=sess-origin-smoke-1 workflowId=wf-smoke-1 stepId=step-smoke-1",
 					},
 				},
 			},
@@ -210,19 +213,28 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 		assert.equal(callbackPosts[0]?.body?.source, "opencode.callback");
 		assert.equal(
 			callbackPosts[0]?.body?.callbackTargetSessionKey,
-			"agent:creator:telegram:direct:5165741309",
+			"agent:creator:opencode:creator:callback:sess-origin-smoke-1",
 		);
 		assert.equal(
 			callbackPosts[0]?.body?.callbackTargetSessionId,
 			"sess-origin-smoke-1",
 		);
 
-		assert.equal(telegramSends.length, 1);
-		assert.equal(telegramSends[0]?.to, "5165741309");
-		assert.match(
-			String(telegramSends[0]?.text || ""),
-			/Verify current session resumed after callback/,
+		assert.equal(systemEvents.length, 2);
+		assert.match(systemEvents[0]?.text, /<opencode_callback_control_internal>/);
+		assert.equal(
+			systemEvents[1]?.text,
+			"Verify current session resumed after callback",
 		);
+		assert.equal(
+			systemEvents[1]?.opts?.sessionKey,
+			"agent:creator:opencode:creator:callback:sess-origin-smoke-1",
+		);
+		assert.equal(
+			systemEvents[1]?.opts?.contextKey,
+			"opencode:run-smoke-1:message.updated:agent:creator:opencode:creator:callback:sess-origin-smoke-1:callback_control:continuation-notify",
+		);
+		assert.equal(telegramSends.length, 0);
 	} finally {
 		globalThis.fetch = oldFetch;
 		if (oldHookBase === undefined) delete process.env.OPENCLAW_HOOK_BASE_URL;

@@ -38,7 +38,7 @@ function createMockRes() {
 	} as any;
 }
 
-test("pragmatic smoke: callback arrives, session wakes, and direct telegram ingress notify is sent", async () => {
+test("pragmatic smoke: callback arrives, session wakes, and no direct telegram ingress notify is sent", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: Array<{ text: string; opts: any }> = [];
 	const heartbeats: any[] = [];
@@ -83,7 +83,7 @@ test("pragmatic smoke: callback arrives, session wakes, and direct telegram ingr
 	const payload = {
 		name: "OpenCode",
 		agentId: "creator",
-		sessionKey: "agent:creator:telegram:direct:5165741309",
+		sessionKey: "agent:creator:opencode:creator:callback:sess-pragmatic-1",
 		sessionId: "sess-pragmatic-1",
 		wakeMode: "now",
 		deliver: true,
@@ -94,8 +94,11 @@ test("pragmatic smoke: callback arrives, session wakes, and direct telegram ingr
 			eventType: "task.completed",
 			runId: "run-pragmatic-1",
 			taskId: "task-pragmatic-1",
-			callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackTargetSessionKey:
+				"agent:creator:opencode:creator:callback:sess-pragmatic-1",
 			callbackTargetSessionId: "sess-pragmatic-1",
+			callbackRelaySessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackRelaySessionId: "sess-pragmatic-1",
 			opencodeSessionId: "oc-sess-pragmatic-1",
 		}),
 	};
@@ -114,12 +117,9 @@ test("pragmatic smoke: callback arrives, session wakes, and direct telegram ingr
 		/OpenCode callback control message/,
 	);
 	assert.match(systemEvents[0]?.text, /"messageKind":"callback_control"/);
-		assert.equal(telegramSends.length, 1);
-	assert.equal(telegramSends[0]?.to, "5165741309");
-	assert.equal(telegramSends[0]?.text, "Background run update received.");
-	assert.equal(telegramSends[0]?.opts?.silent, false);
 	assert.equal(
-		telegramSends[0]?.opts?.contextKey,
-		"opencode:run-pragmatic-1:task.completed:callback-ingress-telegram",
+		systemEvents[0]?.opts?.contextKey,
+		"opencode:run-pragmatic-1:task.completed:agent:creator:opencode:creator:callback:sess-pragmatic-1:callback_control",
 	);
+	assert.equal(telegramSends.length, 0);
 });

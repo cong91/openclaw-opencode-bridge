@@ -46,6 +46,8 @@ import {
 	writeSessionRegistryFile,
 } from "./runtime";
 import {
+	buildCanonicalCallbackSessionKey,
+	isCanonicalCallbackSessionKey,
 	OPENCODE_CALLBACK_HTTP_PATH,
 	OPENCODE_CONTINUATION_CONTROL_HTTP_PATH,
 	OPENCODE_CONTINUATION_HOOK_PATH,
@@ -115,55 +117,6 @@ function appendCallbackDebugAudit(record: Record<string, unknown>) {
 	return path;
 }
 
-function buildDirectOperatorTelegramMessage(payload: Record<string, unknown>) {
-	const intent =
-		payload.intent && typeof payload.intent === "object"
-			? (payload.intent as Record<string, unknown>)
-			: {};
-	const eventType = asString(payload.eventType) || "unknown-event";
-	const taskId =
-		asString(payload.taskId) || asString(payload.runId) || "unknown-task";
-	const runId = asString(payload.runId) || "unknown-run";
-	const agentId = asString(payload.requestedAgentId) || "unknown-agent";
-	const projectId = asString(payload.projectId) || "unknown-project";
-	const repoRoot = asString(payload.repoRoot) || "unknown-repo";
-	const nextStep =
-		asString(intent.taskId) ||
-		asString(intent.objective) ||
-		asString(intent.notify) ||
-		"none";
-	const retryCount = Number(payload.retryCount || 0);
-	const status =
-		eventType === "session.error" || eventType === "task.failed"
-			? retryCount > 2
-				? "step failed repeatedly; loop blocked"
-				: "step failed; corrective relaunch requested"
-			: eventType === "task.completed" || eventType === "session.idle"
-				? "step completed; continuation in progress"
-				: "callback received";
-	const actionTaken =
-		eventType === "session.error" || eventType === "task.failed"
-			? retryCount > 2
-				? "escalating to manual review"
-				: "launching corrective continuation run"
-			: "dispatching continuation hook";
-	const needFromOperator = retryCount > 2 ? "manual review required" : "none";
-	return [
-		"OpenCode Loop Update",
-		`- Agent: ${agentId}`,
-		`- Task: ${taskId}`,
-		`- Run: ${runId}`,
-		`- Event: ${eventType}`,
-		`- Project: ${projectId}`,
-		`- Repo: ${repoRoot}`,
-		`- Status: ${status}`,
-		`- Action taken: ${actionTaken}`,
-		`- Next step: ${nextStep}`,
-		`- Retry count: ${retryCount}`,
-		`- Need from operator: ${needFromOperator}`,
-	].join("\n");
-}
-
 function parseJsonObject(raw: string): Record<string, unknown> | null {
 	try {
 		const parsed = JSON.parse(raw);
@@ -198,6 +151,9 @@ function buildContinuationCommandPayload(input: {
 			input.runStatus.envelope.callback_target_session_key,
 		callbackTargetSessionId:
 			input.runStatus.envelope.callback_target_session_id,
+		callbackRelaySessionKey:
+			input.runStatus.envelope.callback_relay_session_key,
+		callbackRelaySessionId: input.runStatus.envelope.callback_relay_session_id,
 		workflowId: input.runStatus.continuation?.workflowId,
 		stepId: input.runStatus.continuation?.stepId,
 		next: input.step,
@@ -448,10 +404,29 @@ function isTerminalState(state?: BridgeRunStatus["state"] | null): boolean {
 	return state === "completed" || state === "failed" || state === "stalled";
 }
 
-function parseDirectTelegramTarget(sessionKey?: string): string | undefined {
-	if (!sessionKey) return undefined;
-	const matched = sessionKey.match(/^agent:[^:]+:telegram:direct:(.+)$/);
-	return matched?.[1];
+function resolveCanonicalCallbackRoute(input: {
+	callback: { sessionKey: string };
+	metadata: OpenCodeContinuationCallbackMetadata | null;
+}) {
+	const requestedAgentId = asString(input.metadata?.requestedAgentId);
+	const callbackAnchor =
+		asString(input.metadata?.callbackTargetSessionId) ||
+		asString(input.metadata?.originSessionId) ||
+		asString(input.metadata?.runId) ||
+		asString(input.metadata?.taskId);
+	if (requestedAgentId && callbackAnchor) {
+		return buildCanonicalCallbackSessionKey({
+			agentId: requestedAgentId,
+			anchor: callbackAnchor,
+		});
+	}
+	if (isCanonicalCallbackSessionKey(input.metadata?.callbackTargetSessionKey)) {
+		return input.metadata?.callbackTargetSessionKey as string;
+	}
+	if (isCanonicalCallbackSessionKey(input.callback.sessionKey)) {
+		return input.callback.sessionKey;
+	}
+	return input.callback.sessionKey;
 }
 
 function resolveContinuationStep(input: {
@@ -513,33 +488,6 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				sendJson(res, 400, { ok: false, error: "invalid_json" });
 				return true;
 			}
-			const telegramDirectTo =
-				parseDirectTelegramTarget(asString(payload.callbackTargetSessionKey)) ||
-				"5165741309";
-			if (
-				typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
-				"function"
-			) {
-				try {
-					await api.runtime.channel.telegram.sendMessageTelegram(
-						telegramDirectTo,
-						buildDirectOperatorTelegramMessage(payload),
-						{ silent: false },
-					);
-					appendCallbackDebugAudit({
-						phase: "continuation_control_telegram_sent",
-						telegramTo: telegramDirectTo,
-						payload,
-					});
-				} catch (error) {
-					appendCallbackDebugAudit({
-						phase: "continuation_control_telegram_failed",
-						telegramTo: telegramDirectTo,
-						error: error instanceof Error ? error.message : String(error),
-						payload,
-					});
-				}
-			}
 			const metadata =
 				payload as unknown as OpenCodeContinuationCallbackMetadata;
 			const retryCount = Math.max(0, Number(payload.retryCount || 0));
@@ -564,10 +512,24 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					resolved_agent_id:
 						asString(payload.resolvedAgentId) || fallbackAgentId,
 					session_key: asString(payload.callbackTargetSessionKey) || "",
-					origin_session_key: asString(payload.callbackTargetSessionKey) || "",
+					origin_session_key:
+						asString(payload.originSessionKey) ||
+						asString(payload.callbackRelaySessionKey) ||
+						asString(payload.callbackTargetSessionKey) ||
+						"",
+					origin_session_id:
+						asString(payload.originSessionId) ||
+						asString(payload.callbackRelaySessionId) ||
+						asString(payload.callbackTargetSessionId),
 					callback_target_session_key:
 						asString(payload.callbackTargetSessionKey) || "",
 					callback_target_session_id: asString(payload.callbackTargetSessionId),
+					callback_relay_session_key:
+						asString(payload.callbackRelaySessionKey) ||
+						asString(payload.originSessionKey),
+					callback_relay_session_id:
+						asString(payload.callbackRelaySessionId) ||
+						asString(payload.originSessionId),
 					project_id: asString(payload.projectId) || "",
 					repo_root: asString(payload.repoRoot) || "",
 					opencode_server_url:
@@ -688,9 +650,14 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				return true;
 			}
 			const callback = parsed.body;
+			const routedCallbackSessionKey = resolveCanonicalCallbackRoute({
+				callback,
+				metadata: parsed.metadata,
+			});
+			const messageKind = "callback_control";
 			const dedupeKey =
 				parsed.metadata?.runId && parsed.metadata?.eventType
-					? `opencode:${parsed.metadata.runId}:${parsed.metadata.eventType}`
+					? `opencode:${parsed.metadata.runId}:${parsed.metadata.eventType}:${routedCallbackSessionKey}:${messageKind}`
 					: undefined;
 			const runStatus = parsed.metadata?.runId
 				? readRunStatus(parsed.metadata.runId)
@@ -717,7 +684,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						{
 							ok: true,
 							routed: {
-								sessionKey: callback.sessionKey,
+								sessionKey: routedCallbackSessionKey,
 								eventType: parsed.metadata?.eventType || null,
 								runId: parsed.metadata?.runId || null,
 							},
@@ -745,23 +712,26 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					};
 				});
 			}
-			const preferredSessionId =
-				parsed.metadata?.callbackTargetSessionId || callback.sessionId;
+			const preferredSessionId = isCanonicalCallbackSessionKey(
+				routedCallbackSessionKey,
+			)
+				? undefined
+				: parsed.metadata?.callbackTargetSessionId;
 			const callbackTarget = {
-				sessionKey: callback.sessionKey,
+				sessionKey: routedCallbackSessionKey,
 				...(preferredSessionId ? { sessionId: preferredSessionId } : {}),
 			};
 			const sessionIdMatched = Boolean(preferredSessionId);
 			const fallbackToSessionKey = !preferredSessionId;
 			const callbackControlEnvelope = parsed.metadata
 				? {
-						messageKind: "callback_control",
+						messageKind,
 						callbackHandling: "continue_workflow",
 						humanActionRequired: false,
 						callback: parsed.metadata,
 					}
 				: {
-						messageKind: "callback_control",
+						messageKind,
 						callbackHandling: "continue_workflow",
 						humanActionRequired: false,
 						callback: callback.message,
@@ -778,57 +748,9 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				...callbackTarget,
 				...(dedupeKey ? { contextKey: dedupeKey } : {}),
 			});
-			const telegramDirectTo =
-				parseDirectTelegramTarget(
-					parsed.metadata?.callbackTargetSessionKey || callback.sessionKey,
-				) ||
-				parseDirectTelegramTarget(callback.sessionKey) ||
-				(callback.channel === "telegram" ? callback.to : undefined);
-			const continuationWillNotify = continuationStep?.action === "notify";
-			if (
-				callback.deliver === true &&
-				!continuationWillNotify &&
-				typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
-					"function" &&
-				telegramDirectTo
-			) {
-				const ingressNotifyText = "Background run update received.";
-				try {
-					await api.runtime.channel.telegram.sendMessageTelegram(
-						telegramDirectTo,
-						ingressNotifyText,
-						{
-							...(dedupeKey
-								? { contextKey: `${dedupeKey}:callback-ingress-telegram` }
-								: {}),
-							silent: false,
-						},
-					);
-					appendCallbackDebugAudit({
-						phase: "callback_ingress_telegram_sent",
-						sessionKey: callback.sessionKey,
-						telegramTo: telegramDirectTo,
-						dedupeKey,
-						runId: parsed.metadata?.runId || null,
-						eventType: parsed.metadata?.eventType || null,
-						notifyMessage: ingressNotifyText,
-					});
-				} catch (error) {
-					appendCallbackDebugAudit({
-						phase: "callback_ingress_telegram_failed",
-						sessionKey: callback.sessionKey,
-						telegramTo: telegramDirectTo,
-						dedupeKey,
-						runId: parsed.metadata?.runId || null,
-						eventType: parsed.metadata?.eventType || null,
-						notifyMessage: ingressNotifyText,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
-			}
 			appendCallbackDebugAudit({
 				phase: "callback_enqueued",
-				sessionKey: callback.sessionKey,
+				sessionKey: routedCallbackSessionKey,
 				sessionId: preferredSessionId || null,
 				sessionIdMatched,
 				fallbackToSessionKey,
@@ -865,7 +787,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					appendCallbackDebugAudit({
 						phase: "attach_run_pid_killed",
 						runId: parsed.metadata.runId,
-						sessionKey: callback.sessionKey,
+						sessionKey: routedCallbackSessionKey,
 						pid: attachPid,
 						killSignal: "SIGTERM",
 						killResult,
@@ -876,7 +798,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				const step = continuationStep;
 				appendCallbackDebugAudit({
 					phase: "continuation_evaluated",
-					sessionKey: callback.sessionKey,
+					sessionKey: routedCallbackSessionKey,
 					dedupeKey,
 					runId: parsed.metadata?.runId || null,
 					eventType: parsed.metadata?.eventType || null,
@@ -898,7 +820,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						phase: hookDispatch.ok
 							? "continuation_hook_dispatched"
 							: "continuation_hook_failed",
-						sessionKey: callback.sessionKey,
+						sessionKey: routedCallbackSessionKey,
 						dedupeKey,
 						runId: parsed.metadata?.runId || null,
 						commandPayload,
@@ -909,67 +831,26 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						step.objective ||
 						step.prompt ||
 						"Next step requires operator notice.";
-					if (
-						typeof api?.runtime?.channel?.telegram?.sendMessageTelegram ===
-							"function" &&
-						telegramDirectTo
-					) {
-						try {
-							await api.runtime.channel.telegram.sendMessageTelegram(
-								telegramDirectTo,
-								notifyMessage,
-								{
-									...(dedupeKey
-										? {
-												contextKey: `${dedupeKey}:continuation-notify-telegram`,
-											}
-										: {}),
-									silent: false,
-								},
-							);
-							appendCallbackDebugAudit({
-								phase: "continuation_notify_telegram_sent",
-								sessionKey: callback.sessionKey,
-								telegramTo: telegramDirectTo,
-								dedupeKey,
-								runId: parsed.metadata?.runId || null,
-								notifyMessage,
-							});
-						} catch (error) {
-							appendCallbackDebugAudit({
-								phase: "continuation_notify_telegram_failed",
-								sessionKey: callback.sessionKey,
-								telegramTo: telegramDirectTo,
-								dedupeKey,
-								runId: parsed.metadata?.runId || null,
-								notifyMessage,
-								error: error instanceof Error ? error.message : String(error),
-							});
-						}
-					} else {
-						api.runtime.system.enqueueSystemEvent(notifyMessage, {
-							...callbackTarget,
-							...(dedupeKey
-								? { contextKey: `${dedupeKey}:continuation-notify` }
-								: {}),
-						});
-						appendCallbackDebugAudit({
-							phase: "continuation_notify_enqueued",
-							sessionKey: callback.sessionKey,
-							dedupeKey,
-							runId: parsed.metadata?.runId || null,
-							notifyMessage,
-							reason: telegramDirectTo
-								? "telegram_channel_unavailable"
-								: "non_telegram_direct_session",
-						});
-					}
+					api.runtime.system.enqueueSystemEvent(notifyMessage, {
+						...callbackTarget,
+						...(dedupeKey
+							? { contextKey: `${dedupeKey}:continuation-notify` }
+							: {}),
+					});
+					appendCallbackDebugAudit({
+						phase: "continuation_notify_enqueued",
+						sessionKey: routedCallbackSessionKey,
+						dedupeKey,
+						runId: parsed.metadata?.runId || null,
+						notifyMessage,
+						reason: "registrar_authority",
+					});
 				}
 			}
 			sendJson(res, 200, {
 				ok: true,
 				routed: {
-					sessionKey: callback.sessionKey,
+					sessionKey: routedCallbackSessionKey,
 					eventType: parsed.metadata?.eventType || null,
 					runId: parsed.metadata?.runId || null,
 				},

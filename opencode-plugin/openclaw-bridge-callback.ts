@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+	buildCanonicalCallbackSessionKey,
 	buildPluginCallbackDedupeKey,
 	OPENCODE_CONTINUATION_CONTROL_HTTP_PATH,
 	parseTaggedSessionTitle,
@@ -145,11 +146,40 @@ function buildHookContinuationPayload(
 	eventType: string,
 	opencodeSessionId?: string,
 ) {
-	const agentId = tags.requested || tags.requested_agent_id;
-	const sessionKey = tags.callbackSession || tags.callback_target_session_key;
-	const sessionId = tags.callbackSessionId || tags.callback_target_session_id;
+	const requestedAgentIdFromTags = tags.requested || tags.requested_agent_id;
+	const agentId = requestedAgentIdFromTags;
+	const callbackAnchor =
+		tags.callbackSessionId ||
+		tags.callback_target_session_id ||
+		tags.originSessionId ||
+		tags.origin_session_id ||
+		opencodeSessionId ||
+		tags.runId ||
+		tags.run_id ||
+		tags.taskId ||
+		tags.task_id;
+	if (!requestedAgentIdFromTags || !callbackAnchor) return null;
+	const sessionKey = buildCanonicalCallbackSessionKey({
+		agentId: requestedAgentIdFromTags,
+		anchor: callbackAnchor,
+	});
+	const sessionId =
+		tags.callbackSessionId ||
+		tags.callback_target_session_id ||
+		tags.originSessionId ||
+		tags.origin_session_id;
+	const relaySessionKey =
+		tags.callbackRelaySession ||
+		tags.callback_relay_session_key ||
+		tags.originSession ||
+		tags.origin_session_key;
+	const relaySessionId =
+		tags.callbackRelaySessionId ||
+		tags.callback_relay_session_id ||
+		tags.originSessionId ||
+		tags.origin_session_id;
 	const deliver = (tags.callbackDeliver || tags.callback_deliver) === "true";
-	if (!agentId || !sessionKey) return null;
+	if (!agentId) return null;
 	const metadata = buildContinuationMetadata(
 		tags,
 		eventType,
@@ -159,28 +189,24 @@ function buildHookContinuationPayload(
 		eventType === "session.error" || eventType === "task.failed";
 	const isPeriodicUpdate =
 		PERIODIC_UPDATE_EVENT_TYPES.has(eventType) && !isFailureEvent;
-	const statusLine = isFailureEvent
-		? "step failed; corrective relaunch requested"
-		: isPeriodicUpdate
-			? "step in progress; periodic checkpoint"
-			: "step completed; continuation in progress";
-	const actionLine = isFailureEvent
-		? "launching corrective continuation run"
-		: isPeriodicUpdate
-			? "dispatching loop checkpoint update"
-			: "launching continuation / verification";
 	const requestedAgentId = metadata.requestedAgentId || agentId;
 	const resolvedAgentId =
 		metadata.resolvedAgentId || metadata.requestedAgentId || agentId;
 	const callbackTargetSessionKey =
 		metadata.callbackTargetSessionKey || sessionKey;
 	const callbackTargetSessionId = metadata.callbackTargetSessionId || sessionId;
+	const callbackRelaySessionKey =
+		metadata.callbackRelaySessionKey || relaySessionKey;
+	const callbackRelaySessionId =
+		metadata.callbackRelaySessionId || relaySessionId;
 	const callbackMetadata: OpenCodeContinuationCallbackMetadata = {
 		...metadata,
 		requestedAgentId,
 		resolvedAgentId,
 		callbackTargetSessionKey,
 		callbackTargetSessionId,
+		callbackRelaySessionKey,
+		callbackRelaySessionId,
 	};
 	return {
 		source: "opencode.callback",
@@ -199,6 +225,8 @@ function buildHookContinuationPayload(
 		resolvedAgentId,
 		callbackTargetSessionKey,
 		callbackTargetSessionId,
+		callbackRelaySessionKey,
+		callbackRelaySessionId,
 		opencodeSessionId: metadata.opencodeSessionId,
 		workflowId: metadata.workflowId,
 		stepId: metadata.stepId,
@@ -209,28 +237,16 @@ function buildHookContinuationPayload(
 			kind: isFailureEvent ? "launch_run" : "notify",
 			taskId: metadata.taskId,
 			objective: isFailureEvent
-				? "Analyze the failure and continue with the corrective next step."
+				? "Internal continuation control: analyze failure and continue corrective step."
 				: isPeriodicUpdate
-					? "OpenCode step is still running; send checkpoint update and continue monitoring."
-					: "OpenCode step completed; send operator update and continue if needed.",
+					? "Internal continuation checkpoint: OpenCode step still running; continue monitoring."
+					: "Internal continuation control: OpenCode step completed; continue workflow handling.",
 			prompt: isFailureEvent
 				? "The previous step failed. Inspect the failure, summarize the likely reason, then continue with the corrective next step."
 				: isPeriodicUpdate
-					? "OpenCode reports in-progress activity. Send a concise checkpoint update for operators, then continue waiting for terminal callback."
-					: "The previous step completed. Send a concise operator update, then continue with verification or the next task if needed.",
-			notify: [
-				"OpenCode Loop Update",
-				`- Agent: ${requestedAgentId || "unknown-agent"}`,
-				`- Task: ${metadata.taskId || metadata.runId || "unknown-task"}`,
-				`- Run: ${metadata.runId || "unknown-run"}`,
-				`- Event: ${metadata.eventType || "unknown-event"}`,
-				`- Project: ${metadata.projectId || "unknown-project"}`,
-				`- Repo: ${metadata.repoRoot || "unknown-repo"}`,
-				`- Status: ${statusLine}`,
-				`- Action taken: ${actionLine}`,
-				`- Next step: ${metadata.taskId || metadata.runId || "unknown-task"}`,
-				"- Need from operator: none",
-			].join("\n"),
+					? "OpenCode reports in-progress activity. Continue waiting for terminal callback while maintaining internal state."
+					: "The previous step completed. Continue with verification or next task as internal continuation control.",
+			notify: `internal_callback:${metadata.eventType || "unknown-event"}:${metadata.runId || "unknown-run"}`,
 			reason: metadata.eventType,
 		},
 		deliver,
@@ -245,6 +261,23 @@ function buildContinuationMetadata(
 	const requestedAgentId = tags.requested || tags.requested_agent_id;
 	const resolvedAgentId =
 		tags.resolved || tags.resolved_agent_id || requestedAgentId;
+	const callbackAnchor =
+		tags.callbackSessionId ||
+		tags.callback_target_session_id ||
+		tags.originSessionId ||
+		tags.origin_session_id ||
+		opencodeSessionId ||
+		tags.runId ||
+		tags.run_id ||
+		tags.taskId ||
+		tags.task_id;
+	const callbackTargetSessionKey =
+		requestedAgentId && callbackAnchor
+			? buildCanonicalCallbackSessionKey({
+					agentId: requestedAgentId,
+					anchor: callbackAnchor,
+				})
+			: undefined;
 	return {
 		kind: "opencode.callback",
 		eventType,
@@ -254,10 +287,21 @@ function buildContinuationMetadata(
 		repoRoot: tags.repoRoot || tags.repo_root,
 		requestedAgentId,
 		resolvedAgentId,
-		callbackTargetSessionKey:
-			tags.callbackSession || tags.callback_target_session_key,
+		originSessionKey: tags.originSession || tags.origin_session_key,
+		originSessionId: tags.originSessionId || tags.origin_session_id,
+		callbackTargetSessionKey,
 		callbackTargetSessionId:
 			tags.callbackSessionId || tags.callback_target_session_id,
+		callbackRelaySessionKey:
+			tags.callbackRelaySession ||
+			tags.callback_relay_session_key ||
+			tags.originSession ||
+			tags.origin_session_key,
+		callbackRelaySessionId:
+			tags.callbackRelaySessionId ||
+			tags.callback_relay_session_id ||
+			tags.originSessionId ||
+			tags.origin_session_id,
 		opencodeSessionId:
 			opencodeSessionId || tags.opencodeSessionId || tags.opencode_session_id,
 		workflowId: tags.workflowId || tags.workflow_id,
@@ -277,6 +321,8 @@ async function postCallback(
 		resolvedAgentId?: string;
 		callbackTargetSessionKey?: string;
 		callbackTargetSessionId?: string;
+		callbackRelaySessionKey?: string;
+		callbackRelaySessionId?: string;
 		projectId?: string;
 		repoRoot?: string;
 		workflowId?: string;
@@ -533,6 +579,16 @@ export const OpenClawBridgeCallbackPlugin = async ({
 					tags.callbackSession || tags.callback_target_session_key,
 				callbackTargetSessionId:
 					tags.callbackSessionId || tags.callback_target_session_id,
+				callbackRelaySessionKey:
+					tags.callbackRelaySession ||
+					tags.callback_relay_session_key ||
+					tags.originSession ||
+					tags.origin_session_key,
+				callbackRelaySessionId:
+					tags.callbackRelaySessionId ||
+					tags.callback_relay_session_id ||
+					tags.originSessionId ||
+					tags.origin_session_id,
 				projectId: tags.projectId || tags.project_id,
 				repoRoot: tags.repoRoot || tags.repo_root,
 				workflowId: tags.workflowId || tags.workflow_id,

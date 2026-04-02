@@ -9,7 +9,6 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { createServer } from "node:net";
 import { join } from "node:path";
 import {
 	type EventScope,
@@ -50,6 +49,15 @@ export const DEFAULT_OBS_TIMEOUT_MS = 3000;
 export const DEFAULT_TAIL_LIMIT = 20;
 export const DEFAULT_EVENT_LIMIT = 10;
 export const HOOK_PREFIX = "hook:opencode:";
+export const DEFAULT_SERVE_PORT = 4096;
+
+export function getDefaultServePort(): number {
+	return DEFAULT_SERVE_PORT;
+}
+
+export function getDefaultServeUrl(): string {
+	return `http://127.0.0.1:${getDefaultServePort()}`;
+}
 
 export function asArray(value: unknown): any[] {
 	return Array.isArray(value) ? value : [];
@@ -84,7 +92,7 @@ export function ensureBridgeConfigFile(): BridgeConfigFile {
 	const path = getBridgeConfigPath();
 	if (!existsSync(path)) {
 		const initial: BridgeConfigFile = {
-			opencodeServerUrl: "http://127.0.0.1:4096",
+			opencodeServerUrl: getDefaultServeUrl(),
 			projectRegistry: [],
 		};
 		writeFileSync(path, JSON.stringify(initial, null, 2), "utf8");
@@ -266,7 +274,10 @@ export function buildEnvelope(input: {
 	priority?: string;
 }): RoutingEnvelope {
 	const callbackAnchor =
-		input.originSessionId?.trim() || input.runId || input.taskId;
+		input.originSessionKey?.trim() ||
+		input.originSessionId?.trim() ||
+		input.runId ||
+		input.taskId;
 	const canonicalCallbackSessionKey = buildCanonicalCallbackSessionKey({
 		agentId: input.requestedAgentId,
 		anchor: callbackAnchor,
@@ -580,22 +591,11 @@ export function normalizeSessionRegistry(
 	return { entries };
 }
 
-function compactServeRegistryLiveOnly(
-	data: ServeRegistryFile,
-): ServeRegistryFile {
-	const normalized = normalizeServeRegistry(data);
-	return {
-		entries: normalized.entries.filter(
-			(entry) => asString(entry.status) !== "stopped",
-		),
-	};
-}
-
 export function writeServeRegistryFile(data: ServeRegistryFile) {
 	const path = getServeRegistryPath();
 	writeFileSync(
 		path,
-		JSON.stringify(compactServeRegistryLiveOnly(data), null, 2),
+		JSON.stringify(normalizeServeRegistry(data), null, 2),
 		"utf8",
 	);
 	return path;
@@ -620,24 +620,14 @@ export function upsertServeRegistry(entry: ServeRegistryEntry) {
 	);
 	if (idx >= 0) registry.entries[idx] = entry;
 	else registry.entries.push(entry);
-	if (entry.status === "running" || entry.status === "unknown") {
-		registry.entries = registry.entries.filter(
-			(x) =>
-				x.serve_id === entry.serve_id ||
-				x.opencode_server_url === entry.opencode_server_url,
-		);
-	}
 	const path = writeServeRegistryFile(registry);
-	return { path, registry: compactServeRegistryLiveOnly(registry) };
+	return { path, registry: normalizeServeRegistry(registry) };
 }
 
 export function upsertSessionRegistry(entry: SessionRegistryEntry) {
 	const registry = normalizeSessionRegistry(readSessionRegistry());
 	for (const item of registry.entries) {
-		if (
-			item.serve_id === entry.serve_id &&
-			item.directory === entry.directory
-		) {
+		if (item.directory === entry.directory) {
 			item.is_current_for_directory = false;
 		}
 	}
@@ -669,18 +659,6 @@ export function evaluateServeIdle(entry: ServeRegistryEntry, nowMs?: number) {
 		reason:
 			idleMs >= idleTimeoutMs ? "idle_timeout_exceeded" : "within_idle_window",
 	};
-}
-
-export async function allocatePort(): Promise<number> {
-	return await new Promise((resolve, reject) => {
-		const server = createServer();
-		server.listen(0, "127.0.0.1", () => {
-			const address = server.address();
-			const port = typeof address === "object" && address ? address.port : 0;
-			server.close(() => resolve(port));
-		});
-		server.on("error", reject);
-	});
 }
 
 export async function waitForHealth(serverUrl: string, timeoutMs = 10000) {
@@ -752,29 +730,43 @@ export function getServeSpawnLockPath() {
 	return join(getBridgeStateDir(), "serve-spawn.lock");
 }
 
+export function isOpencodeServeCommand(command: string): boolean {
+	const trimmed = String(command || "").trim();
+	if (!trimmed) return false;
+	return /(?:^|\s)(?:\S*\/)?opencode\s+serve(?:\s|$)/.test(trimmed);
+}
+
+export function inferServeUrlFromCommand(command: string): string | undefined {
+	if (!isOpencodeServeCommand(command)) return undefined;
+	const normalized = command.replace(/\s+/g, " ").trim();
+	const portMatch = normalized.match(/(?:^|\s)--port(?:=|\s+)(\d+)(?=\s|$)/);
+	const port = portMatch ? Number(portMatch[1]) : getDefaultServePort();
+	if (!Number.isFinite(port) || port <= 0) return undefined;
+	return `http://127.0.0.1:${port}`;
+}
+
 export function listLiveOpencodeServeProcesses(): Array<{
 	pid: number;
 	serverUrl: string;
 }> {
 	try {
-		const out = execSync(
-			"ps -axo pid,command | rg 'opencode serve --hostname 127.0.0.1 --port'",
-			{
-				encoding: "utf8",
-				stdio: ["ignore", "pipe", "ignore"],
-			},
-		);
+		const out = execSync("ps -axo pid,command", {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
 		return out
 			.split("\n")
 			.map((line: string) => line.trim())
 			.filter(Boolean)
 			.map((line: string) => {
-				const match = line.match(/^(\d+)\s+.*--port\s+(\d+)/);
+				const match = line.match(/^(\d+)\s+(.*)$/);
 				if (!match) return null;
 				const pid = Number(match[1]);
-				const port = Number(match[2]);
-				if (!Number.isFinite(pid) || !Number.isFinite(port)) return null;
-				return { pid, serverUrl: `http://127.0.0.1:${port}` };
+				const cmd = match[2] || "";
+				if (!Number.isFinite(pid)) return null;
+				const serverUrl = inferServeUrlFromCommand(cmd);
+				if (!serverUrl) return null;
+				return { pid, serverUrl };
 			})
 			.filter(Boolean) as Array<{ pid: number; serverUrl: string }>;
 	} catch {
@@ -812,15 +804,30 @@ export async function spawnServeForProject(input: {
 	idle_timeout_ms?: number;
 }) {
 	return await withServeSpawnLock(async () => {
+		const nowIso = new Date().toISOString();
 		const registry = normalizeServeRegistry(readServeRegistry());
 		for (const existing of registry.entries) {
 			if (existing.status !== "running") continue;
 			const healthy = await waitForHealth(existing.opencode_server_url, 2000);
-			if (!healthy) continue;
+			if (!healthy) {
+				upsertServeRegistry({
+					...existing,
+					status: "unknown",
+					updated_at: nowIso,
+				});
+				continue;
+			}
+			const refreshed: ServeRegistryEntry = {
+				...existing,
+				status: "running",
+				last_event_at: nowIso,
+				updated_at: nowIso,
+			};
+			const result = upsertServeRegistry(refreshed);
 			return {
 				reused: true,
-				entry: existing,
-				registryPath: getServeRegistryPath(),
+				entry: refreshed,
+				registryPath: result.path,
 				reuseStrategy: "registry_running",
 			};
 		}
@@ -832,9 +839,9 @@ export async function spawnServeForProject(input: {
 				opencode_server_url: live.serverUrl,
 				pid: live.pid,
 				status: "running",
-				last_event_at: new Date().toISOString(),
+				last_event_at: nowIso,
 				idle_timeout_ms: input.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS,
-				updated_at: new Date().toISOString(),
+				updated_at: nowIso,
 			};
 			const result = upsertServeRegistry(entry);
 			return {
@@ -845,37 +852,32 @@ export async function spawnServeForProject(input: {
 				reuseStrategy: "live_process_adopted",
 			};
 		}
-		const port = await allocatePort();
 		const runtimeCfg = getRuntimeConfig({});
-		const child = spawn(
-			"opencode",
-			["serve", "--hostname", "127.0.0.1", "--port", String(port)],
-			{
-				cwd: input.repo_root,
-				detached: true,
-				stdio: "ignore",
-				env: {
-					...process.env,
-					...(runtimeCfg.hookBaseUrl
-						? { OPENCLAW_HOOK_BASE_URL: runtimeCfg.hookBaseUrl }
-						: {}),
-					...(runtimeCfg.hookToken
-						? { OPENCLAW_HOOK_TOKEN: runtimeCfg.hookToken }
-						: {}),
-				},
+		const child = spawn("opencode", ["serve", "--hostname", "0.0.0.0"], {
+			cwd: input.repo_root,
+			detached: true,
+			stdio: "ignore",
+			env: {
+				...process.env,
+				...(runtimeCfg.hookBaseUrl
+					? { OPENCLAW_HOOK_BASE_URL: runtimeCfg.hookBaseUrl }
+					: {}),
+				...(runtimeCfg.hookToken
+					? { OPENCLAW_HOOK_TOKEN: runtimeCfg.hookToken }
+					: {}),
 			},
-		);
+		});
 		child.unref();
-		const serverUrl = `http://127.0.0.1:${port}`;
+		const serverUrl = getDefaultServeUrl();
 		const healthy = await waitForHealth(serverUrl, 10000);
 		const entry: ServeRegistryEntry = {
 			serve_id: serverUrl,
 			opencode_server_url: serverUrl,
 			pid: child.pid,
 			status: healthy ? "running" : "unknown",
-			last_event_at: new Date().toISOString(),
+			last_event_at: nowIso,
 			idle_timeout_ms: input.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS,
-			updated_at: new Date().toISOString(),
+			updated_at: nowIso,
 		};
 		const result = upsertServeRegistry(entry);
 		return {
@@ -1046,7 +1048,7 @@ export function resolveServerUrl(cfg: any, params?: any): string {
 		asString(params?.opencodeServerUrl) ||
 		asString(params?.serverUrl) ||
 		getRuntimeConfig(cfg).opencodeServerUrl ||
-		"http://127.0.0.1:4096"
+		getDefaultServeUrl()
 	);
 }
 
@@ -1540,7 +1542,22 @@ export async function resolveAttachRunSession(input: {
 	runId: string;
 	attempts?: number;
 	delayMs?: number;
-}) {
+}): Promise<
+	| {
+			ok: true;
+			sessionId: string;
+			sessionTitle?: string;
+			sessionUpdatedAt?: string;
+			sessionResolvedAt: string;
+			sessionResolutionStrategy: "title_match";
+			attempt: number;
+	  }
+	| {
+			ok: false;
+			sessionResolutionPending: true;
+			sessionResolutionStrategy: "title_match_pending";
+	  }
+> {
 	const serverUrl = input.envelope.opencode_server_url.replace(/\/$/, "");
 	const attempts = input.attempts ?? 8;
 	const delayMs = input.delayMs ?? 1000;
@@ -1556,9 +1573,15 @@ export async function resolveAttachRunSession(input: {
 		});
 		const matchedId = asString(match?.id);
 		if (matchedId) {
+			const rawUpdated = asNumber(match?.time?.updated);
+			const sessionUpdatedAt = Number.isFinite(rawUpdated)
+				? new Date(rawUpdated as number).toISOString()
+				: undefined;
 			return {
 				ok: true,
 				sessionId: matchedId,
+				sessionTitle: asString(match?.title),
+				...(sessionUpdatedAt ? { sessionUpdatedAt } : {}),
 				sessionResolvedAt: new Date().toISOString(),
 				sessionResolutionStrategy: "title_match",
 				attempt: attempt + 1,
@@ -1740,6 +1763,30 @@ export async function startExecutionRun(input: {
 			last_event_at: nowIso,
 			updated_at: nowIso,
 		});
+	}
+	if (sessionResolution.ok && sessionResolution.sessionId) {
+		try {
+			upsertSessionRegistry({
+				session_id: sessionResolution.sessionId,
+				serve_id: serveEntry?.serve_id || input.envelope.opencode_server_url,
+				opencode_server_url: input.envelope.opencode_server_url,
+				directory: input.envelope.repo_root,
+				project_id: input.envelope.project_id,
+				...(sessionResolution.sessionTitle
+					? { session_title: sessionResolution.sessionTitle }
+					: {}),
+				...(sessionResolution.sessionUpdatedAt
+					? { session_updated_at: sessionResolution.sessionUpdatedAt }
+					: {}),
+				status: "active",
+				is_current_for_directory: true,
+				updated_at: nowIso,
+			});
+		} catch (error: any) {
+			console.warn(
+				`[opencode-bridge] warning: failed to upsert sessions.json for runId=${input.envelope.run_id}: ${error?.message || String(error)}`,
+			);
+		}
 	}
 	const current =
 		patchRunStatus(input.envelope.run_id, (status) => ({

@@ -8,7 +8,12 @@ import {
 	buildHookPolicyChecklist,
 	buildHooksAgentCallback,
 	evaluateServeIdle,
+	getDefaultServePort,
+	getDefaultServeUrl,
+	inferServeUrlFromCommand,
+	isOpencodeServeCommand,
 	resolveExecutionAgent,
+	resolveServerUrl,
 	resolveSessionForRun,
 } from "../src/runtime";
 
@@ -60,8 +65,13 @@ test("buildEnvelope preserves origin session context and callback target", () =>
 	assert.equal(envelope.resolved_agent_id, "coder-lane");
 	assert.equal(envelope.origin_session_key, "session:origin:key");
 	assert.equal(envelope.origin_session_id, "session-origin-id");
-	assert.equal(envelope.callback_target_session_key, "session:origin:key");
-	assert.equal(envelope.callback_target_session_id, "session-origin-id");
+	assert.equal(
+		envelope.callback_target_session_key,
+		"agent:creator:opencode:creator:callback:session%3Aorigin%3Akey",
+	);
+	assert.equal(envelope.callback_target_session_id, undefined);
+	assert.equal(envelope.callback_relay_session_key, "session:origin:key");
+	assert.equal(envelope.callback_relay_session_id, "session-origin-id");
 });
 
 test("buildHooksAgentCallback routes callback to requester agent + origin session", () => {
@@ -83,8 +93,11 @@ test("buildHooksAgentCallback routes callback to requester agent + origin sessio
 	});
 
 	assert.equal(callback.agentId, "creator");
-	assert.equal(callback.sessionKey, "session:origin:key:2");
-	assert.equal(callback.sessionId, "origin-session-2");
+	assert.equal(
+		callback.sessionKey,
+		"agent:creator:opencode:creator:callback:session%3Aorigin%3Akey%3A2",
+	);
+	assert.equal(callback.sessionId, undefined);
 	assert.match(callback.message, /requestedAgent=creator/);
 	assert.match(callback.message, /resolvedAgent=coder-lane/);
 });
@@ -132,8 +145,10 @@ test("resolveSessionForRun prefers callback_target_session_id over execution ses
 			resolved_agent_id: "coder-lane",
 			session_key: "hook:opencode:coder-lane:task-3",
 			origin_session_key: "session:origin:key:3",
-			callback_target_session_key: "session:origin:key:3",
-			callback_target_session_id: "sess-origin-3",
+			callback_target_session_key:
+				"agent:creator:opencode:creator:callback:sess-origin-3",
+			callback_relay_session_key: "session:origin:key:3",
+			callback_relay_session_id: "sess-origin-3",
 			project_id: "proj-3",
 			repo_root: "/tmp/repo3",
 			opencode_server_url: "http://127.0.0.1:4098",
@@ -177,7 +192,9 @@ test("resolveSessionForRun falls back to callback target session key before exec
 			resolved_agent_id: "coder-lane",
 			session_key: "hook:opencode:coder-lane:task-4",
 			origin_session_key: "session:origin:key:4",
-			callback_target_session_key: "session:origin:key:4",
+			callback_target_session_key:
+				"agent:creator:opencode:creator:callback:run-4",
+			callback_relay_session_key: "session:origin:key:4",
 			project_id: "proj-4",
 			repo_root: "/tmp/repo4",
 			opencode_server_url: "http://127.0.0.1:4099",
@@ -259,8 +276,10 @@ test("buildContinuationCallbackMetadata projects continuation correlation fields
 			resolved_agent_id: "coder-lane",
 			session_key: "hook:opencode:coder-lane:task-5",
 			origin_session_key: "session:origin:key:5",
-			callback_target_session_key: "session:origin:key:5",
-			callback_target_session_id: "sess-origin-5",
+			callback_target_session_key:
+				"agent:creator:opencode:creator:callback:run-5",
+			callback_relay_session_key: "session:origin:key:5",
+			callback_relay_session_id: "sess-origin-5",
 			project_id: "proj-5",
 			repo_root: "/tmp/repo5",
 			agent_workspace_dir: "/tmp/workspaces/agent-5",
@@ -281,9 +300,55 @@ test("buildContinuationCallbackMetadata projects continuation correlation fields
 	assert.equal(metadata.agentWorkspaceDir, "/tmp/workspaces/agent-5");
 	assert.equal(metadata.requestedAgentId, "creator");
 	assert.equal(metadata.resolvedAgentId, "coder-lane");
-	assert.equal(metadata.callbackTargetSessionKey, "session:origin:key:5");
-	assert.equal(metadata.callbackTargetSessionId, "sess-origin-5");
+	assert.equal(
+		metadata.callbackTargetSessionKey,
+		"agent:creator:opencode:creator:callback:run-5",
+	);
+	assert.equal(metadata.callbackTargetSessionId, undefined);
+	assert.equal(metadata.callbackRelaySessionKey, "session:origin:key:5");
+	assert.equal(metadata.callbackRelaySessionId, "sess-origin-5");
 	assert.equal(metadata.opencodeSessionId, "sess-opencode-5");
 	assert.equal(metadata.workflowId, "wf-5");
 	assert.equal(metadata.stepId, "step-5");
+});
+
+test("default serve helpers resolve canonical URL", () => {
+	assert.equal(getDefaultServePort(), 4096);
+	assert.equal(getDefaultServeUrl(), "http://127.0.0.1:4096");
+	assert.equal(resolveServerUrl({}, {}), "http://127.0.0.1:4096");
+});
+
+test("serve command detector supports legacy and default-port forms", () => {
+	assert.equal(isOpencodeServeCommand("opencode serve"), true);
+	assert.equal(
+		isOpencodeServeCommand("opencode serve --hostname 127.0.0.1"),
+		true,
+	);
+	assert.equal(
+		isOpencodeServeCommand("opencode serve --hostname 127.0.0.1 --port 5173"),
+		true,
+	);
+	assert.equal(
+		isOpencodeServeCommand("/usr/local/bin/opencode serve --port=5173"),
+		true,
+	);
+	assert.equal(isOpencodeServeCommand("opencode run --attach"), false);
+
+	assert.equal(
+		inferServeUrlFromCommand("opencode serve"),
+		"http://127.0.0.1:4096",
+	);
+	assert.equal(
+		inferServeUrlFromCommand("opencode serve --hostname 127.0.0.1"),
+		"http://127.0.0.1:4096",
+	);
+	assert.equal(
+		inferServeUrlFromCommand("opencode serve --hostname 127.0.0.1 --port 6123"),
+		"http://127.0.0.1:6123",
+	);
+	assert.equal(
+		inferServeUrlFromCommand("opencode serve --hostname 127.0.0.1 --port=7123"),
+		"http://127.0.0.1:7123",
+	);
+	assert.equal(inferServeUrlFromCommand("opencode run --attach"), undefined);
 });

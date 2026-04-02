@@ -1,8 +1,11 @@
 import "./observability.test";
 import "./runtime-integrity.test";
+import "./attach-run-session-persistence.test";
 import "./contract-envelope-callback.test";
 import "./session-callback-integrity.test";
+import "./serve-registry-live-only.test";
 import "./serve-binding.test";
+import "./observability-shared-serve-project-scope.test";
 import "./multi-project-contract-smoke.test";
 import "./plugin-callback-contract.test";
 import "./plugin-openclaw-audit-bridge.test";
@@ -10,3 +13,4 @@ import "./callback-http-route-visible.test";
 import "./pragmatic-visible-smoke.test";
 import "./idle-cleanup.test";
 import "./execution-callback-loop.test";
+import "./install-bridge.test";

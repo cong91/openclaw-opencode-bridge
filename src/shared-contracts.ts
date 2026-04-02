@@ -5,6 +5,10 @@ export type BridgeSessionTagFields = {
 	resolved: string;
 	callbackSession: string;
 	callbackSessionId?: string;
+	originSession?: string;
+	originSessionId?: string;
+	callbackRelaySession?: string;
+	callbackRelaySessionId?: string;
 	callbackDeliver?: boolean;
 	projectId?: string;
 	repoRoot?: string;
@@ -14,8 +18,27 @@ export type BridgeSessionTagFields = {
 };
 
 export const OPENCODE_CALLBACK_HTTP_PATH = "/plugin/opencode-bridge/callback";
-export const OPENCODE_CONTINUATION_CONTROL_HTTP_PATH = "/plugin/opencode-bridge/continue-loop";
+export const OPENCODE_CONTINUATION_CONTROL_HTTP_PATH =
+	"/plugin/opencode-bridge/continue-loop";
 export const OPENCODE_CONTINUATION_HOOK_PATH = "/hooks/opencode-callback";
+
+const CALLBACK_KEY_RE = /^agent:([^:]+):opencode:\1:callback:(.+)$/;
+
+export function sanitizeCallbackAnchor(anchor: string): string {
+	return encodeURIComponent(anchor.trim());
+}
+
+export function buildCanonicalCallbackSessionKey(input: {
+	agentId: string;
+	anchor: string;
+}): string {
+	return `agent:${input.agentId}:opencode:${input.agentId}:callback:${sanitizeCallbackAnchor(input.anchor)}`;
+}
+
+export function isCanonicalCallbackSessionKey(sessionKey?: string): boolean {
+	if (!sessionKey) return false;
+	return CALLBACK_KEY_RE.test(sessionKey);
+}
 
 export type OpenCodePluginCallbackAuditRecord = {
 	phase?: string;
@@ -45,6 +68,16 @@ export function buildTaggedSessionTitle(
 		`callbackSession=${fields.callbackSession}`,
 		...(fields.callbackSessionId
 			? [`callbackSessionId=${fields.callbackSessionId}`]
+			: []),
+		...(fields.originSession ? [`originSession=${fields.originSession}`] : []),
+		...(fields.originSessionId
+			? [`originSessionId=${fields.originSessionId}`]
+			: []),
+		...(fields.callbackRelaySession
+			? [`callbackRelaySession=${fields.callbackRelaySession}`]
+			: []),
+		...(fields.callbackRelaySessionId
+			? [`callbackRelaySessionId=${fields.callbackRelaySessionId}`]
 			: []),
 		...(fields.callbackDeliver !== undefined
 			? [`callbackDeliver=${fields.callbackDeliver ? "true" : "false"}`]

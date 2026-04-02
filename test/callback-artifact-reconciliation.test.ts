@@ -128,7 +128,7 @@ test("callback ingress reconciles run artifact from running to completed when ca
 		const payload = {
 			name: "OpenCode",
 			agentId: "fullstack",
-			sessionKey: "agent:fullstack:telegram:direct:5165741309",
+			sessionKey: "agent:fullstack:opencode:fullstack:callback:9606",
 			sessionId: "9606",
 			wakeMode: "now",
 			deliver: false,
@@ -137,8 +137,11 @@ test("callback ingress reconciles run artifact from running to completed when ca
 				eventType: "message.updated",
 				runId,
 				taskId: "VAA-24-image-catalog",
-				callbackTargetSessionKey: "agent:fullstack:telegram:direct:5165741309",
+				callbackTargetSessionKey:
+					"agent:fullstack:opencode:fullstack:callback:9606",
 				callbackTargetSessionId: "9606",
+				callbackRelaySessionKey: "agent:fullstack:telegram:direct:5165741309",
+				callbackRelaySessionId: "9606",
 				opencodeSessionId: "ses_2e0841bd8ffePQNn705C9mL9j4",
 			}),
 		};

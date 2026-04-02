@@ -36,10 +36,10 @@ function createMockRes() {
 	} as any;
 }
 
-test("callback route prefers callbackTargetSessionId over lane-only routing metadata", async () => {
+test("callback route ignores callbackTargetSessionId when callback session key is canonical", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: Array<{ text: string; opts: any }> = [];
-	
+
 	registerOpenCodeBridgeTools(
 		{
 			registerTool() {},
@@ -66,7 +66,7 @@ test("callback route prefers callbackTargetSessionId over lane-only routing meta
 	const payload = {
 		name: "OpenCode",
 		agentId: "creator",
-		sessionKey: "agent:creator:telegram:direct:5165741309",
+		sessionKey: "agent:creator:opencode:creator:callback:run-exact-session-1",
 		sessionId: "stale-lane-session-id",
 		wakeMode: "now",
 		deliver: false,
@@ -75,8 +75,11 @@ test("callback route prefers callbackTargetSessionId over lane-only routing meta
 			eventType: "task.completed",
 			runId: "run-exact-session-1",
 			taskId: "task-exact-session-1",
-			callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackTargetSessionKey:
+				"agent:creator:opencode:creator:callback:run-exact-session-1",
 			callbackTargetSessionId: "exact-requester-session-id",
+			callbackRelaySessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackRelaySessionId: "exact-requester-session-id",
 		}),
 	};
 
@@ -88,10 +91,10 @@ test("callback route prefers callbackTargetSessionId over lane-only routing meta
 	assert.equal(res.statusCode, 200);
 	assert.equal(systemEvents.length, 1);
 	assert.equal(systemEvents[0]?.opts?.sessionKey, payload.sessionKey);
-	assert.equal(systemEvents[0]?.opts?.sessionId, "exact-requester-session-id");
+	assert.equal(systemEvents[0]?.opts?.sessionId, undefined);
 });
 
-test("callback route falls back to payload sessionId when callbackTargetSessionId metadata is absent", async () => {
+test("callback route does not use payload sessionId on canonical requested-agent callback lane when metadata callbackTargetSessionId is absent", async () => {
 	const routes: RegisteredRoute[] = [];
 	const systemEvents: Array<{ text: string; opts: any }> = [];
 
@@ -122,7 +125,7 @@ test("callback route falls back to payload sessionId when callbackTargetSessionI
 	const payload = {
 		name: "OpenCode",
 		agentId: "creator",
-		sessionKey: "agent:creator:telegram:direct:5165741309",
+		sessionKey: "agent:creator:opencode:creator:callback:run-exact-session-2",
 		sessionId: "payload-session-id-only",
 		wakeMode: "now",
 		deliver: false,
@@ -131,7 +134,8 @@ test("callback route falls back to payload sessionId when callbackTargetSessionI
 			eventType: "task.completed",
 			runId: "run-exact-session-2",
 			taskId: "task-exact-session-2",
-			callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackTargetSessionKey:
+				"agent:creator:opencode:creator:callback:run-exact-session-2",
 		}),
 	};
 
@@ -142,12 +146,12 @@ test("callback route falls back to payload sessionId when callbackTargetSessionI
 	assert.equal(handled, true);
 	assert.equal(res.statusCode, 200);
 	assert.equal(systemEvents.length, 1);
-	assert.equal(systemEvents[0]?.opts?.sessionId, "payload-session-id-only");
+	assert.equal(systemEvents[0]?.opts?.sessionId, undefined);
 });
 
 test("callback route derives heartbeat agentId from agent sessionKey when payload agentId is missing", async () => {
 	const routes: RegisteredRoute[] = [];
-	
+
 	registerOpenCodeBridgeTools(
 		{
 			registerTool() {},
@@ -172,7 +176,7 @@ test("callback route derives heartbeat agentId from agent sessionKey when payloa
 
 	const payload = {
 		name: "OpenCode",
-		sessionKey: "agent:builder:telegram:direct:5165741309",
+		sessionKey: "agent:builder:opencode:builder:callback:run-derived-agent-1",
 		sessionId: "session-derived-agent-1",
 		wakeMode: "now",
 		deliver: false,

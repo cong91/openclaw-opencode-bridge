@@ -3,28 +3,50 @@
 OpenClaw ↔ OpenCode bridge for hybrid execution, callback orchestration, and multi-project-safe runtime control.
 
 ## What it does
+
 `opencode-bridge` connects two runtime surfaces:
+
 - **OpenClaw side**: project-aware routing, run state, serve management, observability, and callback policy
 - **OpenCode side**: event-driven callback plugin for terminal session lifecycle events
 
 It is designed for teams that want:
+
 - project-aware OpenCode execution
 - callback flow back into OpenClaw via `/hooks/agent`
 - installable OpenCode-side plugin artifacts
 - multi-project-safe runtime boundaries
 
 ## Install
+
 ### 1) OpenClaw side
+
 ```bash
 openclaw plugins install @mrc2204/openclaw-opencode-bridge
 ```
 
+Or for local source checkout installs:
+
+```bash
+openclaw plugins install -l /absolute/path/to/opencode-bridge
+```
+
+**Do not install from an entry file path** (this can recreate a local plugin id `index`):
+
+```bash
+# ❌ wrong
+openclaw plugins install -l /absolute/path/to/opencode-bridge/dist/src/index.js
+```
+
+Reason: OpenClaw local install infers the install key from the basename; `index.js` becomes plugin key `index`.
+
 ### 2) OpenCode side — project install
+
 ```bash
 npm run materialize:opencode-plugin:project
 ```
 
 ### 3) OpenCode side — global install
+
 ```bash
 npm run materialize:opencode-plugin:global
 ```
@@ -32,44 +54,61 @@ npm run materialize:opencode-plugin:global
 Global mode auto-patches `~/.config/opencode/opencode.json` when it exists.
 
 ### 4) One-command install
+
 Project mode:
+
 ```bash
 npm run install:bridge:project
 ```
 
 Global mode:
+
 ```bash
 npm run install:bridge:global
 ```
 
+`scripts/install-bridge.mjs` now includes a guard: if `--target` points to `dist/src/index.js` (or equivalent entry-file path), the install is rejected with a clear error and canonical root-based command.
+
 ## Canonical hook continuation artifacts
+
 This repository now carries the hook continuation artifacts needed for shipping the new loop:
+
 - `hooks/opencode-callback.js`
 - `hooks/opencode-hooks-config.template.json5`
 - install guide: `docs/install/opencode-hook-install-2026-03-25.md`
 
 ## Required callback environment
+
 The OpenCode-side callback plugin / hook continuation needs:
+
 - `OPENCLAW_HOOK_BASE_URL`
 - `OPENCLAW_HOOK_TOKEN`
 
 Optional:
+
 - `OPENCLAW_BRIDGE_AUDIT_DIR`
 - `OPENCLAW_BRIDGE_OPENCLAW_AUDIT_PATH`
 
 ## Runtime model
+
 ### Hybrid execution strategy
+
 `opencode-bridge` supports two practical execution lanes:
+
 - **CLI-direct**: lightweight execution for simpler tasks
 - **serve/plugin mode**: canonical path for callback, observability, and event-driven lifecycle handling
 
 ### Multi-project safety
+
 Current contracts assume:
-- `1 project = 1 correctly bound OpenCode serve instance`
-- serve reuse is allowed only when runtime introspection confirms the expected `repo_root`
+
+- a shared OpenCode serve may back multiple projects/sessions when runtime session resolution remains project-correct
+- `serves.json` is the serve lifecycle registry (spawn/reuse/adopt/health/shutdown/cleanup/stale-or-dead transitions)
+- `sessions.json` is the session mapping registry (session-to-serve and current-for-directory state)
 - bridge session tags must preserve callback identity per run/session
 
 ## Build and verify
+
 ```bash
 npm install
 npm run build
@@ -77,6 +116,7 @@ npm test -- --runInBand
 ```
 
 ## Package / artifact layout
+
 ```text
 openclaw-opencode-bridge/
 ├── src/                 # OpenClaw-side runtime
@@ -88,13 +128,16 @@ openclaw-opencode-bridge/
 ```
 
 ## More docs
+
 - `docs/install/quick-start-2026-03-22.md`
 - `docs/install/production-ish-install-2026-03-22.md`
 - `docs/contracts/multi-project-contract-draft-2026-03-22.md`
 - `docs/architecture/hybrid-execution-strategy-2026-03-22.md`
 
 Developer-only local debug notes are intentionally kept out of this README. See:
+
 - `docs/install/developer-local-debug-2026-03-22.md`
 
 ## Status
+
 Current status: functional and productized enough for real use, with hardening history reflected in tests and docs.

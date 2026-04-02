@@ -226,6 +226,14 @@ test("smoke: terminal plugin callback keeps control internal and routes continua
 			systemEvents[1]?.text,
 			"Verify current session resumed after callback",
 		);
+		assert.doesNotMatch(
+			systemEvents[1]?.text,
+			/To operator on Telegram \(single concise update, deduplicated intent\):/,
+		);
+		assert.doesNotMatch(
+			systemEvents[1]?.text,
+			/Telegram target: operator \(direct update\)/,
+		);
 		assert.equal(
 			systemEvents[1]?.opts?.sessionKey,
 			"agent:creator:opencode:creator:callback:sess-origin-smoke-1",

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import {
 	buildCanonicalCallbackSessionKey,
 	buildPluginCallbackDedupeKey,
-	OPENCODE_CONTINUATION_CONTROL_HTTP_PATH,
+	OPENCODE_CALLBACK_HTTP_PATH,
 	parseTaggedSessionTitle,
 } from "../src/shared-contracts";
 import type { OpenCodeContinuationCallbackMetadata } from "../src/types";
@@ -376,7 +376,7 @@ async function postCallback(
 		});
 		return { ok: false, status: 0, reason: "missing_hook_env" };
 	}
-	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_CONTROL_HTTP_PATH}`;
+	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CALLBACK_HTTP_PATH}`;
 	appendAudit(directory, {
 		phase: "callback_attempt",
 		diagnostics: {
@@ -544,18 +544,19 @@ export const OpenClawBridgeCallbackPlugin = async ({
 				sessionId,
 				runId: tags.runId || tags.run_id,
 			});
-			if (terminal && callbackDedupe.has(dedupeKey)) {
+			const terminalDedupeKey = `${dedupeKey}|${type}`;
+			if (terminal && callbackDedupe.has(terminalDedupeKey)) {
 				appendAudit(directory, {
 					phase: "deduped",
 					event_type: type,
 					session_id: sessionId,
-					dedupeKey,
+					dedupeKey: terminalDedupeKey,
 					tags,
 				});
 				return;
 			}
 			if (terminal) {
-				callbackDedupe.add(dedupeKey);
+				callbackDedupe.add(terminalDedupeKey);
 				runCheckpointAt.delete(asString(tags.runId || tags.run_id) || "");
 			}
 			const payload = buildHookContinuationPayload(tags, type, sessionId);

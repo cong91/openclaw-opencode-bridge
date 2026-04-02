@@ -418,9 +418,12 @@ test("callback ingress does not regress already-terminal artifact on non-termina
 					resolved_agent_id: "fullstack",
 					session_key: "hook:opencode:fullstack:task-terminal-preserve-1",
 					origin_session_key: "agent:fullstack:telegram:direct:5165741309",
+					origin_session_id: "9606",
 					callback_target_session_key:
+						"agent:fullstack:opencode:fullstack:callback:9606",
+					callback_relay_session_key:
 						"agent:fullstack:telegram:direct:5165741309",
-					callback_target_session_id: "9606",
+					callback_relay_session_id: "9606",
 					project_id: "proj-terminal-preserve-1",
 					repo_root: "/tmp/repo-terminal-preserve-1",
 					opencode_server_url: "http://127.0.0.1:56106",
@@ -472,7 +475,7 @@ test("callback ingress does not regress already-terminal artifact on non-termina
 		const payload = {
 			name: "OpenCode",
 			agentId: "fullstack",
-			sessionKey: "agent:fullstack:telegram:direct:5165741309",
+			sessionKey: "agent:fullstack:opencode:fullstack:callback:9606",
 			sessionId: "9606",
 			wakeMode: "now",
 			deliver: false,
@@ -481,8 +484,11 @@ test("callback ingress does not regress already-terminal artifact on non-termina
 				eventType: "task.progress",
 				runId,
 				taskId: "task-terminal-preserve-1",
-				callbackTargetSessionKey: "agent:fullstack:telegram:direct:5165741309",
+				callbackTargetSessionKey:
+					"agent:fullstack:opencode:fullstack:callback:9606",
 				callbackTargetSessionId: "9606",
+				callbackRelaySessionKey: "agent:fullstack:telegram:direct:5165741309",
+				callbackRelaySessionId: "9606",
 			}),
 		};
 

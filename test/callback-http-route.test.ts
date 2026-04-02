@@ -87,7 +87,7 @@ test("callback http route enqueues callback message into target session and wake
 	const payload = {
 		name: "OpenCode",
 		agentId: "creator",
-		sessionKey: "agent:creator:telegram:direct:5165741309",
+		sessionKey: "agent:creator:opencode:creator:callback:run-1",
 		sessionId: "sess-origin-1",
 		wakeMode: "now",
 		deliver: false,
@@ -96,8 +96,10 @@ test("callback http route enqueues callback message into target session and wake
 			eventType: "session.idle",
 			runId: "run-1",
 			taskId: "task-1",
-			callbackTargetSessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackTargetSessionKey: "agent:creator:opencode:creator:callback:run-1",
 			callbackTargetSessionId: "sess-origin-1",
+			callbackRelaySessionKey: "agent:creator:telegram:direct:5165741309",
+			callbackRelaySessionId: "sess-origin-1",
 		}),
 	};
 
@@ -116,7 +118,7 @@ test("callback http route enqueues callback message into target session and wake
 	assert.match(systemEvents[0]?.text, /"messageKind":"callback_control"/);
 	assert.match(systemEvents[0]?.text, /"runId":"run-1"/);
 	assert.equal(systemEvents[0]?.opts?.sessionKey, payload.sessionKey);
-	assert.equal(systemEvents[0]?.opts?.sessionId, payload.sessionId);
+	assert.equal(systemEvents[0]?.opts?.sessionId, undefined);
 	assert.equal(
 		systemEvents[0]?.opts?.contextKey,
 		"opencode:run-1:session.idle",
@@ -238,4 +240,142 @@ test("callback http route materializes terminal run artifact on message.updated 
 	}
 });
 
+test("callback http route keeps run completed when message.updated is followed by session.idle", async () => {
+	const tempRoot = mkdtempSync(join(tmpdir(), "opencode-bridge-callback-seq-"));
+	const stateDir = join(tempRoot, "state");
+	const bridgeDir = join(stateDir, "opencode-bridge");
+	const runsDir = join(bridgeDir, "runs");
+	mkdirSync(runsDir, { recursive: true });
+	const runId = "run-terminal-seq-1";
+	const runPath = join(runsDir, `${runId}.json`);
+	writeFileSync(
+		runPath,
+		JSON.stringify(
+			{
+				taskId: "task-terminal-seq-1",
+				runId,
+				state: "running",
+				lastEvent: null,
+				lastSummary:
+					"Attach-run dispatched; terminal callback owned by OpenCode-side plugin",
+				updatedAt: "2000-01-01T00:00:00.000Z",
+				envelope: {
+					task_id: "task-terminal-seq-1",
+					run_id: runId,
+					agent_id: "builder",
+					requested_agent_id: "creator",
+					resolved_agent_id: "builder",
+					session_key: "hook:opencode:builder:task-terminal-seq-1",
+					origin_session_key: "session:origin:terminal-seq-1",
+					callback_target_session_key: "session:origin:terminal-seq-1",
+					project_id: "proj-terminal-seq-1",
+					repo_root: "/tmp/repo-terminal-seq-1",
+					opencode_server_url: "http://opencode.local",
+				},
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
 
+	const prevStateDir = process.env.OPENCLAW_STATE_DIR;
+	process.env.OPENCLAW_STATE_DIR = stateDir;
+
+	const routes: RegisteredRoute[] = [];
+	registerOpenCodeBridgeTools(
+		{
+			registerTool() {},
+			registerHttpRoute(route: RegisteredRoute) {
+				routes.push(route);
+			},
+			runtime: {
+				system: {
+					enqueueSystemEvent() {
+						return true;
+					},
+					requestHeartbeatNow() {},
+				},
+			},
+		},
+		{
+			hookToken: "test-token",
+		},
+	);
+
+	try {
+		const route = routes.find(
+			(x) => x.path === "/plugin/opencode-bridge/callback",
+		);
+		assert.ok(route, "callback route should be registered");
+
+		const basePayload = {
+			name: "OpenCode",
+			agentId: "creator",
+			sessionKey: "session:origin:terminal-seq-1",
+			wakeMode: "now",
+			deliver: false,
+		};
+
+		const messageUpdatedReq = createMockReq(
+			JSON.stringify({
+				...basePayload,
+				message: JSON.stringify({
+					kind: "opencode.callback",
+					eventType: "message.updated",
+					runId,
+					taskId: "task-terminal-seq-1",
+					callbackTargetSessionKey: "session:origin:terminal-seq-1",
+				}),
+			}),
+			"test-token",
+		);
+		const messageUpdatedRes = createMockRes();
+		const handledUpdated = await route!.handler(
+			messageUpdatedReq,
+			messageUpdatedRes,
+		);
+		assert.equal(handledUpdated, true);
+		assert.equal(messageUpdatedRes.statusCode, 200);
+
+		let persisted = JSON.parse(readFileSync(runPath, "utf8"));
+		assert.equal(persisted.state, "completed");
+		assert.equal(persisted.lastEvent, "task.completed");
+
+		const sessionIdleReq = createMockReq(
+			JSON.stringify({
+				...basePayload,
+				message: JSON.stringify({
+					kind: "opencode.callback",
+					eventType: "session.idle",
+					runId,
+					taskId: "task-terminal-seq-1",
+					callbackTargetSessionKey: "session:origin:terminal-seq-1",
+				}),
+			}),
+			"test-token",
+		);
+		const sessionIdleRes = createMockRes();
+		const handledIdle = await route!.handler(sessionIdleReq, sessionIdleRes);
+		assert.equal(handledIdle, true);
+		assert.equal(sessionIdleRes.statusCode, 200);
+
+		persisted = JSON.parse(readFileSync(runPath, "utf8"));
+		assert.equal(persisted.state, "completed");
+		assert.equal(persisted.lastEvent, "task.completed");
+		assert.match(
+			String(persisted.lastSummary || ""),
+			/Terminal callback materialized/,
+		);
+		assert.equal(persisted.callbackStatus, 200);
+		assert.equal(persisted.callbackOk, true);
+		assert.match(
+			String(persisted.callbackBody || ""),
+			/"eventType":"session.idle"/,
+		);
+	} finally {
+		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+		else process.env.OPENCLAW_STATE_DIR = prevStateDir;
+		rmSync(tempRoot, { recursive: true, force: true });
+	}
+});

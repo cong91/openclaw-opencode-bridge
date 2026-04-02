@@ -672,9 +672,19 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			);
 			if (parsed.metadata?.runId) {
 				patchRunStatus(parsed.metadata.runId, (current) => {
+					const shouldForceTerminal = Boolean(
+						callbackPersistence?.terminal &&
+						current.callbackOk === true &&
+						(
+							parsed.metadata?.eventType === "message.updated" ||
+							parsed.metadata?.eventType === "session.idle" ||
+							parsed.metadata?.eventType === "session.error"
+						)
+					);
 					const preserveTerminal =
 						isTerminalState(current.state) &&
-						(!callbackPersistence || !callbackPersistence.terminal);
+						(!callbackPersistence || !callbackPersistence.terminal) &&
+						!shouldForceTerminal;
 					const summary = parsed.metadata?.eventType
 						? callbackPersistence?.terminal
 							? `Terminal callback materialized (${parsed.metadata.eventType})`
@@ -794,6 +804,7 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					});
 				}
 			}
+			let dispatchedToHook = false;
 			if (runStatus?.continuation) {
 				const step = continuationStep;
 				appendCallbackDebugAudit({
@@ -845,6 +856,42 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						notifyMessage,
 						reason: "registrar_authority",
 					});
+				}
+			} else {
+				const runtimeCfg = getRuntimeConfig(cfg);
+				const hookBaseUrl = asString(runtimeCfg.hookBaseUrl);
+				const hookToken = asString(runtimeCfg.hookToken);
+				if (hookBaseUrl && hookToken) {
+					const hookUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_HOOK_PATH}`;
+					try {
+						const hookRes = await fetch(hookUrl, {
+							method: "POST",
+							headers: {
+								Authorization: `Bearer ${hookToken}`,
+								"Content-Type": "application/json",
+							},
+							body: bodyText,
+						});
+						const hookBody = await hookRes.text().catch(() => "");
+						appendCallbackDebugAudit({
+							phase: "terminal_callback_forwarded",
+							sessionKey: routedCallbackSessionKey,
+							dedupeKey,
+							runId: parsed.metadata?.runId || null,
+							url: hookUrl,
+							ok: hookRes.ok,
+							status: hookRes.status,
+							body: hookBody,
+						});
+					} catch (error: any) {
+						appendCallbackDebugAudit({
+							phase: "terminal_callback_forward_failed",
+							sessionKey: routedCallbackSessionKey,
+							dedupeKey,
+							runId: parsed.metadata?.runId || null,
+							error: error?.message || String(error),
+						});
+					}
 				}
 			}
 			sendJson(res, 200, {

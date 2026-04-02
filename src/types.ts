@@ -22,6 +22,8 @@ export type RoutingEnvelope = {
 	origin_session_id?: string;
 	callback_target_session_key: string;
 	callback_target_session_id?: string;
+	callback_relay_session_key?: string;
+	callback_relay_session_id?: string;
 	project_id: string;
 	repo_root: string;
 	agent_workspace_dir?: string;
@@ -86,8 +88,12 @@ export type OpenCodeContinuationCallbackMetadata = {
 	agentWorkspaceDir?: string;
 	requestedAgentId?: string;
 	resolvedAgentId?: string;
+	originSessionKey?: string;
+	originSessionId?: string;
 	callbackTargetSessionKey?: string;
 	callbackTargetSessionId?: string;
+	callbackRelaySessionKey?: string;
+	callbackRelaySessionId?: string;
 	opencodeSessionId?: string;
 	workflowId?: string;
 	stepId?: string;

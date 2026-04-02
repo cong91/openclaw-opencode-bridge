@@ -169,7 +169,7 @@ test("opencode_execute_task starts execution with plugin-owned callback authorit
 			);
 			return;
 		}
-		if (req.method === "POST" && url === "/plugin/opencode-bridge/callback") {
+		if (req.method === "POST" && url === "/hooks/opencode-callback") {
 			let body = "";
 			req.on("data", (chunk) => {
 				body += chunk.toString();

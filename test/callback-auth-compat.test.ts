@@ -156,7 +156,7 @@ test("OpenCode-side plugin sends bearer auth while preserving legacy header for 
 		assert.equal(callbackRequests.length, 1);
 		assert.equal(
 			callbackRequests[0]?.url,
-			"http://callback.test/plugin/opencode-bridge/callback",
+			"http://callback.test/hooks/opencode-callback",
 		);
 		assert.equal(
 			callbackRequests[0]?.headers?.Authorization,

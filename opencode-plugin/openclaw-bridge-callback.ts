@@ -3,7 +3,7 @@ import { join } from "node:path";
 import {
 	buildCanonicalCallbackSessionKey,
 	buildPluginCallbackDedupeKey,
-	OPENCODE_CALLBACK_HTTP_PATH,
+	OPENCODE_CONTINUATION_HOOK_PATH,
 	parseTaggedSessionTitle,
 } from "../src/shared-contracts";
 import type { OpenCodeContinuationCallbackMetadata } from "../src/types";
@@ -376,7 +376,7 @@ async function postCallback(
 		});
 		return { ok: false, status: 0, reason: "missing_hook_env" };
 	}
-	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CALLBACK_HTTP_PATH}`;
+	const callbackUrl = `${hookBaseUrl.replace(/\/$/, "")}${OPENCODE_CONTINUATION_HOOK_PATH}`;
 	appendAudit(directory, {
 		phase: "callback_attempt",
 		diagnostics: {

@@ -17,6 +17,9 @@ export type BridgeSessionTagFields = {
 	stepId?: string;
 };
 
+// Deprecated compatibility ingress only. New primary callback traffic must use
+// OPENCODE_CONTINUATION_HOOK_PATH so OpenCode-side plugin/hook flows do not
+// treat the legacy plugin callback route as the main callback authority.
 export const OPENCODE_CALLBACK_HTTP_PATH = "/plugin/opencode-bridge/callback";
 export const OPENCODE_CONTINUATION_CONTROL_HTTP_PATH =
 	"/plugin/opencode-bridge/continue-loop";

@@ -408,6 +408,9 @@ function resolveCanonicalCallbackRoute(input: {
 	callback: { sessionKey: string };
 	metadata: OpenCodeContinuationCallbackMetadata | null;
 }) {
+	if (isCanonicalCallbackSessionKey(input.metadata?.callbackTargetSessionKey)) {
+		return input.metadata?.callbackTargetSessionKey as string;
+	}
 	const requestedAgentId = asString(input.metadata?.requestedAgentId);
 	const callbackAnchor =
 		asString(input.metadata?.callbackTargetSessionId) ||
@@ -419,9 +422,6 @@ function resolveCanonicalCallbackRoute(input: {
 			agentId: requestedAgentId,
 			anchor: callbackAnchor,
 		});
-	}
-	if (isCanonicalCallbackSessionKey(input.metadata?.callbackTargetSessionKey)) {
-		return input.metadata?.callbackTargetSessionKey as string;
 	}
 	if (isCanonicalCallbackSessionKey(input.callback.sessionKey)) {
 		return input.callback.sessionKey;
@@ -613,6 +613,10 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 		},
 	});
 
+	// Deprecated compatibility shim only.
+	// Primary callback ingress is /hooks/opencode-callback; keep this legacy
+	// route registered for controlled compatibility while preventing it from
+	// being treated as the primary path in source/wording.
 	api.registerHttpRoute({
 		path: OPENCODE_CALLBACK_HTTP_PATH,
 		auth: "plugin",
@@ -649,6 +653,13 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				sendJson(res, 400, { ok: false, error: parsed.error });
 				return true;
 			}
+			appendCallbackDebugAudit({
+				phase: "deprecated_callback_http_route_used",
+				path: OPENCODE_CALLBACK_HTTP_PATH,
+				primaryPath: OPENCODE_CONTINUATION_HOOK_PATH,
+				eventType: parsed.metadata?.eventType || null,
+				runId: parsed.metadata?.runId || null,
+			});
 			const callback = parsed.body;
 			const routedCallbackSessionKey = resolveCanonicalCallbackRoute({
 				callback,
@@ -672,14 +683,12 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			);
 			if (parsed.metadata?.runId) {
 				patchRunStatus(parsed.metadata.runId, (current) => {
+					const isTerminalCallbackIngressEvent =
+						parsed.metadata?.eventType === "message.updated" ||
+						parsed.metadata?.eventType === "session.idle" ||
+						parsed.metadata?.eventType === "session.error";
 					const shouldForceTerminal = Boolean(
-						callbackPersistence?.terminal &&
-						current.callbackOk === true &&
-						(
-							parsed.metadata?.eventType === "message.updated" ||
-							parsed.metadata?.eventType === "session.idle" ||
-							parsed.metadata?.eventType === "session.error"
-						)
+						callbackPersistence?.terminal && isTerminalCallbackIngressEvent,
 					);
 					const preserveTerminal =
 						isTerminalState(current.state) &&
@@ -1218,7 +1227,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 			name: "opencode_check_hook_policy",
 			label: "OpenCode Check Hook Policy",
 			description:
-				"Kiểm tra checklist/policy tối thiểu cho callback `/plugin/opencode-bridge/callback` với agentId và sessionKey cụ thể.",
+				"Kiểm tra checklist/policy tối thiểu cho primary callback `/hooks/opencode-callback`; `/plugin/opencode-bridge/callback` chỉ còn compat/deprecated.",
 			parameters: {
 				type: "object",
 				properties: {

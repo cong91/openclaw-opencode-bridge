@@ -121,7 +121,7 @@ test("callback http route enqueues callback message into target session and wake
 	assert.equal(systemEvents[0]?.opts?.sessionId, undefined);
 	assert.equal(
 		systemEvents[0]?.opts?.contextKey,
-		"opencode:run-1:session.idle",
+		"opencode:run-1:session.idle:agent:creator:opencode:creator:callback:run-1:callback_control",
 	);
 });
 
@@ -233,6 +233,116 @@ test("callback http route materializes terminal run artifact on message.updated 
 			/"eventType":"message.updated"/,
 		);
 		assert.notEqual(persisted.updatedAt, initialUpdatedAt);
+	} finally {
+		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+		else process.env.OPENCLAW_STATE_DIR = prevStateDir;
+		rmSync(tempRoot, { recursive: true, force: true });
+	}
+});
+
+test("callback http route finalizes terminal artifact on first session.idle callback without prior callbackOk", async () => {
+	const tempRoot = mkdtempSync(join(tmpdir(), "opencode-bridge-callback-idle-first-"));
+	const stateDir = join(tempRoot, "state");
+	const bridgeDir = join(stateDir, "opencode-bridge");
+	const runsDir = join(bridgeDir, "runs");
+	mkdirSync(runsDir, { recursive: true });
+	const runId = "run-terminal-idle-first-1";
+	const runPath = join(runsDir, `${runId}.json`);
+	writeFileSync(
+		runPath,
+		JSON.stringify(
+			{
+				taskId: "task-terminal-idle-first-1",
+				runId,
+				state: "running",
+				lastEvent: "task.progress",
+				lastSummary:
+					"Attach-run dispatched; terminal callback owned by OpenCode-side plugin",
+				updatedAt: "2000-01-01T00:00:00.000Z",
+				envelope: {
+					task_id: "task-terminal-idle-first-1",
+					run_id: runId,
+					agent_id: "builder",
+					requested_agent_id: "creator",
+					resolved_agent_id: "builder",
+					session_key: "hook:opencode:builder:task-terminal-idle-first-1",
+					origin_session_key: "session:origin:terminal-idle-first-1",
+					callback_target_session_key:
+						"session:origin:terminal-idle-first-1",
+					project_id: "proj-terminal-idle-first-1",
+					repo_root: "/tmp/repo-terminal-idle-first-1",
+					opencode_server_url: "http://opencode.local",
+				},
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
+
+	const prevStateDir = process.env.OPENCLAW_STATE_DIR;
+	process.env.OPENCLAW_STATE_DIR = stateDir;
+
+	const routes: RegisteredRoute[] = [];
+	registerOpenCodeBridgeTools(
+		{
+			registerTool() {},
+			registerHttpRoute(route: RegisteredRoute) {
+				routes.push(route);
+			},
+			runtime: {
+				system: {
+					enqueueSystemEvent() {
+						return true;
+					},
+					requestHeartbeatNow() {},
+				},
+			},
+		},
+		{
+			hookToken: "test-token",
+		},
+	);
+
+	try {
+		const route = routes.find(
+			(x) => x.path === "/plugin/opencode-bridge/callback",
+		);
+		assert.ok(route, "callback route should be registered");
+
+		const req = createMockReq(
+			JSON.stringify({
+				name: "OpenCode",
+				agentId: "creator",
+				sessionKey: "session:origin:terminal-idle-first-1",
+				wakeMode: "now",
+				deliver: false,
+				message: JSON.stringify({
+					kind: "opencode.callback",
+					eventType: "session.idle",
+					runId,
+					taskId: "task-terminal-idle-first-1",
+					callbackTargetSessionKey:
+						"session:origin:terminal-idle-first-1",
+				}),
+			}),
+			"test-token",
+		);
+		const res = createMockRes();
+		const handled = await route!.handler(req, res);
+
+		assert.equal(handled, true);
+		assert.equal(res.statusCode, 200);
+
+		const persisted = JSON.parse(readFileSync(runPath, "utf8"));
+		assert.equal(persisted.state, "completed");
+		assert.equal(persisted.lastEvent, "task.completed");
+		assert.match(
+			String(persisted.lastSummary || ""),
+			/Terminal callback materialized \(session.idle\)/,
+		);
+		assert.equal(persisted.callbackStatus, 200);
+		assert.equal(persisted.callbackOk, true);
 	} finally {
 		if (prevStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
 		else process.env.OPENCLAW_STATE_DIR = prevStateDir;

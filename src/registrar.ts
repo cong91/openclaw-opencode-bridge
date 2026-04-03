@@ -52,6 +52,11 @@ import {
 	OPENCODE_CONTINUATION_CONTROL_HTTP_PATH,
 	OPENCODE_CONTINUATION_HOOK_PATH,
 } from "./shared-contracts";
+import {
+	isTerminalArtifactState,
+	mapCallbackEventToArtifactState,
+	reconcileRunArtifactSnapshotFromCallback,
+} from "./callback-artifact-reconciliation.js";
 import type {
 	BridgeRunStatus,
 	OpenCodeContinuationCallbackMetadata,
@@ -365,45 +370,6 @@ function parseOpencodeCallbackPayload(raw: string):
 	};
 }
 
-function mapCallbackEventToArtifactState(eventType?: string): {
-	state: BridgeRunStatus["state"];
-	lastEvent: BridgeRunStatus["lastEvent"];
-	terminal: boolean;
-} | null {
-	if (!eventType) return null;
-	switch (eventType) {
-		case "task.started":
-			return { state: "planning", lastEvent: "task.started", terminal: false };
-		case "task.progress":
-			return { state: "running", lastEvent: "task.progress", terminal: false };
-		case "permission.requested":
-			return {
-				state: "awaiting_permission",
-				lastEvent: "permission.requested",
-				terminal: false,
-			};
-		case "task.stalled":
-			return { state: "stalled", lastEvent: "task.stalled", terminal: true };
-		case "task.failed":
-		case "session.error":
-			return { state: "failed", lastEvent: "task.failed", terminal: true };
-		case "task.completed":
-		case "session.idle":
-		case "message.updated":
-			return {
-				state: "completed",
-				lastEvent: "task.completed",
-				terminal: true,
-			};
-		default:
-			return null;
-	}
-}
-
-function isTerminalState(state?: BridgeRunStatus["state"] | null): boolean {
-	return state === "completed" || state === "failed" || state === "stalled";
-}
-
 function resolveCanonicalCallbackRoute(input: {
 	callback: { sessionKey: string };
 	metadata: OpenCodeContinuationCallbackMetadata | null;
@@ -683,22 +649,6 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			);
 			if (parsed.metadata?.runId) {
 				patchRunStatus(parsed.metadata.runId, (current) => {
-					const isTerminalCallbackIngressEvent =
-						parsed.metadata?.eventType === "message.updated" ||
-						parsed.metadata?.eventType === "session.idle" ||
-						parsed.metadata?.eventType === "session.error";
-					const shouldForceTerminal = Boolean(
-						callbackPersistence?.terminal && isTerminalCallbackIngressEvent,
-					);
-					const preserveTerminal =
-						isTerminalState(current.state) &&
-						(!callbackPersistence || !callbackPersistence.terminal) &&
-						!shouldForceTerminal;
-					const summary = parsed.metadata?.eventType
-						? callbackPersistence?.terminal
-							? `Terminal callback materialized (${parsed.metadata.eventType})`
-							: `Callback materialized (${parsed.metadata.eventType})`
-						: "Callback materialized";
 					const callbackBody = JSON.stringify(
 						{
 							ok: true,
@@ -711,24 +661,18 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						null,
 						0,
 					);
-					return {
-						...current,
-						...(callbackPersistence && !preserveTerminal
-							? {
-									state: callbackPersistence.state,
-									lastEvent: callbackPersistence.lastEvent,
-								}
-							: {}),
-						lastSummary: preserveTerminal
-							? current.lastSummary || summary
-							: summary,
-						callbackSentAt: callbackAt,
-						callbackStatus: 200,
-						callbackOk: true,
-						callbackBody,
-						callbackError: undefined,
-						updatedAt: callbackAt,
-					};
+					return (
+						reconcileRunArtifactSnapshotFromCallback({
+							current,
+							eventType: parsed.metadata?.eventType,
+							callbackAt,
+							callbackOk: true,
+							callbackStatus: 200,
+							callbackBody,
+							callbackError: undefined,
+							killProcess: (pid, signal) => process.kill(pid, signal),
+						}) || current
+					);
 				});
 			}
 			const preferredSessionId = isCanonicalCallbackSessionKey(
@@ -780,39 +724,6 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				hasContinuation: Boolean(runStatus?.continuation),
 				continuation: runStatus?.continuation || null,
 			});
-			if (callbackPersistence?.terminal && parsed.metadata?.runId) {
-				const refreshedRun = readRunStatus(parsed.metadata.runId);
-				const attachPid = refreshedRun?.attachRun?.pid;
-				if (typeof attachPid === "number") {
-					let killResult = "not_attempted";
-					try {
-						process.kill(attachPid, "SIGTERM");
-						killResult = "sigterm_sent";
-					} catch (error) {
-						killResult = error instanceof Error ? error.message : String(error);
-					}
-					patchRunStatus(parsed.metadata.runId, (current) => ({
-						...current,
-						callbackCleaned: killResult === "sigterm_sent",
-						attachRun: {
-							...current.attachRun,
-							cleaned: killResult === "sigterm_sent",
-							cleanedAt: new Date().toISOString(),
-							killSignal: "SIGTERM",
-							killResult,
-						},
-						updatedAt: new Date().toISOString(),
-					}));
-					appendCallbackDebugAudit({
-						phase: "attach_run_pid_killed",
-						runId: parsed.metadata.runId,
-						sessionKey: routedCallbackSessionKey,
-						pid: attachPid,
-						killSignal: "SIGTERM",
-						killResult,
-					});
-				}
-			}
 			let dispatchedToHook = false;
 			if (runStatus?.continuation) {
 				const step = continuationStep;
@@ -1630,7 +1541,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				const state = artifact?.state || (sessionId ? "running" : "queued");
 				const migratedSessionId =
 					artifact?.sessionId || artifact?.opencodeSessionId;
-				const currentState = isTerminalState(artifact?.state)
+				const currentState = isTerminalArtifactState(artifact?.state)
 					? artifact!.state
 					: (lifecycleSummary.currentState as any) || state;
 				const warnings: string[] = [];
@@ -1656,7 +1567,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				}
 				if (
 					artifact?.callbackOk === true &&
-					!isTerminalState(artifact?.state)
+					!isTerminalArtifactState(artifact?.state)
 				) {
 					warnings.push("callback_sent_but_not_reconciled");
 				}
@@ -1674,7 +1585,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 				) {
 					warnings.push("process_missing_but_running_artifact");
 				}
-				const stateConfidence = isTerminalState(artifact?.state)
+				const stateConfidence = isTerminalArtifactState(artifact?.state)
 					? "artifact_plus_callback"
 					: sessionId
 						? "artifact_plus_session"

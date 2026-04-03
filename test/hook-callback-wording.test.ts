@@ -1,17 +1,15 @@
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
 import test from "node:test";
 
-const require = createRequire(import.meta.url);
-const hookModule = require("../hooks/opencode-callback.js");
+import { buildContinuationInstruction } from "../hooks/opencode-callback.js";
 
-const buildContinuationInstruction: (
+const typedBuildContinuationInstruction: (
 	payload: Record<string, unknown>,
 	routedSessionKey: string,
-) => string = hookModule.buildContinuationInstruction;
+) => string = buildContinuationInstruction;
 
 test("hook continuation text stays internal-only and does not synthesize operator-facing preamble", () => {
-	const text = buildContinuationInstruction(
+	const text = typedBuildContinuationInstruction(
 		{
 			eventType: "task.completed",
 			runId: "run-wording-1",

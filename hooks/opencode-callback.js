@@ -1,3 +1,13 @@
+import fs from "node:fs";
+import path from "node:path";
+import {
+  reconcileRunArtifactSnapshotFromCallback,
+} from "../src/callback-artifact-reconciliation.js";
+
+function asTrimmedString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
 function buildOpencodeSessionKey(payload) {
   const requestedAgentId = typeof payload.requestedAgentId === "string"
     ? payload.requestedAgentId
@@ -13,8 +23,68 @@ function buildOpencodeSessionKey(payload) {
   return `opencode:${requestedAgentId}:callback:${runId}`;
 }
 
-function asTrimmedString(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+function getBridgeStateDir() {
+  const stateDir = process.env.OPENCLAW_STATE_DIR || `${process.env.HOME}/.openclaw`;
+  return path.join(stateDir, "opencode-bridge");
+}
+
+function getRunStatePath(runId) {
+  return path.join(getBridgeStateDir(), "runs", `${runId}.json`);
+}
+
+function readRunStatus(runId) {
+  try {
+    const runPath = getRunStatePath(runId);
+    if (!fs.existsSync(runPath)) return null;
+    return JSON.parse(fs.readFileSync(runPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeRunStatus(runId, status) {
+  const runPath = getRunStatePath(runId);
+  fs.mkdirSync(path.dirname(runPath), { recursive: true });
+  fs.writeFileSync(runPath, JSON.stringify(status, null, 2), "utf8");
+}
+
+function reconcileRunArtifactFromHook(payload) {
+  const runId = asTrimmedString(payload.runId) || asTrimmedString(payload.run_id);
+  const eventType = asTrimmedString(payload.eventType) || asTrimmedString(payload.event_type);
+  if (!runId || !eventType) return null;
+
+  const current = readRunStatus(runId);
+  if (!current || typeof current !== "object") return null;
+
+  const next = reconcileRunArtifactSnapshotFromCallback({
+    current,
+    eventType,
+    callbackAt: new Date().toISOString(),
+    callbackOk: true,
+    callbackStatus: 200,
+    callbackBody: JSON.stringify({
+      ok: true,
+      via: "hook_ingress",
+      eventType,
+      runId,
+    }),
+    callbackError: undefined,
+    includeRealState: true,
+    includeStateConfidence: true,
+    killProcess: (pid, signal) => process.kill(pid, signal),
+  });
+
+  if (!next) return null;
+  writeRunStatus(runId, next);
+  return next;
+}
+
+function buildInternalControlNote() {
+  return [
+    "OpenCode hook continuation control.",
+    "Internal notify/control note:",
+    "Any operator-facing update must be emitted by registrar authority only.",
+  ].join("\n");
 }
 
 function buildOperatorUpdate(payload, routedSessionKey) {
@@ -32,14 +102,14 @@ function buildOperatorUpdate(payload, routedSessionKey) {
   const status = intentKind === "launch_run"
     ? (eventType === "session.error" || eventType === "task.failed" ? "step failed; corrective relaunch requested" : "next step launched")
     : intentKind === "notify"
-      ? "operator update required"
+      ? "internal continuation update"
       : intentKind === "done"
         ? "loop completed"
         : "blocked / manual triage";
   const actionTaken = intentKind === "launch_run"
     ? (eventType === "session.error" || eventType === "task.failed" ? "launching corrective continuation run" : "launching verification / next task")
     : intentKind === "notify"
-      ? "sending operator-facing update"
+      ? "keeping continuation aligned"
       : intentKind === "done"
         ? "closing loop"
         : "waiting manual intervention";
@@ -84,7 +154,7 @@ function buildContinuationInstruction(payload, routedSessionKey) {
   const lines = [
     buildOperatorUpdate(payload, routedSessionKey),
     "",
-    "OpenCode hook continuation loop.",
+    buildInternalControlNote(),
     `Run ID: ${runId}`,
     `Task ID: ${taskId}`,
     `Event: ${eventType}`,
@@ -113,8 +183,8 @@ function buildContinuationInstruction(payload, routedSessionKey) {
     );
   } else if (intentKind === "notify") {
     lines.push(
-      "Action required: prepare a concise operator-facing notification/update now.",
-      "Summarize completion or blocker clearly."
+      "Action required: continue internal workflow handling now.",
+      "Do not synthesize a direct operator-facing update from this hook payload."
     );
   } else if (intentKind === "done") {
     lines.push(
@@ -145,27 +215,31 @@ function buildContinuationInstruction(payload, routedSessionKey) {
   return lines.join("\n");
 }
 
-module.exports = async function transform(ctx) {
+async function transform(ctx) {
   const payload = ctx?.payload ?? {};
-  const requestedAgentId = asTrimmedString(payload.requestedAgentId) || asTrimmedString(payload.requested_agent_id) || "scrum";
-  const routedSessionKey = buildOpencodeSessionKey(payload);
-  const message = buildContinuationInstruction(payload, routedSessionKey);
-  const intent = payload && typeof payload.intent === "object" ? payload.intent : {};
-  const intentKind = asTrimmedString(intent.kind) || "blocked";
-  const shouldNotifyDirect = intentKind === "notify" || intentKind === "done" || intentKind === "blocked";
-  const directPreface = shouldNotifyDirect
-    ? "Send one concise direct Telegram update to the operator summarizing the current callback state. Avoid duplicate updates."
-    : undefined;
-  const finalMessage = [directPreface, message].filter(Boolean).join("\n\n");
+  const normalizedPayload = payload && typeof payload === "object" ? payload : {};
+  reconcileRunArtifactFromHook(normalizedPayload);
+
+  const requestedAgentId = asTrimmedString(normalizedPayload.requestedAgentId) || asTrimmedString(normalizedPayload.requested_agent_id) || "scrum";
+  const routedSessionKey = buildOpencodeSessionKey(normalizedPayload);
+  const message = buildContinuationInstruction(normalizedPayload, routedSessionKey);
+
   return {
     kind: "agent",
     agentId: requestedAgentId,
     sessionKey: routedSessionKey,
-    message: finalMessage,
+    message,
     name: "OpenCodeCallbackLoop",
     wakeMode: "now",
-    deliver: shouldNotifyDirect,
+    deliver: false,
     allowUnsafeExternalContent: false,
-    ...(shouldNotifyDirect ? { channel: "telegram", to: "5165741309" } : {})
   };
+}
+
+export default transform;
+export {
+  buildContinuationInstruction,
+  reconcileRunArtifactFromHook,
+  buildInternalControlNote,
+  buildOpencodeSessionKey,
 };

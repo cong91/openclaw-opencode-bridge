@@ -71,17 +71,15 @@ import type {
 	ServeRegistryEntry,
 	SessionTailMessage,
 	SessionTailResponse,
-	WorkflowStepState,
 } from "./types";
+import { handleWorkflowCallbackTransition } from "./workflow-callback-transition";
+import { resolveContinuationStep } from "./workflow-continuation";
 import {
-	buildPromptForWorkflowIntent,
 	DEFAULT_WORKFLOW_MAX_TRANSITIONS,
 	DEFAULT_WORKFLOW_TYPE,
-	resolveWorkflowPolicyTransition,
 	WORKFLOW_POLICY_VERSION,
 } from "./workflow-policy";
 import {
-	applyWorkflowTransitionToContinuation,
 	asWorkflowStepIntent,
 	buildInitialWorkflowState,
 	buildWorkflowStatusSnapshot,
@@ -134,25 +132,6 @@ function asWorkflowArtifacts(value: unknown): { spec?: string; plan?: string } {
 		...(asString(raw.spec) ? { spec: asString(raw.spec) } : {}),
 		...(asString(raw.plan) ? { plan: asString(raw.plan) } : {}),
 	};
-}
-
-function buildContinuationTransitionDedupeKey(input: {
-	runId: string;
-	eventType?: string;
-	step?: OpenCodeRunContinuation["nextOnSuccess"];
-}) {
-	const eventType = asString(input.eventType) || "unknown-event";
-	const stablePolicyReason = asString(input.step?.reason);
-	if (stablePolicyReason?.startsWith("policy_transition:")) {
-		return `${input.runId}:${eventType}:${stablePolicyReason}:${input.step?.action || "none"}`;
-	}
-	const stepId =
-		asString(input.step?.stepId) ||
-		asString(input.step?.taskId) ||
-		asString(input.step?.stepIntent) ||
-		asString(input.step?.executionLane) ||
-		"unknown-step";
-	return `${input.runId}:${eventType}:${stepId}:${input.step?.action || "none"}`;
 }
 
 function readRequestBody(req: IncomingMessage): Promise<string> {
@@ -495,238 +474,6 @@ function resolveCanonicalCallbackRoute(input: {
 		return input.callback.sessionKey;
 	}
 	return input.callback.sessionKey;
-}
-
-function resolveLegacyContinuationStep(input: {
-	runStatus: BridgeRunStatus | null;
-	eventType?: string;
-}): OpenCodeRunContinuation["nextOnSuccess"] | undefined {
-	if (!input.runStatus?.continuation) return undefined;
-	return input.eventType === "task.failed" ||
-		input.eventType === "task.stalled" ||
-		input.eventType === "session.error"
-		? input.runStatus.continuation.nextOnFailure
-		: input.runStatus.continuation.nextOnSuccess;
-}
-
-function resolveContinuationStep(input: {
-	cfg: any;
-	runStatus: BridgeRunStatus | null;
-	eventType?: string;
-}): {
-	step?: OpenCodeRunContinuation["nextOnSuccess"];
-	source: "none" | "legacy" | "workflow_policy";
-	policy?: ReturnType<typeof resolveWorkflowPolicyTransition>;
-} {
-	const continuation = input.runStatus?.continuation;
-	if (!continuation) return { source: "none" };
-
-	const workflow = continuation.workflow;
-	const currentIntent =
-		workflow?.currentStep?.intent || continuation.currentIntent;
-	if (!workflow || !currentIntent) {
-		return {
-			step: resolveLegacyContinuationStep(input),
-			source: "legacy",
-		};
-	}
-
-	const runtimeCfg = getRuntimeConfig(input.cfg);
-	const policy = resolveWorkflowPolicyTransition({
-		workflowType: workflow.workflowType || continuation.workflowType,
-		currentIntent,
-		eventType: input.eventType,
-		transitionCount: workflow.transitionCount,
-		maxTransitions:
-			workflow.maxTransitions ||
-			runtimeCfg.workflowPolicy?.maxTransitions ||
-			DEFAULT_WORKFLOW_MAX_TRANSITIONS,
-	});
-
-	if (policy.action !== "launch_run") {
-		return {
-			step: {
-				action: policy.action,
-				reason: policy.reason,
-				stepIntent: policy.nextIntent,
-				stepId: workflow.currentStep?.stepId,
-				taskId: workflow.currentStep?.taskId,
-			},
-			source: "workflow_policy",
-			policy,
-		};
-	}
-
-	if (!policy.nextIntent) {
-		throw new Error(
-			`Workflow policy returned launch_run without next intent for runId=${input.runStatus?.runId || "unknown"}`,
-		);
-	}
-
-	const laneResolution = resolveIntentToLaneFromConfig({
-		intent: policy.nextIntent,
-		workflowOverride: normalizeIntentLaneMap(
-			workflow.intentLaneOverrides || continuation.intentLaneOverrides,
-		),
-		workflowPolicy: runtimeCfg.workflowPolicy,
-		projectId: input.runStatus?.envelope.project_id,
-		validLanes: DEFAULT_EXECUTION_LANES,
-	});
-	const stepOrdinal = Math.max(1, Number(workflow.transitionCount || 0) + 1);
-	const nextStepId = `${workflow.workflowId || input.runStatus?.runId || "wf"}:${policy.nextIntent}:${stepOrdinal}`;
-	const promptPacket = buildPromptForWorkflowIntent({
-		intent: policy.nextIntent,
-		workflowObjective: workflow.objective,
-		previousIntent: currentIntent,
-		previousOutcome: policy.outcome,
-	});
-
-	return {
-		step: {
-			action: "launch_run",
-			stepId: nextStepId,
-			taskId: nextStepId,
-			stepIntent: policy.nextIntent,
-			executionLane: laneResolution.executionLane,
-			objective: promptPacket.objective,
-			prompt: promptPacket.prompt,
-			reason: policy.reason,
-		},
-		source: "workflow_policy",
-		policy,
-	};
-}
-
-async function launchWorkflowContinuationStep(input: {
-	cfg: any;
-	parentRunStatus: BridgeRunStatus;
-	step: NonNullable<OpenCodeRunContinuation["nextOnSuccess"]>;
-	policy?: ReturnType<typeof resolveWorkflowPolicyTransition>;
-	transitionDedupeKey: string;
-}) {
-	const taskId =
-		asString(input.step.taskId) ||
-		asString(input.step.stepId) ||
-		`${input.parentRunStatus.taskId}-continue`;
-	const runId = `${taskId}-${Date.now()}`;
-	const requestedAgentId =
-		input.parentRunStatus.envelope.requested_agent_id || "creator";
-	const resolvedAgentId =
-		asString(input.step.executionLane) ||
-		input.parentRunStatus.envelope.resolved_agent_id ||
-		requestedAgentId;
-	if (!DEFAULT_EXECUTION_LANES.has(resolvedAgentId)) {
-		throw new Error(
-			`Workflow continuation resolved unsupported execution lane '${resolvedAgentId}'`,
-		);
-	}
-
-	const repoRoot = input.parentRunStatus.envelope.repo_root;
-	const projectId = input.parentRunStatus.envelope.project_id;
-	const serverUrl =
-		findRegistryEntry(input.cfg, projectId, repoRoot)?.serverUrl ||
-		input.parentRunStatus.envelope.opencode_server_url ||
-		resolveServerUrl(input.cfg);
-
-	const envelope = buildEnvelope({
-		taskId,
-		runId,
-		requestedAgentId,
-		resolvedAgentId,
-		executionAgentExplicit: true,
-		originSessionKey: input.parentRunStatus.envelope.origin_session_key,
-		originSessionId: input.parentRunStatus.envelope.origin_session_id,
-		projectId,
-		repoRoot,
-		agentWorkspaceDir:
-			input.parentRunStatus.envelope.agent_workspace_dir || repoRoot,
-		serverUrl,
-		deliver: true,
-		channel: input.parentRunStatus.envelope.channel,
-		to: input.parentRunStatus.envelope.to,
-		priority: input.parentRunStatus.envelope.priority,
-	});
-
-	const parentContinuation = input.parentRunStatus.continuation;
-	const parentWorkflow = parentContinuation?.workflow;
-	const stepIntent = asWorkflowStepIntent(input.step.stepIntent);
-	const childWorkflow =
-		parentWorkflow && stepIntent
-			? {
-					...parentWorkflow,
-					currentStep: {
-						stepId: asString(input.step.stepId) || taskId,
-						intent: stepIntent,
-						executionLane: resolvedAgentId,
-						status: "running" as const,
-						taskId,
-						objective: asString(input.step.objective),
-						prompt: asString(input.step.prompt),
-					},
-					transitionCount: Math.max(
-						1,
-						Number(parentWorkflow.transitionCount || 0) + 1,
-					),
-					nextTransition: {
-						action: "launch_run" as const,
-						reason: input.policy?.reason || input.step.reason,
-						previousOutcome: input.policy?.outcome,
-						nextStep: {
-							stepId: asString(input.step.stepId) || taskId,
-							intent: stepIntent,
-							executionLane: resolvedAgentId,
-							status: "running" as const,
-							taskId,
-						},
-						dedupeKey: input.transitionDedupeKey,
-						launched: true,
-						launchedAt: new Date().toISOString(),
-					},
-				}
-			: undefined;
-
-	const continuation: OpenCodeRunContinuation | undefined = parentContinuation
-		? {
-				...parentContinuation,
-				workflowId:
-					childWorkflow?.workflowId ||
-					parentContinuation.workflowId ||
-					parentWorkflow?.workflowId,
-				workflowType:
-					childWorkflow?.workflowType ||
-					parentContinuation.workflowType ||
-					parentWorkflow?.workflowType,
-				policyVersion:
-					childWorkflow?.policyVersion ||
-					parentContinuation.policyVersion ||
-					parentWorkflow?.policyVersion,
-				stepId: asString(input.step.stepId) || taskId,
-				currentIntent: stepIntent || parentContinuation.currentIntent,
-				currentExecutionLane: resolvedAgentId,
-				nextAction: undefined,
-				workflow: childWorkflow,
-				nextOnSuccess: parentContinuation.nextOnSuccess,
-				nextOnFailure: parentContinuation.nextOnFailure,
-				callbackEventKind: "opencode.callback",
-			}
-		: undefined;
-
-	const execution = await startExecutionRun({
-		cfg: input.cfg,
-		envelope,
-		prompt:
-			asString(input.step.prompt) ||
-			asString(input.step.objective) ||
-			"Continue workflow step.",
-		continuation,
-	});
-
-	return {
-		runId,
-		taskId,
-		execution,
-		envelope,
-	};
 }
 
 function registerCallbackIngressRoute(api: any, cfg: any) {
@@ -1077,219 +824,39 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					policy: continuationDecision?.policy || null,
 					selectedStep: step || null,
 				});
-				if (step?.action === "launch_run") {
-					if (continuationDecision?.source === "workflow_policy") {
-						const transitionDedupeKey = buildContinuationTransitionDedupeKey({
-							runId: runStatus.runId,
-							eventType: parsed.metadata?.eventType,
-							step,
-						});
-						const latestRunStatus = parsed.metadata?.runId
-							? readRunStatus(parsed.metadata.runId) || runStatus
-							: runStatus;
-						const alreadyLaunched =
-							latestRunStatus.continuation?.workflow?.nextTransition
-								?.dedupeKey === transitionDedupeKey &&
-							latestRunStatus.continuation?.workflow?.nextTransition
-								?.launched === true;
-						if (alreadyLaunched) {
-							appendCallbackDebugAudit({
-								phase: "continuation_launch_deduped",
-								runId: latestRunStatus.runId,
-								eventType: parsed.metadata?.eventType || null,
-								transitionDedupeKey,
-								selectedStep: step,
-							});
-						} else {
-							const nextStepState: WorkflowStepState | undefined =
-								step.stepIntent
-									? {
-											stepId:
-												asString(step.stepId) ||
-												asString(step.taskId) ||
-												`${latestRunStatus.taskId}:next`,
-											intent: step.stepIntent,
-											executionLane: asString(step.executionLane),
-											status: "pending",
-											taskId: asString(step.taskId),
-											objective: asString(step.objective),
-											prompt: asString(step.prompt),
-										}
-									: undefined;
-							if (parsed.metadata?.runId) {
-								patchRunStatus(parsed.metadata.runId, (current) => ({
-									...current,
-									continuation: current.continuation
-										? applyWorkflowTransitionToContinuation({
-												continuation: current.continuation,
-												outcome:
-													continuationDecision?.policy?.outcome || "unknown",
-												action: "launch_run",
-												reason:
-													continuationDecision?.policy?.reason ||
-													step.reason ||
-													"continuation_launch_requested",
-												nextStep: nextStepState,
-												dedupeKey: transitionDedupeKey,
-												launched: false,
-											})
-										: current.continuation,
-								}));
-							}
-
-							try {
-								const childRun = await launchWorkflowContinuationStep({
-									cfg,
-									parentRunStatus: latestRunStatus,
-									step,
-									policy: continuationDecision?.policy,
-									transitionDedupeKey,
-								});
-								if (parsed.metadata?.runId) {
-									patchRunStatus(parsed.metadata.runId, (current) => ({
-										...current,
-										continuation: current.continuation
-											? applyWorkflowTransitionToContinuation({
-													continuation: current.continuation,
-													outcome:
-														continuationDecision?.policy?.outcome || "unknown",
-													action: "launch_run",
-													reason:
-														continuationDecision?.policy?.reason ||
-														step.reason ||
-														"continuation_launch_dispatched",
-													nextStep: nextStepState,
-													dedupeKey: transitionDedupeKey,
-													launched: true,
-												})
-											: current.continuation,
-									}));
-								}
-								appendCallbackDebugAudit({
-									phase: "continuation_run_started",
-									runId: latestRunStatus.runId,
-									eventType: parsed.metadata?.eventType || null,
-									transitionDedupeKey,
-									selectedStep: step,
-									childRunId: childRun.runId,
-									childTaskId: childRun.taskId,
-									childExecutionLane: childRun.envelope.resolved_agent_id,
-								});
-							} catch (error: any) {
-								appendCallbackDebugAudit({
-									phase: "continuation_run_failed",
-									runId: latestRunStatus.runId,
-									eventType: parsed.metadata?.eventType || null,
-									transitionDedupeKey,
-									error: error?.message || String(error),
-								});
-								sendJson(res, 500, {
-									ok: false,
-									error: error?.message || "continuation_launch_failed_fast",
-								});
-								return true;
-							}
-						}
-					} else {
-						const commandPayload = buildContinuationCommandPayload({
-							runStatus,
-							metadata: parsed.metadata,
-							step,
-						});
-						const hookDispatch = await dispatchContinuationToCustomHook({
-							cfg,
-							metadata: parsed.metadata,
-							runStatus,
-							step,
-						});
-						appendCallbackDebugAudit({
-							phase: hookDispatch.ok
-								? "continuation_hook_dispatched"
-								: "continuation_hook_failed",
-							sessionKey: routedCallbackSessionKey,
-							dedupeKey,
-							runId: parsed.metadata?.runId || null,
-							commandPayload,
-							hookDispatch,
-						});
-					}
-				} else if (step?.action === "notify") {
-					if (
-						continuationDecision?.source === "workflow_policy" &&
-						parsed.metadata?.runId
-					) {
-						patchRunStatus(parsed.metadata.runId, (current) => ({
-							...current,
-							continuation: current.continuation
-								? applyWorkflowTransitionToContinuation({
-										continuation: current.continuation,
-										outcome: continuationDecision?.policy?.outcome || "unknown",
-										action: "notify",
-										reason:
-											continuationDecision?.policy?.reason ||
-											step.reason ||
-											"workflow_notify",
-										launched: false,
-									})
-								: current.continuation,
-						}));
-					}
-					const notifyMessage =
-						step.objective ||
-						step.prompt ||
-						"Next step requires operator notice.";
-					api.runtime.system.enqueueSystemEvent(notifyMessage, {
-						...callbackTarget,
-						...(dedupeKey
-							? { contextKey: `${dedupeKey}:continuation-notify` }
-							: {}),
-					});
-					appendCallbackDebugAudit({
-						phase: "continuation_notify_enqueued",
-						sessionKey: routedCallbackSessionKey,
+				if (step) {
+					const transitionResult = await handleWorkflowCallbackTransition({
+						cfg,
+						runStatus,
+						metadata: parsed.metadata,
+						decision: continuationDecision,
+						step,
 						dedupeKey,
-						runId: parsed.metadata?.runId || null,
-						notifyMessage,
-						reason: "registrar_authority",
+						callbackTarget,
+						appendCallbackDebugAudit,
+						enqueueSystemEvent: (message, options) =>
+							api.runtime.system.enqueueSystemEvent(message, options),
+						buildContinuationCommandPayload: (selectedStep) =>
+							buildContinuationCommandPayload({
+								runStatus,
+								metadata: parsed.metadata,
+								step: selectedStep,
+							}),
+						dispatchContinuationToCustomHook: (selectedStep) =>
+							dispatchContinuationToCustomHook({
+								cfg,
+								metadata: parsed.metadata,
+								runStatus,
+								step: selectedStep,
+							}),
 					});
-				} else if (step?.action === "stop" || step?.action === "escalate") {
-					if (
-						continuationDecision?.source === "workflow_policy" &&
-						parsed.metadata?.runId
-					) {
-						patchRunStatus(parsed.metadata.runId, (current) => ({
-							...current,
-							continuation: current.continuation
-								? applyWorkflowTransitionToContinuation({
-										continuation: current.continuation,
-										outcome: continuationDecision?.policy?.outcome || "unknown",
-										action: step.action,
-										reason:
-											continuationDecision?.policy?.reason ||
-											step.reason ||
-											`workflow_${step.action}`,
-										launched: false,
-									})
-								: current.continuation,
-						}));
+					if (!transitionResult.ok) {
+						sendJson(res, transitionResult.statusCode, {
+							ok: false,
+							error: transitionResult.error,
+						});
+						return true;
 					}
-					const controlMessage =
-						step.objective ||
-						step.prompt ||
-						`Workflow requested action=${step.action}.`;
-					api.runtime.system.enqueueSystemEvent(controlMessage, {
-						...callbackTarget,
-						...(dedupeKey
-							? { contextKey: `${dedupeKey}:continuation-${step.action}` }
-							: {}),
-					});
-					appendCallbackDebugAudit({
-						phase: `continuation_${step.action}_enqueued`,
-						sessionKey: routedCallbackSessionKey,
-						dedupeKey,
-						runId: parsed.metadata?.runId || null,
-						controlMessage,
-					});
 				}
 			} else {
 				const runtimeCfg = getRuntimeConfig(cfg);

@@ -61,8 +61,106 @@ export type HooksAgentCallbackPayload = {
 	to?: string;
 };
 
+export const WORKFLOW_STEP_INTENTS = [
+	"clarify",
+	"design",
+	"plan",
+	"explore",
+	"implement",
+	"review",
+	"verify",
+	"repair",
+	"summarize",
+	"notify",
+	"stop",
+	"escalate",
+] as const;
+
+export type WorkflowStepIntent = (typeof WORKFLOW_STEP_INTENTS)[number];
+
+export type WorkflowTransitionAction =
+	| "launch_run"
+	| "notify"
+	| "stop"
+	| "escalate"
+	| "none";
+
+export type WorkflowPolicyOutcome =
+	| "success"
+	| "failure"
+	| "stalled"
+	| "unknown";
+
+export type WorkflowStepStatus =
+	| "pending"
+	| "running"
+	| "completed"
+	| "failed"
+	| "stalled"
+	| "blocked";
+
+export type WorkflowIntentLaneMap = Partial<Record<WorkflowStepIntent, string>>;
+
+export type WorkflowStepState = {
+	stepId: string;
+	intent: WorkflowStepIntent;
+	executionLane?: string;
+	status?: WorkflowStepStatus;
+	taskId?: string;
+	objective?: string;
+	prompt?: string;
+};
+
+export type WorkflowNextTransition = {
+	action: WorkflowTransitionAction;
+	reason?: string;
+	previousOutcome?: WorkflowPolicyOutcome;
+	nextStep?: WorkflowStepState;
+	dedupeKey?: string;
+	launched?: boolean;
+	launchedAt?: string;
+};
+
+export type WorkflowPolicyState = {
+	workflowId: string;
+	workflowType: string;
+	policyVersion: string;
+	objective?: string;
+	artifacts?: {
+		spec?: string;
+		plan?: string;
+	};
+	currentStep?: WorkflowStepState;
+	previousOutcome?: WorkflowPolicyOutcome;
+	transitionCount?: number;
+	maxTransitions?: number;
+	nextTransition?: WorkflowNextTransition;
+	intentLaneOverrides?: WorkflowIntentLaneMap;
+};
+
+export type WorkflowStatusSnapshot = {
+	workflowId?: string;
+	workflowType?: string;
+	policyVersion?: string;
+	currentStepId?: string;
+	currentStepIntent?: WorkflowStepIntent;
+	currentExecutionLane?: string;
+	previousOutcome?: WorkflowPolicyOutcome;
+	nextAction?: WorkflowTransitionAction;
+	nextStepId?: string;
+	nextStepIntent?: WorkflowStepIntent;
+	nextExecutionLane?: string;
+	transitionReason?: string;
+	continuationLaunched?: boolean;
+	transitionCount?: number;
+};
+
 export type OpenCodeRunContinuationStep = {
-	action: "launch_run" | "notify" | "none";
+	action: WorkflowTransitionAction;
+	stepId?: string;
+	stepIntent?: WorkflowStepIntent;
+	executionLane?: string;
+	reason?: string;
 	taskId?: string;
 	objective?: string;
 	prompt?: string;
@@ -70,12 +168,19 @@ export type OpenCodeRunContinuationStep = {
 
 export type OpenCodeRunContinuation = {
 	workflowId?: string;
+	workflowType?: string;
+	policyVersion?: string;
 	stepId?: string;
+	currentIntent?: WorkflowStepIntent;
+	currentExecutionLane?: string;
 	callbackEventKind?: "opencode.callback";
 	nextOnSuccess?: OpenCodeRunContinuationStep;
 	nextOnFailure?: OpenCodeRunContinuationStep;
 	promptVariant?: "medium" | "high";
 	thinking?: boolean;
+	intentLaneOverrides?: WorkflowIntentLaneMap;
+	nextAction?: WorkflowTransitionAction;
+	workflow?: WorkflowPolicyState;
 };
 
 export type OpenCodeContinuationCallbackMetadata = {
@@ -96,7 +201,12 @@ export type OpenCodeContinuationCallbackMetadata = {
 	callbackRelaySessionId?: string;
 	opencodeSessionId?: string;
 	workflowId?: string;
+	workflowType?: string;
+	policyVersion?: string;
 	stepId?: string;
+	stepIntent?: WorkflowStepIntent;
+	executionLane?: string;
+	previousOutcome?: WorkflowPolicyOutcome;
 };
 
 export type BridgeRunStatus = {
@@ -213,6 +323,8 @@ export type RunStatusResponse = {
 	};
 	apiSnapshot?: OpenCodeApiSnapshot;
 	continuation?: OpenCodeRunContinuation;
+	workflow?: WorkflowPolicyState;
+	workflowStatus?: WorkflowStatusSnapshot;
 	callbackSummary?: {
 		ok?: boolean;
 		status?: number;
@@ -279,6 +391,8 @@ export type RunEventsResponse = {
 	eventCount: number;
 	events: RunEventRecord[];
 	continuation?: OpenCodeRunContinuation;
+	workflow?: WorkflowPolicyState;
+	workflowStatus?: WorkflowStatusSnapshot;
 	truncated: boolean;
 	timeoutMs: number;
 };
@@ -317,6 +431,8 @@ export type SessionTailResponse = {
 	totalMessages: number;
 	messages: SessionTailMessage[];
 	continuation?: OpenCodeRunContinuation;
+	workflow?: WorkflowPolicyState;
+	workflowStatus?: WorkflowStatusSnapshot;
 	diff?: any;
 	latestSummary?: any;
 	fetchedAt: string;
@@ -390,4 +506,10 @@ export type BridgeConfigFile = {
 	}[];
 	hookBaseUrl?: string;
 	hookToken?: string;
+	workflowPolicy?: {
+		policyVersion?: string;
+		defaultIntentLaneMap?: WorkflowIntentLaneMap;
+		projectIntentLaneMap?: Record<string, WorkflowIntentLaneMap>;
+		maxTransitions?: number;
+	};
 };

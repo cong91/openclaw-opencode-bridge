@@ -117,6 +117,7 @@ export function getRuntimeConfig(cfg: any): BridgeConfigFile {
 			fileCfg.executionAgentMappings || cfg?.executionAgentMappings || [],
 		hookBaseUrl: fileCfg.hookBaseUrl || cfg?.hookBaseUrl,
 		hookToken: fileCfg.hookToken || cfg?.hookToken,
+		workflowPolicy: fileCfg.workflowPolicy || cfg?.workflowPolicy,
 	};
 }
 
@@ -1681,6 +1682,7 @@ export function buildContinuationCallbackMetadata(input: {
 	eventType: string;
 }): OpenCodeContinuationCallbackMetadata {
 	const continuation = input.runStatus.continuation;
+	const workflow = continuation?.workflow;
 	return {
 		kind: "opencode.callback",
 		eventType: input.eventType,
@@ -1701,8 +1703,15 @@ export function buildContinuationCallbackMetadata(input: {
 			input.runStatus.envelope.callback_relay_session_key,
 		callbackRelaySessionId: input.runStatus.envelope.callback_relay_session_id,
 		opencodeSessionId: input.runStatus.sessionId,
-		workflowId: continuation?.workflowId,
-		stepId: continuation?.stepId,
+		workflowId: workflow?.workflowId || continuation?.workflowId,
+		workflowType: workflow?.workflowType || continuation?.workflowType,
+		policyVersion: workflow?.policyVersion || continuation?.policyVersion,
+		stepId: workflow?.currentStep?.stepId || continuation?.stepId,
+		stepIntent: workflow?.currentStep?.intent || continuation?.currentIntent,
+		executionLane:
+			workflow?.currentStep?.executionLane ||
+			continuation?.currentExecutionLane,
+		previousOutcome: workflow?.previousOutcome,
 	};
 }
 

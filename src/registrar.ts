@@ -2,6 +2,11 @@ import { execSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
+import {
+	isTerminalArtifactState,
+	mapCallbackEventToArtifactState,
+	reconcileRunArtifactSnapshotFromCallback,
+} from "./callback-artifact-reconciliation.js";
 import { mapCallbackEventToContinuationIntent } from "./hook-continuation";
 import type { EventScope } from "./observability";
 import { summarizeLifecycle } from "./observability";
@@ -53,10 +58,10 @@ import {
 	OPENCODE_CONTINUATION_HOOK_PATH,
 } from "./shared-contracts";
 import {
-	isTerminalArtifactState,
-	mapCallbackEventToArtifactState,
-	reconcileRunArtifactSnapshotFromCallback,
-} from "./callback-artifact-reconciliation.js";
+	DEFAULT_EXECUTION_LANES,
+	normalizeIntentLaneMap,
+	resolveIntentToLaneFromConfig,
+} from "./step-intent-resolver";
 import type {
 	BridgeRunStatus,
 	OpenCodeContinuationCallbackMetadata,
@@ -66,7 +71,22 @@ import type {
 	ServeRegistryEntry,
 	SessionTailMessage,
 	SessionTailResponse,
+	WorkflowStepState,
 } from "./types";
+import {
+	buildPromptForWorkflowIntent,
+	DEFAULT_WORKFLOW_MAX_TRANSITIONS,
+	DEFAULT_WORKFLOW_TYPE,
+	resolveWorkflowPolicyTransition,
+	WORKFLOW_POLICY_VERSION,
+} from "./workflow-policy";
+import {
+	applyWorkflowTransitionToContinuation,
+	asWorkflowStepIntent,
+	buildInitialWorkflowState,
+	buildWorkflowStatusSnapshot,
+	normalizeWorkflowIntentLaneOverrides,
+} from "./workflow-state";
 
 const PLUGIN_VERSION = "0.1.6";
 
@@ -82,15 +102,57 @@ function asContinuationStep(
 	if (!value || typeof value !== "object") return undefined;
 	const raw = value as Record<string, unknown>;
 	const action = asString(raw.action);
-	if (action !== "launch_run" && action !== "notify" && action !== "none") {
+	if (
+		action !== "launch_run" &&
+		action !== "notify" &&
+		action !== "stop" &&
+		action !== "escalate" &&
+		action !== "none"
+	) {
 		return undefined;
 	}
 	return {
 		action,
+		...(asString(raw.stepId) ? { stepId: asString(raw.stepId) } : {}),
+		...(asWorkflowStepIntent(raw.stepIntent)
+			? { stepIntent: asWorkflowStepIntent(raw.stepIntent) }
+			: {}),
+		...(asString(raw.executionLane)
+			? { executionLane: asString(raw.executionLane) }
+			: {}),
+		...(asString(raw.reason) ? { reason: asString(raw.reason) } : {}),
 		...(asString(raw.taskId) ? { taskId: asString(raw.taskId) } : {}),
 		...(asString(raw.objective) ? { objective: asString(raw.objective) } : {}),
 		...(asString(raw.prompt) ? { prompt: asString(raw.prompt) } : {}),
 	};
+}
+
+function asWorkflowArtifacts(value: unknown): { spec?: string; plan?: string } {
+	if (!value || typeof value !== "object") return {};
+	const raw = value as Record<string, unknown>;
+	return {
+		...(asString(raw.spec) ? { spec: asString(raw.spec) } : {}),
+		...(asString(raw.plan) ? { plan: asString(raw.plan) } : {}),
+	};
+}
+
+function buildContinuationTransitionDedupeKey(input: {
+	runId: string;
+	eventType?: string;
+	step?: OpenCodeRunContinuation["nextOnSuccess"];
+}) {
+	const eventType = asString(input.eventType) || "unknown-event";
+	const stablePolicyReason = asString(input.step?.reason);
+	if (stablePolicyReason?.startsWith("policy_transition:")) {
+		return `${input.runId}:${eventType}:${stablePolicyReason}:${input.step?.action || "none"}`;
+	}
+	const stepId =
+		asString(input.step?.stepId) ||
+		asString(input.step?.taskId) ||
+		asString(input.step?.stepIntent) ||
+		asString(input.step?.executionLane) ||
+		"unknown-step";
+	return `${input.runId}:${eventType}:${stepId}:${input.step?.action || "none"}`;
 }
 
 function readRequestBody(req: IncomingMessage): Promise<string> {
@@ -160,7 +222,20 @@ function buildContinuationCommandPayload(input: {
 			input.runStatus.envelope.callback_relay_session_key,
 		callbackRelaySessionId: input.runStatus.envelope.callback_relay_session_id,
 		workflowId: input.runStatus.continuation?.workflowId,
+		workflowType:
+			input.runStatus.continuation?.workflow?.workflowType ||
+			input.runStatus.continuation?.workflowType,
+		policyVersion:
+			input.runStatus.continuation?.workflow?.policyVersion ||
+			input.runStatus.continuation?.policyVersion,
 		stepId: input.runStatus.continuation?.stepId,
+		stepIntent:
+			input.runStatus.continuation?.workflow?.currentStep?.intent ||
+			input.runStatus.continuation?.currentIntent,
+		executionLane:
+			input.runStatus.continuation?.workflow?.currentStep?.executionLane ||
+			input.runStatus.continuation?.currentExecutionLane,
+		workflow: input.runStatus.continuation?.workflow,
 		next: input.step,
 	};
 }
@@ -259,11 +334,8 @@ function registerContinuationCommand(api: any, cfg: any) {
 			const originSessionKey =
 				asString(payload.originSessionKey) || "session:unknown";
 			const serverUrl =
-				findRegistryEntry({
-					cfg,
-					projectId,
-					repoRoot,
-				})?.serverUrl || resolveServerUrl(cfg);
+				findRegistryEntry(cfg, projectId, repoRoot)?.serverUrl ||
+				resolveServerUrl(cfg);
 			const envelope = buildEnvelope({
 				taskId,
 				runId,
@@ -277,11 +349,41 @@ function registerContinuationCommand(api: any, cfg: any) {
 				serverUrl,
 				deliver: true,
 			});
-			const continuation = asString(payload.workflowId)
+			const workflowId = asString(payload.workflowId);
+			const stepId =
+				asString(next?.stepId) ||
+				asString(next?.taskId) ||
+				asString(payload.stepId) ||
+				taskId;
+			const stepIntent =
+				asWorkflowStepIntent(next?.stepIntent) ||
+				asWorkflowStepIntent(payload.stepIntent);
+			const workflowType = asString(payload.workflowType);
+			const policyVersion =
+				asString(payload.policyVersion) || WORKFLOW_POLICY_VERSION;
+			const continuation = workflowId
 				? {
-						workflowId: asString(payload.workflowId),
-						stepId: asString(next?.taskId) || asString(payload.stepId),
+						workflowId,
+						workflowType,
+						policyVersion,
+						stepId,
+						...(stepIntent ? { currentIntent: stepIntent } : {}),
+						currentExecutionLane: resolvedAgentId,
 						callbackEventKind: "opencode.callback" as const,
+						...(stepIntent
+							? {
+									workflow: buildInitialWorkflowState({
+										workflowId,
+										workflowType,
+										policyVersion,
+										objective:
+											asString(next?.objective) || asString(payload.objective),
+										stepId,
+										stepIntent,
+										executionLane: resolvedAgentId,
+									}),
+								}
+							: {}),
 					}
 				: undefined;
 			await startExecutionRun({
@@ -395,7 +497,7 @@ function resolveCanonicalCallbackRoute(input: {
 	return input.callback.sessionKey;
 }
 
-function resolveContinuationStep(input: {
+function resolveLegacyContinuationStep(input: {
 	runStatus: BridgeRunStatus | null;
 	eventType?: string;
 }): OpenCodeRunContinuation["nextOnSuccess"] | undefined {
@@ -405,6 +507,226 @@ function resolveContinuationStep(input: {
 		input.eventType === "session.error"
 		? input.runStatus.continuation.nextOnFailure
 		: input.runStatus.continuation.nextOnSuccess;
+}
+
+function resolveContinuationStep(input: {
+	cfg: any;
+	runStatus: BridgeRunStatus | null;
+	eventType?: string;
+}): {
+	step?: OpenCodeRunContinuation["nextOnSuccess"];
+	source: "none" | "legacy" | "workflow_policy";
+	policy?: ReturnType<typeof resolveWorkflowPolicyTransition>;
+} {
+	const continuation = input.runStatus?.continuation;
+	if (!continuation) return { source: "none" };
+
+	const workflow = continuation.workflow;
+	const currentIntent =
+		workflow?.currentStep?.intent || continuation.currentIntent;
+	if (!workflow || !currentIntent) {
+		return {
+			step: resolveLegacyContinuationStep(input),
+			source: "legacy",
+		};
+	}
+
+	const runtimeCfg = getRuntimeConfig(input.cfg);
+	const policy = resolveWorkflowPolicyTransition({
+		workflowType: workflow.workflowType || continuation.workflowType,
+		currentIntent,
+		eventType: input.eventType,
+		transitionCount: workflow.transitionCount,
+		maxTransitions:
+			workflow.maxTransitions ||
+			runtimeCfg.workflowPolicy?.maxTransitions ||
+			DEFAULT_WORKFLOW_MAX_TRANSITIONS,
+	});
+
+	if (policy.action !== "launch_run") {
+		return {
+			step: {
+				action: policy.action,
+				reason: policy.reason,
+				stepIntent: policy.nextIntent,
+				stepId: workflow.currentStep?.stepId,
+				taskId: workflow.currentStep?.taskId,
+			},
+			source: "workflow_policy",
+			policy,
+		};
+	}
+
+	if (!policy.nextIntent) {
+		throw new Error(
+			`Workflow policy returned launch_run without next intent for runId=${input.runStatus?.runId || "unknown"}`,
+		);
+	}
+
+	const laneResolution = resolveIntentToLaneFromConfig({
+		intent: policy.nextIntent,
+		workflowOverride: normalizeIntentLaneMap(
+			workflow.intentLaneOverrides || continuation.intentLaneOverrides,
+		),
+		workflowPolicy: runtimeCfg.workflowPolicy,
+		projectId: input.runStatus?.envelope.project_id,
+		validLanes: DEFAULT_EXECUTION_LANES,
+	});
+	const stepOrdinal = Math.max(1, Number(workflow.transitionCount || 0) + 1);
+	const nextStepId = `${workflow.workflowId || input.runStatus?.runId || "wf"}:${policy.nextIntent}:${stepOrdinal}`;
+	const promptPacket = buildPromptForWorkflowIntent({
+		intent: policy.nextIntent,
+		workflowObjective: workflow.objective,
+		previousIntent: currentIntent,
+		previousOutcome: policy.outcome,
+	});
+
+	return {
+		step: {
+			action: "launch_run",
+			stepId: nextStepId,
+			taskId: nextStepId,
+			stepIntent: policy.nextIntent,
+			executionLane: laneResolution.executionLane,
+			objective: promptPacket.objective,
+			prompt: promptPacket.prompt,
+			reason: policy.reason,
+		},
+		source: "workflow_policy",
+		policy,
+	};
+}
+
+async function launchWorkflowContinuationStep(input: {
+	cfg: any;
+	parentRunStatus: BridgeRunStatus;
+	step: NonNullable<OpenCodeRunContinuation["nextOnSuccess"]>;
+	policy?: ReturnType<typeof resolveWorkflowPolicyTransition>;
+	transitionDedupeKey: string;
+}) {
+	const taskId =
+		asString(input.step.taskId) ||
+		asString(input.step.stepId) ||
+		`${input.parentRunStatus.taskId}-continue`;
+	const runId = `${taskId}-${Date.now()}`;
+	const requestedAgentId =
+		input.parentRunStatus.envelope.requested_agent_id || "creator";
+	const resolvedAgentId =
+		asString(input.step.executionLane) ||
+		input.parentRunStatus.envelope.resolved_agent_id ||
+		requestedAgentId;
+	if (!DEFAULT_EXECUTION_LANES.has(resolvedAgentId)) {
+		throw new Error(
+			`Workflow continuation resolved unsupported execution lane '${resolvedAgentId}'`,
+		);
+	}
+
+	const repoRoot = input.parentRunStatus.envelope.repo_root;
+	const projectId = input.parentRunStatus.envelope.project_id;
+	const serverUrl =
+		findRegistryEntry(input.cfg, projectId, repoRoot)?.serverUrl ||
+		input.parentRunStatus.envelope.opencode_server_url ||
+		resolveServerUrl(input.cfg);
+
+	const envelope = buildEnvelope({
+		taskId,
+		runId,
+		requestedAgentId,
+		resolvedAgentId,
+		executionAgentExplicit: true,
+		originSessionKey: input.parentRunStatus.envelope.origin_session_key,
+		originSessionId: input.parentRunStatus.envelope.origin_session_id,
+		projectId,
+		repoRoot,
+		agentWorkspaceDir:
+			input.parentRunStatus.envelope.agent_workspace_dir || repoRoot,
+		serverUrl,
+		deliver: true,
+		channel: input.parentRunStatus.envelope.channel,
+		to: input.parentRunStatus.envelope.to,
+		priority: input.parentRunStatus.envelope.priority,
+	});
+
+	const parentContinuation = input.parentRunStatus.continuation;
+	const parentWorkflow = parentContinuation?.workflow;
+	const stepIntent = asWorkflowStepIntent(input.step.stepIntent);
+	const childWorkflow =
+		parentWorkflow && stepIntent
+			? {
+					...parentWorkflow,
+					currentStep: {
+						stepId: asString(input.step.stepId) || taskId,
+						intent: stepIntent,
+						executionLane: resolvedAgentId,
+						status: "running" as const,
+						taskId,
+						objective: asString(input.step.objective),
+						prompt: asString(input.step.prompt),
+					},
+					transitionCount: Math.max(
+						1,
+						Number(parentWorkflow.transitionCount || 0) + 1,
+					),
+					nextTransition: {
+						action: "launch_run" as const,
+						reason: input.policy?.reason || input.step.reason,
+						previousOutcome: input.policy?.outcome,
+						nextStep: {
+							stepId: asString(input.step.stepId) || taskId,
+							intent: stepIntent,
+							executionLane: resolvedAgentId,
+							status: "running" as const,
+							taskId,
+						},
+						dedupeKey: input.transitionDedupeKey,
+						launched: true,
+						launchedAt: new Date().toISOString(),
+					},
+				}
+			: undefined;
+
+	const continuation: OpenCodeRunContinuation | undefined = parentContinuation
+		? {
+				...parentContinuation,
+				workflowId:
+					childWorkflow?.workflowId ||
+					parentContinuation.workflowId ||
+					parentWorkflow?.workflowId,
+				workflowType:
+					childWorkflow?.workflowType ||
+					parentContinuation.workflowType ||
+					parentWorkflow?.workflowType,
+				policyVersion:
+					childWorkflow?.policyVersion ||
+					parentContinuation.policyVersion ||
+					parentWorkflow?.policyVersion,
+				stepId: asString(input.step.stepId) || taskId,
+				currentIntent: stepIntent || parentContinuation.currentIntent,
+				currentExecutionLane: resolvedAgentId,
+				nextAction: undefined,
+				workflow: childWorkflow,
+				nextOnSuccess: parentContinuation.nextOnSuccess,
+				nextOnFailure: parentContinuation.nextOnFailure,
+				callbackEventKind: "opencode.callback",
+			}
+		: undefined;
+
+	const execution = await startExecutionRun({
+		cfg: input.cfg,
+		envelope,
+		prompt:
+			asString(input.step.prompt) ||
+			asString(input.step.objective) ||
+			"Continue workflow step.",
+		continuation,
+	});
+
+	return {
+		runId,
+		taskId,
+		execution,
+		envelope,
+	};
 }
 
 function registerCallbackIngressRoute(api: any, cfg: any) {
@@ -639,10 +961,29 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 			const runStatus = parsed.metadata?.runId
 				? readRunStatus(parsed.metadata.runId)
 				: null;
-			const continuationStep = resolveContinuationStep({
-				runStatus,
-				eventType: parsed.metadata?.eventType,
-			});
+			let continuationDecision:
+				| ReturnType<typeof resolveContinuationStep>
+				| undefined;
+			try {
+				continuationDecision = resolveContinuationStep({
+					cfg,
+					runStatus,
+					eventType: parsed.metadata?.eventType,
+				});
+			} catch (error: any) {
+				appendCallbackDebugAudit({
+					phase: "continuation_policy_failed_fast",
+					runId: parsed.metadata?.runId || null,
+					eventType: parsed.metadata?.eventType || null,
+					error: error?.message || String(error),
+				});
+				sendJson(res, 500, {
+					ok: false,
+					error: error?.message || "workflow_policy_transition_failed",
+				});
+				return true;
+			}
+			const continuationStep = continuationDecision?.step;
 			const callbackAt = new Date().toISOString();
 			const callbackPersistence = mapCallbackEventToArtifactState(
 				parsed.metadata?.eventType,
@@ -724,7 +1065,6 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 				hasContinuation: Boolean(runStatus?.continuation),
 				continuation: runStatus?.continuation || null,
 			});
-			let dispatchedToHook = false;
 			if (runStatus?.continuation) {
 				const step = continuationStep;
 				appendCallbackDebugAudit({
@@ -733,31 +1073,167 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 					dedupeKey,
 					runId: parsed.metadata?.runId || null,
 					eventType: parsed.metadata?.eventType || null,
+					source: continuationDecision?.source || "none",
+					policy: continuationDecision?.policy || null,
 					selectedStep: step || null,
 				});
 				if (step?.action === "launch_run") {
-					const commandPayload = buildContinuationCommandPayload({
-						runStatus,
-						metadata: parsed.metadata,
-						step,
-					});
-					const hookDispatch = await dispatchContinuationToCustomHook({
-						cfg,
-						metadata: parsed.metadata,
-						runStatus,
-						step,
-					});
-					appendCallbackDebugAudit({
-						phase: hookDispatch.ok
-							? "continuation_hook_dispatched"
-							: "continuation_hook_failed",
-						sessionKey: routedCallbackSessionKey,
-						dedupeKey,
-						runId: parsed.metadata?.runId || null,
-						commandPayload,
-						hookDispatch,
-					});
+					if (continuationDecision?.source === "workflow_policy") {
+						const transitionDedupeKey = buildContinuationTransitionDedupeKey({
+							runId: runStatus.runId,
+							eventType: parsed.metadata?.eventType,
+							step,
+						});
+						const latestRunStatus = parsed.metadata?.runId
+							? readRunStatus(parsed.metadata.runId) || runStatus
+							: runStatus;
+						const alreadyLaunched =
+							latestRunStatus.continuation?.workflow?.nextTransition
+								?.dedupeKey === transitionDedupeKey &&
+							latestRunStatus.continuation?.workflow?.nextTransition
+								?.launched === true;
+						if (alreadyLaunched) {
+							appendCallbackDebugAudit({
+								phase: "continuation_launch_deduped",
+								runId: latestRunStatus.runId,
+								eventType: parsed.metadata?.eventType || null,
+								transitionDedupeKey,
+								selectedStep: step,
+							});
+						} else {
+							const nextStepState: WorkflowStepState | undefined =
+								step.stepIntent
+									? {
+											stepId:
+												asString(step.stepId) ||
+												asString(step.taskId) ||
+												`${latestRunStatus.taskId}:next`,
+											intent: step.stepIntent,
+											executionLane: asString(step.executionLane),
+											status: "pending",
+											taskId: asString(step.taskId),
+											objective: asString(step.objective),
+											prompt: asString(step.prompt),
+										}
+									: undefined;
+							if (parsed.metadata?.runId) {
+								patchRunStatus(parsed.metadata.runId, (current) => ({
+									...current,
+									continuation: current.continuation
+										? applyWorkflowTransitionToContinuation({
+												continuation: current.continuation,
+												outcome:
+													continuationDecision?.policy?.outcome || "unknown",
+												action: "launch_run",
+												reason:
+													continuationDecision?.policy?.reason ||
+													step.reason ||
+													"continuation_launch_requested",
+												nextStep: nextStepState,
+												dedupeKey: transitionDedupeKey,
+												launched: false,
+											})
+										: current.continuation,
+								}));
+							}
+
+							try {
+								const childRun = await launchWorkflowContinuationStep({
+									cfg,
+									parentRunStatus: latestRunStatus,
+									step,
+									policy: continuationDecision?.policy,
+									transitionDedupeKey,
+								});
+								if (parsed.metadata?.runId) {
+									patchRunStatus(parsed.metadata.runId, (current) => ({
+										...current,
+										continuation: current.continuation
+											? applyWorkflowTransitionToContinuation({
+													continuation: current.continuation,
+													outcome:
+														continuationDecision?.policy?.outcome || "unknown",
+													action: "launch_run",
+													reason:
+														continuationDecision?.policy?.reason ||
+														step.reason ||
+														"continuation_launch_dispatched",
+													nextStep: nextStepState,
+													dedupeKey: transitionDedupeKey,
+													launched: true,
+												})
+											: current.continuation,
+									}));
+								}
+								appendCallbackDebugAudit({
+									phase: "continuation_run_started",
+									runId: latestRunStatus.runId,
+									eventType: parsed.metadata?.eventType || null,
+									transitionDedupeKey,
+									selectedStep: step,
+									childRunId: childRun.runId,
+									childTaskId: childRun.taskId,
+									childExecutionLane: childRun.envelope.resolved_agent_id,
+								});
+							} catch (error: any) {
+								appendCallbackDebugAudit({
+									phase: "continuation_run_failed",
+									runId: latestRunStatus.runId,
+									eventType: parsed.metadata?.eventType || null,
+									transitionDedupeKey,
+									error: error?.message || String(error),
+								});
+								sendJson(res, 500, {
+									ok: false,
+									error: error?.message || "continuation_launch_failed_fast",
+								});
+								return true;
+							}
+						}
+					} else {
+						const commandPayload = buildContinuationCommandPayload({
+							runStatus,
+							metadata: parsed.metadata,
+							step,
+						});
+						const hookDispatch = await dispatchContinuationToCustomHook({
+							cfg,
+							metadata: parsed.metadata,
+							runStatus,
+							step,
+						});
+						appendCallbackDebugAudit({
+							phase: hookDispatch.ok
+								? "continuation_hook_dispatched"
+								: "continuation_hook_failed",
+							sessionKey: routedCallbackSessionKey,
+							dedupeKey,
+							runId: parsed.metadata?.runId || null,
+							commandPayload,
+							hookDispatch,
+						});
+					}
 				} else if (step?.action === "notify") {
+					if (
+						continuationDecision?.source === "workflow_policy" &&
+						parsed.metadata?.runId
+					) {
+						patchRunStatus(parsed.metadata.runId, (current) => ({
+							...current,
+							continuation: current.continuation
+								? applyWorkflowTransitionToContinuation({
+										continuation: current.continuation,
+										outcome: continuationDecision?.policy?.outcome || "unknown",
+										action: "notify",
+										reason:
+											continuationDecision?.policy?.reason ||
+											step.reason ||
+											"workflow_notify",
+										launched: false,
+									})
+								: current.continuation,
+						}));
+					}
 					const notifyMessage =
 						step.objective ||
 						step.prompt ||
@@ -775,6 +1251,44 @@ function registerCallbackIngressRoute(api: any, cfg: any) {
 						runId: parsed.metadata?.runId || null,
 						notifyMessage,
 						reason: "registrar_authority",
+					});
+				} else if (step?.action === "stop" || step?.action === "escalate") {
+					if (
+						continuationDecision?.source === "workflow_policy" &&
+						parsed.metadata?.runId
+					) {
+						patchRunStatus(parsed.metadata.runId, (current) => ({
+							...current,
+							continuation: current.continuation
+								? applyWorkflowTransitionToContinuation({
+										continuation: current.continuation,
+										outcome: continuationDecision?.policy?.outcome || "unknown",
+										action: step.action,
+										reason:
+											continuationDecision?.policy?.reason ||
+											step.reason ||
+											`workflow_${step.action}`,
+										launched: false,
+									})
+								: current.continuation,
+						}));
+					}
+					const controlMessage =
+						step.objective ||
+						step.prompt ||
+						`Workflow requested action=${step.action}.`;
+					api.runtime.system.enqueueSystemEvent(controlMessage, {
+						...callbackTarget,
+						...(dedupeKey
+							? { contextKey: `${dedupeKey}:continuation-${step.action}` }
+							: {}),
+					});
+					appendCallbackDebugAudit({
+						phase: `continuation_${step.action}_enqueued`,
+						sessionKey: routedCallbackSessionKey,
+						dedupeKey,
+						runId: parsed.metadata?.runId || null,
+						controlMessage,
 					});
 				}
 			} else {
@@ -944,6 +1458,8 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 										"lastEvent",
 										"last_event_kind",
 										"lastSummary",
+										"workflow",
+										"workflowStatus",
 									],
 									primaryCallbackPath: OPENCODE_CALLBACK_HTTP_PATH,
 									alternativeSignalPaths: [
@@ -1197,14 +1713,50 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					pollIntervalMs: { type: "number" },
 					maxWaitMs: { type: "number" },
 					workflowId: { type: "string" },
+					workflowType: { type: "string" },
+					policyVersion: { type: "string" },
 					stepId: { type: "string" },
+					stepIntent: {
+						type: "string",
+						enum: [
+							"clarify",
+							"design",
+							"plan",
+							"explore",
+							"implement",
+							"review",
+							"verify",
+							"repair",
+							"summarize",
+							"notify",
+							"stop",
+							"escalate",
+						],
+					},
+					workflowObjective: { type: "string" },
+					workflowArtifacts: {
+						type: "object",
+						properties: {
+							spec: { type: "string" },
+							plan: { type: "string" },
+						},
+					},
+					intentLaneOverrides: {
+						type: "object",
+						additionalProperties: { type: "string" },
+					},
+					maxTransitions: { type: "number" },
 					nextOnSuccess: {
 						type: "object",
 						properties: {
 							action: {
 								type: "string",
-								enum: ["launch_run", "notify", "none"],
+								enum: ["launch_run", "notify", "stop", "escalate", "none"],
 							},
+							stepId: { type: "string" },
+							stepIntent: { type: "string" },
+							executionLane: { type: "string" },
+							reason: { type: "string" },
 							taskId: { type: "string" },
 							objective: { type: "string" },
 							prompt: { type: "string" },
@@ -1216,8 +1768,12 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 						properties: {
 							action: {
 								type: "string",
-								enum: ["launch_run", "notify", "none"],
+								enum: ["launch_run", "notify", "stop", "escalate", "none"],
 							},
+							stepId: { type: "string" },
+							stepIntent: { type: "string" },
+							executionLane: { type: "string" },
+							reason: { type: "string" },
 							taskId: { type: "string" },
 							objective: { type: "string" },
 							prompt: { type: "string" },
@@ -1300,14 +1856,64 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					deliver: params.deliver,
 					priority: params.priority,
 				});
+				const runtimeCfg = getRuntimeConfig(cfg);
 				const prompt = buildExecutionPrompt(params, envelope);
-				const workflowId = asString(params.workflowId);
-				const stepId = asString(params.stepId);
+				const workflowIdInput = asString(params.workflowId);
+				const workflowTypeInput = asString(params.workflowType);
+				const policyVersionInput = asString(params.policyVersion);
+				const stepIdInput = asString(params.stepId);
+				const stepIntent = asWorkflowStepIntent(params.stepIntent);
+				const workflowObjective = asString(params.workflowObjective);
+				const effectiveWorkflowObjective =
+					workflowObjective ||
+					asString(params.objective) ||
+					asString(params.message);
+				const workflowArtifacts = asWorkflowArtifacts(params.workflowArtifacts);
+				const intentLaneOverrides = normalizeWorkflowIntentLaneOverrides(
+					params.intentLaneOverrides,
+				);
 				const nextOnSuccess = asContinuationStep(params.nextOnSuccess);
 				const nextOnFailure = asContinuationStep(params.nextOnFailure);
-				const continuationEnabled = Boolean(
-					workflowId || stepId || nextOnSuccess || nextOnFailure,
+				const workflowPolicyRequested = Boolean(
+					workflowTypeInput ||
+						stepIntent ||
+						policyVersionInput ||
+						Object.keys(intentLaneOverrides).length ||
+						Number.isFinite(asNumber(params.maxTransitions)) ||
+						workflowObjective ||
+						workflowArtifacts.spec ||
+						workflowArtifacts.plan,
 				);
+				if (workflowPolicyRequested && !stepIntent) {
+					return {
+						isError: true,
+						content: [
+							{
+								type: "text",
+								text: JSON.stringify(
+									{
+										ok: false,
+										error:
+											"Workflow policy launch requires stepIntent so bridge can resolve intent->lane and initialize workflow step state.",
+										requiredForWorkflowPolicy: ["stepIntent"],
+										provided: {
+											workflowType: workflowTypeInput || null,
+											policyVersion: policyVersionInput || null,
+											stepIntent: stepIntent || null,
+										},
+									},
+									null,
+									2,
+								),
+							},
+						],
+					};
+				}
+				const continuationEnabledLegacy = Boolean(
+					workflowIdInput || stepIdInput || nextOnSuccess || nextOnFailure,
+				);
+				const continuationEnabled =
+					continuationEnabledLegacy || workflowPolicyRequested;
 				if (params.deliver === true && !continuationEnabled) {
 					return {
 						isError: true,
@@ -1318,11 +1924,13 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 									{
 										ok: false,
 										error:
-											"deliver=true requires continuation metadata (workflowId/stepId and nextOnSuccess or nextOnFailure) so callback can resume work instead of wake-only.",
+											"deliver=true requires continuation metadata (legacy nextOn* or workflow policy fields) so callback can resume work instead of wake-only.",
 										requiredForAutoResume: true,
 										provided: {
-											workflowId,
-											stepId,
+											workflowId: workflowIdInput,
+											workflowType: workflowTypeInput,
+											stepId: stepIdInput,
+											stepIntent: stepIntent || null,
 											nextOnSuccess: nextOnSuccess || null,
 											nextOnFailure: nextOnFailure || null,
 										},
@@ -1343,19 +1951,7 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					asString(params.priority)?.toLowerCase() === "high"
 						? "high"
 						: "medium";
-				const allowedExecutionAgents = new Set([
-					"build",
-					"plan",
-					"fullstack",
-					"creator",
-					"general",
-					"review",
-					"explore",
-					"scout",
-					"vision",
-					"compaction",
-					"painter",
-				]);
+				const allowedExecutionAgents = DEFAULT_EXECUTION_LANES;
 				const requestedExecutionAgent = asString(
 					params.executionAgentId,
 				)?.trim();
@@ -1364,25 +1960,104 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					allowedExecutionAgents.has(requestedExecutionAgent)
 						? requestedExecutionAgent
 						: undefined;
+				let intentLaneResolution:
+					| ReturnType<typeof resolveIntentToLaneFromConfig>
+					| undefined;
+				if (stepIntent) {
+					try {
+						intentLaneResolution = resolveIntentToLaneFromConfig({
+							intent: stepIntent,
+							workflowOverride: normalizeIntentLaneMap(intentLaneOverrides),
+							workflowPolicy: runtimeCfg.workflowPolicy,
+							projectId: asString(params.projectId),
+							validLanes: allowedExecutionAgents,
+						});
+					} catch (error: any) {
+						return {
+							isError: true,
+							content: [
+								{
+									type: "text",
+									text: JSON.stringify(
+										{
+											ok: false,
+											error:
+												error?.message ||
+												"workflow_intent_lane_resolution_failed",
+											stepIntent,
+										},
+										null,
+										2,
+									),
+								},
+							],
+						};
+					}
+				}
+				const resolvedExecutionAgent =
+					intentLaneResolution?.executionLane || normalizedExecutionAgent;
+				const executionEnvelope = resolvedExecutionAgent
+					? {
+							...envelope,
+							agent_id: resolvedExecutionAgent,
+							resolved_agent_id: resolvedExecutionAgent,
+							execution_agent_explicit: true,
+						}
+					: envelope;
+				const resolvedWorkflowId =
+					workflowIdInput ||
+					(workflowPolicyRequested ? `wf-${params.runId}` : undefined);
+				const resolvedPolicyVersion =
+					policyVersionInput ||
+					runtimeCfg.workflowPolicy?.policyVersion ||
+					WORKFLOW_POLICY_VERSION;
+				const resolvedStepId = stepIdInput || asString(params.taskId);
+				const configuredMaxTransitions = asNumber(params.maxTransitions);
+				const maxTransitions =
+					configuredMaxTransitions ||
+					runtimeCfg.workflowPolicy?.maxTransitions ||
+					DEFAULT_WORKFLOW_MAX_TRANSITIONS;
+				const workflowState =
+					workflowPolicyRequested && resolvedWorkflowId && stepIntent
+						? buildInitialWorkflowState({
+								workflowId: resolvedWorkflowId,
+								workflowType: workflowTypeInput || DEFAULT_WORKFLOW_TYPE,
+								policyVersion: resolvedPolicyVersion,
+								objective: effectiveWorkflowObjective,
+								artifacts: workflowArtifacts,
+								stepId: resolvedStepId || asString(params.taskId) || "step-1",
+								stepIntent,
+								executionLane: executionEnvelope.resolved_agent_id,
+								intentLaneOverrides,
+								maxTransitions,
+							})
+						: undefined;
 				const continuation = continuationEnabled
 					? {
-							...(workflowId ? { workflowId } : {}),
-							...(stepId ? { stepId } : {}),
+							...(resolvedWorkflowId ? { workflowId: resolvedWorkflowId } : {}),
+							...(workflowTypeInput || workflowState?.workflowType
+								? {
+										workflowType:
+											workflowTypeInput || workflowState?.workflowType,
+									}
+								: {}),
+							...(resolvedPolicyVersion
+								? { policyVersion: resolvedPolicyVersion }
+								: {}),
+							...(resolvedStepId ? { stepId: resolvedStepId } : {}),
+							...(stepIntent ? { currentIntent: stepIntent } : {}),
+							currentExecutionLane: executionEnvelope.resolved_agent_id,
 							callbackEventKind: "opencode.callback" as const,
 							promptVariant,
 							thinking: true,
+							...(Object.keys(intentLaneOverrides).length
+								? { intentLaneOverrides }
+								: {}),
+							...(workflowState ? { workflow: workflowState } : {}),
 							...(nextOnSuccess ? { nextOnSuccess } : {}),
 							...(nextOnFailure ? { nextOnFailure } : {}),
 						}
 					: { promptVariant, thinking: true };
-				const executionEnvelope = normalizedExecutionAgent
-					? {
-							...envelope,
-							agent_id: normalizedExecutionAgent,
-							resolved_agent_id: normalizedExecutionAgent,
-							execution_agent_explicit: true,
-						}
-					: envelope;
 				const execution = await startExecutionRun({
 					cfg,
 					envelope: executionEnvelope,
@@ -1422,6 +2097,11 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 										attachRun: (execution as any).attachRun,
 										callbackAuthority: "opencode_plugin",
 										continuationEnabled,
+										workflowPolicy: {
+											enabled: workflowPolicyRequested,
+											stepIntent: stepIntent || null,
+											intentLaneResolution: intentLaneResolution || null,
+										},
 									},
 									runStatus: snapshot,
 								},
@@ -1645,6 +2325,9 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 						"Callback evidence exists but artifact is not terminal; inspect callback reconciliation before rerunning.",
 					);
 				}
+				const workflowStatus = buildWorkflowStatusSnapshot(
+					artifact?.continuation,
+				);
 				const response: RunStatusResponse = {
 					ok: true,
 					source: {
@@ -1705,6 +2388,10 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					...(artifact?.continuation
 						? { continuation: artifact.continuation }
 						: {}),
+					...(artifact?.continuation?.workflow
+						? { workflow: artifact.continuation.workflow }
+						: {}),
+					...(workflowStatus ? { workflowStatus } : {}),
 					...(callbackSummary ? { callbackSummary } : {}),
 					...(attachRunSummary ? { attachRunSummary } : {}),
 					...(operatorHints.length ? { operatorHints } : {}),
@@ -1798,6 +2485,9 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 							e.normalizedKind === "task.stalled",
 					),
 				};
+				const workflowStatus = buildWorkflowStatusSnapshot(
+					artifact?.continuation,
+				);
 				const response: RunEventsResponse = {
 					ok: true,
 					...(runId ? { runId } : {}),
@@ -1826,6 +2516,10 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					...(artifact?.continuation
 						? { continuation: artifact.continuation }
 						: {}),
+					...(artifact?.continuation?.workflow
+						? { workflow: artifact.continuation.workflow }
+						: {}),
+					...(workflowStatus ? { workflowStatus } : {}),
 					truncated: events.length >= limit,
 					timeoutMs,
 				};
@@ -1935,6 +2629,9 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 						} as SessionTailMessage;
 					});
 
+				const workflowStatus = buildWorkflowStatusSnapshot(
+					artifact?.continuation,
+				);
 				const response: SessionTailResponse = {
 					ok: true,
 					sessionId,
@@ -1970,6 +2667,10 @@ export function registerOpenCodeBridgeTools(api: any, cfg: any) {
 					...(artifact?.continuation
 						? { continuation: artifact.continuation }
 						: {}),
+					...(artifact?.continuation?.workflow
+						? { workflow: artifact.continuation.workflow }
+						: {}),
+					...(workflowStatus ? { workflowStatus } : {}),
 					...(includeDiff ? { diff: diffRes.data } : {}),
 					latestSummary: sessionRes.data,
 					fetchedAt: new Date().toISOString(),

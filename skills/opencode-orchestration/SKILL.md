@@ -91,9 +91,30 @@ Do not let OpenCode silently fall back to whatever default agent/runtime would p
 - Broad exploration / discovery -> use `--agent explore` or `--agent scout` as appropriate
 - If the requested lane is not known to the current OpenCode config, do not invent it silently; fall back deliberately and note the fallback
 
+### Workflow Policy Layer (intent-centric mode)
+
+For multi-step callback-driven workflows, prefer passing **workflow semantics** instead of hardcoding every lane:
+
+- `workflowType` (e.g. `small-fix`, `feature-delivery`, `forensic-fix`)
+- `stepIntent` (e.g. `implement`, `review`, `verify`, `repair`)
+- optional `intentLaneOverrides` when a workflow step must run in a non-default lane
+
+Bridge behavior in this mode:
+
+1. resolve `stepIntent -> execution lane` with precedence:
+   - workflow override
+   - project policy mapping
+   - global default mapping
+2. fail-fast if lane cannot be resolved
+3. persist workflow/step/lane state in run artifact
+4. when terminal callback arrives, policy decides next action/step and bridge can auto-launch the next isolated run (with duplicate-launch protection)
+
+Use explicit `executionAgentId` only when you intentionally need a direct lane override for the current step.
+
 ### Shared-serve observability rule
 
 In one-serve-many-project topology, observability must resolve sessions in this order:
+
 1. explicit session id
 2. callback/origin target session id from run artifact
 3. callback/origin target session key
@@ -338,11 +359,13 @@ Rules:
 - Choose the lane deliberately and report which lane was used.
 
 ### Prefer CLI-direct when
+
 - the task is lightweight or one-shot
 - no callback or long-lived lifecycle tracking is required
 - no serve/session registry management is needed
 
 ### Prefer serve/plugin mode when
+
 - callback correctness matters
 - event-driven lifecycle handling is required
 - multi-project safety matters
@@ -362,24 +385,30 @@ Current team workflow after planning is:
 During **execute**, if routing goes into the OpenCode lane, use the bridge-aware strategy and choose one of these execution lanes explicitly:
 
 ### Lane A — CLI-direct
+
 Use for lightweight tasks where callback/lifecycle tracking is not the main requirement.
 
 Rules:
+
 - bind the repo explicitly with `--dir <absolute-repo-path>`
 - prefer explicit `--model` if agent resolution is uncertain
 - report clearly that the task used CLI-direct execution
 
 ### Lane B — serve/plugin mode (canonical callback lane)
+
 Use when callback correctness, observability, event-driven lifecycle handling, or multi-project-safe control plane is required.
 
 Rules:
+
 - bind execution to one project-bound serve instance only
 - keep routing envelope fields explicit
 - treat `/hooks/agent` as the primary callback path
 - use OpenCode-side plugin callback for terminal lifecycle signaling
 
 ### Current implementation status (important)
+
 The bridge stack has already proven these capabilities:
+
 - routing envelope build
 - callback payload build
 - callback execution to `/hooks/agent`
@@ -389,7 +418,9 @@ The bridge stack has already proven these capabilities:
 - materialized OpenCode-side plugin artifact and install flow
 
 ### Practical guidance for agents
+
 When handing off into OpenCode execution:
+
 - mention the intended repo explicitly
 - ensure the execution packet is file-driven
 - ensure repo binding is explicit (`--dir <repo>` for CLI-direct, project-bound serve for serve/plugin mode)
@@ -401,9 +432,11 @@ When handing off into OpenCode execution:
   - event-driven terminal signaling
 
 ### Prompt tightening rule for build lane (MANDATORY)
+
 For implementation-focused attach-run tasks, prompts must bias strongly toward direct execution rather than open-ended reconnaissance.
 
 Required rules for build-oriented packets:
+
 - require one short audit pass only
 - forbid prolonged analysis/report-only behavior
 - tell the agent to materialize code changes immediately after the first useful audit result
@@ -411,6 +444,7 @@ Required rules for build-oriented packets:
 - require explicit completion or explicit blocker; do not allow silent looping
 
 Recommended constraints to include in build prompts:
+
 - `Do not spawn more than one explore subagent unless blocked by missing exact file/function location.`
 - `Do not use explore for generic repo layout discovery when repo scope is already explicit.`
 - `After the first useful audit result, continue implementation directly.`
@@ -421,7 +455,9 @@ Recommended constraints to include in build prompts:
 - `Do not loop on todowrite more than once per milestone.`
 
 ### Early-stall operational rule
+
 Treat a run as early-stalled when all of the following are true:
+
 - no meaningful diff / files_changed evidence
 - no callback attempt
 - no terminal event
@@ -429,12 +465,15 @@ Treat a run as early-stalled when all of the following are true:
 - no meaningful progress after roughly 2-5 minutes
 
 When early-stall is detected:
+
 - stop waiting
 - rerun with a stricter build packet
 - reduce or forbid explore fan-out unless the run is truly blocked
 
 ### Mandatory reporting after execution handoff
+
 Outer agents should report:
+
 - whether the task was handed to OpenCode direct path or bridge path
 - the packet/artifacts used
 - the target project/repo
@@ -566,6 +605,7 @@ This section explains how to use the current `opencode-bridge` plugin/runtime pa
 ### What is currently true
 
 The current bridge stack already proves these capabilities:
+
 - routing envelope construction
 - callback payload construction for `/hooks/agent`
 - callback execution into OpenClaw hook ingress
@@ -580,6 +620,7 @@ The current bridge stack already proves these capabilities:
 ### What is **not** yet safe to assume
 
 Do **not** assume all of the following are production-grade yet:
+
 - fully autonomous long-running listener without further supervision
 - fully hardened multi-agent production runtime manager
 - complete serve fleet management with every edge case covered
@@ -594,6 +635,7 @@ Agents must describe these limits honestly and avoid over-claiming completion.
 Bridge-aware execution must preserve caller identity and callback destination explicitly.
 
 Required fields to preserve whenever available:
+
 - `requested_agent_id`
 - `resolved_agent_id`
 - `origin_session_key`
@@ -602,6 +644,7 @@ Required fields to preserve whenever available:
 - `callback_target_session_id`
 
 Operational rules:
+
 - Callback must return to the **current caller session**, not an arbitrary latest/execution session.
 - If bridge/runtime cannot resolve the requested execution agent cleanly, it must **fail fast** instead of silently falling back to a default agent.
 - If callback target session information is missing or inconsistent, treat that as a routing integrity error, not a soft warning.
@@ -616,10 +659,10 @@ Operational rules:
 When a task or epic is marked `done/closed`, any OpenCode serve/process that was started only for that execution must be shut down immediately unless there is an explicit reason to keep it alive.
 
 Operational rules:
+
 - Do not leave lingering OpenCode serves after work completes.
 - Treat serve shutdown as part of completion hygiene, not optional cleanup.
 - If a serve remains alive intentionally, the agent must report the reason explicitly.
-
 
 1. **Serve is shared runtime; session is the execution lane**
    - Do not assume `project -> serve` is the primary identity.
@@ -677,18 +720,24 @@ If the agent cannot satisfy these items, it should not claim the bridge flow is 
 Use these tools deliberately:
 
 #### `opencode_status`
+
 Use to inspect the current bridge contract, assumptions, registry-related config, and lifecycle model.
 
 #### `opencode_resolve_project`
+
 Use when you need to resolve which OpenCode serve should be used for a given:
+
 - `projectId`
 - `repoRoot`
 
 #### `opencode_build_envelope`
+
 Use when you are about to delegate a concrete task into OpenCode lane and need the canonical routing envelope.
 
 #### `opencode_execute_task`
+
 Use as the standard serve/plugin-mode execution entrypoint:
+
 - resolve/reuse a healthy shared serve runtime
 - primary execution lane = `opencode run --attach <serve> --dir <repoRoot>`
 - attach-run must carry tagged title metadata via `buildTaggedSessionTitle(...)`
@@ -701,49 +750,64 @@ Use as the standard serve/plugin-mode execution entrypoint:
 - do not assume `project -> serve`; execution still routes by shared `serve + dir`
 
 #### `opencode_run_status`
+
 Use to inspect run state and event-derived lifecycle summary.
 
 #### `opencode_run_events`
+
 Use to inspect normalized SSE event output for a run/session.
 
 #### `opencode_session_tail`
+
 Use to inspect session messages and diff/tail evidence when available.
 
 #### `opencode_run_status`
+
 Use to inspect the artifact state of a previously handled run.
 
 #### `opencode_callback_from_event`
+
 Use when you already have a raw event and want to test the `normalize -> callback -> artifact` path directly.
 
 #### `opencode_check_hook_policy`
+
 Use to validate whether the current hook policy is compatible with the intended `agentId` and `sessionKey`.
 
 #### `opencode_evaluate_lifecycle`
+
 Use to evaluate lifecycle state from:
+
 - last event kind
 - last event timestamp
 - soft/hard stall thresholds
 
 #### `opencode_registry_get`
+
 Use to read the current session-centric registry:
+
 - `serves.json` for runtime serve inventory
 - `sessions.json` for current session routing per `serve + directory`
 
 #### `opencode_registry_upsert`
+
 Use to create/update serve registry entries only.
 Do not treat it as the canonical project routing tool.
 
 #### `opencode_registry_cleanup`
+
 Use to normalize and clean both `serves.json` and `sessions.json`.
 
 #### `opencode_serve_spawn`
+
 Use to spawn or reuse an OpenCode serve runtime.
 Serve selection is independent from project ownership; the project context is applied later via session creation and `directory`.
 
 #### `opencode_serve_idle_check`
+
 Use to evaluate whether a serve should be shut down based on idle timeout.
 
 #### `opencode_serve_shutdown`
+
 Use to mark a serve as stopped and send shutdown for a project serve entry.
 
 ### Recommended end-to-end bridge-aware flow
@@ -781,6 +845,7 @@ When a task must enter OpenCode execution lane, use this order:
 ### Reporting requirements
 
 When handing work into OpenCode lane, the outer agent should report:
+
 - whether it used direct OpenCode execution or bridge-aware execution
 - which packet/artifact was used
 - which `project_id` / `repo_root` / `opencode_server_url` was targeted
@@ -789,6 +854,7 @@ When handing work into OpenCode lane, the outer agent should report:
 ### Do / Don't
 
 #### Do
+
 - Do keep OpenCode execution project-bound.
 - Do keep callback/session routing explicit.
 - Do choose execution lane explicitly: CLI-direct vs serve/plugin mode.
@@ -798,6 +864,7 @@ When handing work into OpenCode lane, the outer agent should report:
 - Do treat active serve registry as active-only truth and use process audit/cleanup for OS hygiene.
 
 #### Don’t
+
 - Don’t use ad-hoc `opencode run` for callback/lifecycle-sensitive work without explicit lane selection.
 - Don’t assume a single serve is multi-project-safe unless project-aware observability is respected.
 - Don’t assume `sessions.json` is the primary truth for execution state.

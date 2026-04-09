@@ -265,8 +265,24 @@ test("buildContinuationCallbackMetadata projects continuation correlation fields
 		sessionId: "sess-opencode-5",
 		continuation: {
 			workflowId: "wf-5",
+			workflowType: "small-fix",
+			policyVersion: "2026-04-09-v1",
 			stepId: "step-5",
+			currentIntent: "implement",
+			currentExecutionLane: "build",
 			callbackEventKind: "opencode.callback",
+			workflow: {
+				workflowId: "wf-5",
+				workflowType: "small-fix",
+				policyVersion: "2026-04-09-v1",
+				currentStep: {
+					stepId: "step-5",
+					intent: "implement",
+					executionLane: "build",
+					status: "running",
+				},
+				previousOutcome: "success",
+			},
 		},
 		envelope: {
 			task_id: "task-5",
@@ -309,7 +325,12 @@ test("buildContinuationCallbackMetadata projects continuation correlation fields
 	assert.equal(metadata.callbackRelaySessionId, "sess-origin-5");
 	assert.equal(metadata.opencodeSessionId, "sess-opencode-5");
 	assert.equal(metadata.workflowId, "wf-5");
+	assert.equal(metadata.workflowType, "small-fix");
+	assert.equal(metadata.policyVersion, "2026-04-09-v1");
 	assert.equal(metadata.stepId, "step-5");
+	assert.equal(metadata.stepIntent, "implement");
+	assert.equal(metadata.executionLane, "build");
+	assert.equal(metadata.previousOutcome, "success");
 });
 
 test("default serve helpers resolve canonical URL", () => {

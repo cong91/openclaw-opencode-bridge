@@ -1,0 +1,6 @@
+{
+  "hookBaseUrl": "http://127.0.0.1:18789",
+  "hookToken": "taa-webhook-trader-2026",
+  "openclawAuditPath": "/Users/mrcagents/.openclaw/opencode-bridge/audit/callbacks.jsonl",
+  "auditDir": "/Users/mrcagents/Work/projects/opencode-bridge/.opencode"
+}
